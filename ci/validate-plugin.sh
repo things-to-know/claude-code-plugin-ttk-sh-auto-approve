@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Validate the plugin with `claude plugin validate`, failing on errors and on
 # every warning except the missing-version one. `version` is deliberately
-# absent (see CLAUDE.md), so `--strict` would always fail here.
+# absent (see AGENTS.md), so `--strict` would always fail here.
 set -euo pipefail
 
 plugin_dir="${1:-plugin}"

@@ -1,6 +1,6 @@
 {
   "name": "ttk-sh-auto-approve",
-  "description": "PreToolUse hook that auto-approves Bash commands it can prove are read-only, and stays silent otherwise",
+  "description": "PreToolUse hook that auto-approves Bash tool commands (run by bash or zsh) it can prove are read-only, and stays silent otherwise",
   "author": {
     "name": "things-to-know",
     "url": "https://github.com/things-to-know"

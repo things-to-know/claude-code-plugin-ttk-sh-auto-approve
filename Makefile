@@ -81,7 +81,7 @@ lint-json: ## Check that every JSON file parses
 
 .PHONY: test
 test: ## Run the tests
-	$(PYTHON) -m unittest discover -s tests -v
+	$(PYTHON) -m unittest discover -s tests
 
 .PHONY: validate
 validate: ## Run `claude plugin validate` (needs `claude` on PATH)

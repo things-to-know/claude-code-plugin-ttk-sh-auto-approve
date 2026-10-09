@@ -74,7 +74,7 @@ class WiringTest(unittest.TestCase):
         self.assertTrue(Path(script).is_file(), script)
 
     def test_no_version_field_in_manifest(self):
-        # Versions are derived from the sha pinned in the catalog (see CLAUDE.md).
+        # Versions are derived from the sha pinned in the catalog (see AGENTS.md).
         manifest = json.loads((PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text())
         self.assertNotIn("version", manifest)
 
