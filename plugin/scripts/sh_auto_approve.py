@@ -5,6 +5,32 @@ A Claude Code ``PreToolUse`` hook. It reads the tool call on stdin and prints an
 decision when every command in it is provably read-only; otherwise it prints nothing,
 falling through to the normal user confirmation prompt.
 
+.. warning::
+
+   The "Bash" tool is not always bash. Claude Code runs the command in the operator's login
+   shell when that is bash or zsh -- zsh is the macOS default -- or in the one
+   ``CLAUDE_CODE_SHELL`` names. The aliases and functions of the operator's shell startup file
+   apply as well, e.g. ``grep`` may be ``grep --color=auto ...``.
+
+Under zsh the command is wrapped as
+``zsh -c 'source <snapshot>; setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; ... eval <command>'``.
+This module reads a program name as the program itself, and cannot see an alias that makes it write.
+
+Sources: ``CLAUDE_CODE_SHELL`` in https://code.claude.com/docs/en/env-vars, and "Bash tool
+behavior" in https://code.claude.com/docs/en/tools-reference. The wrapper is observed, not
+documented: ``ps -o args= -p $$`` run through the Bash tool prints it, options included.
+
+Thus, every rule here has to hold under both grammars. Decisions for this hook:
+
+- The grammar modeled is bash's
+- What only zsh expands is refused wherever it is spelled. Examples:
+  - ``${(e)x}``
+  - ``$~x``
+  - glob qualifiers
+  - ``=(...)``
+  - ``echo`` interpreting escapes without ``-e``
+  - ``printf '%d'`` evaluating its argument
+
 A command is approved when every simple command in it clears one of two tiers:
 
     1. nothing in it can write a file, change a resource, or run a program this
@@ -56,16 +82,6 @@ command the shell builds at runtime. For example:
 
 has no text to match and prompts every time, however many rules are added.
 This hook reads the whole command instead and decides on what it does.
-
-Which shell: Claude Code runs the command in the operator's login shell, which need not be
-bash. Under zsh it wraps the command as ``zsh -c '... setopt NO_EXTENDED_GLOB
-NO_BARE_GLOB_QUAL ... eval <command>'``. The grammar modeled here is bash's, so zsh's own ways
-to evaluate a value -- ``${(e)x}``, glob substitution, ``printf '%d'`` -- are refused where
-they are spelled.
-
-TODO: cite an official source for the paragraph above, the Claude Code documentation or the
-code that builds the wrapper. Until then it is an observation, not a documented behavior:
-``ps -o args= -p $$`` run through the Bash tool prints the wrapper, options included.
 
 Requires Python ``MINIMUM_PYTHON`` or later on Linux or macOS. Anywhere else it stays silent,
 which is the same as not being installed: every command prompts.
@@ -369,10 +385,10 @@ SUBSTRING = re.compile(
 )
 INDIRECT = re.compile(r"\$\{!(?![A-Za-z_][A-Za-z0-9_]*(?:\[[@*]\]|[@*])\})")
 
-# zsh is the shell Claude Code runs these commands in on this machine, and it has
-# expansions bash does not. `${(e)x}` re-expands the value -- command substitution included
-# -- and any `${(...)` flag set is refused rather than read letter by letter. `${~x}` and
-# `$~x` turn the value into a glob, and a zsh glob qualifier `*(e:cmd:)` runs a command.
+# zsh is one of the 2 shells Claude Code runs these commands in (see the module docstring), and it
+# has expansions bash does not. `${(e)x}` re-expands the value -- command substitution included --
+# and any `${(...)` flag set is refused rather than read letter by letter. `${~x}` and `$~x`
+# turn the value into a glob, and a zsh glob qualifier `*(e:cmd:)` runs a command.
 ZSH_PARAMETER_FLAGS = re.compile(r"\$\{\s*\(")
 ZSH_GLOB_SUBST = re.compile(r"\$\{?~")
 

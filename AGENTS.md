@@ -21,6 +21,13 @@ insists on its own filename, symlink to this file rather than copying it.
 
 - **Threat model:** the hook may run while Claude's context is poisoned. An
   approval for a command that isn't read-only is the failure to avoid.
+- **Shell**:
+  - The `Bash` tool runs bash or zsh: the user's `$SHELL` when it is one of them, or the one
+    `CLAUDE_CODE_SHELL` names. Every rule has to hold under both grammars.
+  - When only one shell expands a construct (zsh's `${(e)x}`, `$~x`, glob qualifiers, `=(...)`,
+    `echo` escapes without `-e`), refuse it wherever it is spelled.
+  - Aliases and functions from the user's shell startup file apply as well, and the hook can't
+    see them. The module docstring of `sh_auto_approve.py` has the sources.
 - **Fail closed.** Print nothing unless the command is proven read-only. On
   any error, exit 0 with no output. Never exit 2: that blocks the call instead
   of handing it to the user. A crash or timeout also falls back to the normal

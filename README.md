@@ -8,6 +8,17 @@ normal permission prompt.
 > **Status:** not released yet. Requires Python 3.12 or later on Linux or macOS;
 > anywhere else the hook stays silent and every command prompts.
 
+## The Bash tool may run zsh
+
+> [!WARNING]
+> Despite its name, Claude Code's Bash tool runs each command in your login shell when that is
+> bash or zsh (zsh is the macOS default), or in the shell `CLAUDE_CODE_SHELL` names.
+> The aliases and functions from your shell startup file apply too.
+>
+> So the hook checks every command against both grammars, and refuses anything only one of them
+> would expand. What it can't see is your aliases: if one turns a read-only program such as `ls`
+> or `grep` into something that writes, the hook still approves it.
+
 ## Install
 
 Through the things-to-know plugin catalog (not published yet).
