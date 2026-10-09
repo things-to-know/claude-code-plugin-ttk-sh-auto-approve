@@ -17,7 +17,7 @@ jobs:
       matrix:
         # The hook runs on whatever `python3` is first on each user's PATH.
         # Keep the oldest version your teammates have in this list.
-        python: ["3.10", "3.13"]
+        python: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -27,6 +27,24 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Run tests
         run: python3 -m unittest discover -s tests -v
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      # The version in the local virtualenv, so CI formats exactly as `make fmt` does
+      - name: Install ruff
+        run: python3 -m pip install 'ruff==0.16.10'
+      # markdownlint-cli2 and editorconfig-checker run from their pinned images (see Makefile);
+      # shellcheck comes with the runner
+      - name: Lint
+        run: make lint
 
   validate:
     name: claude plugin validate

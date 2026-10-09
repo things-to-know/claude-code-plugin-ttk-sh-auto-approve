@@ -1,0 +1,10 @@
+# Configuration for markdownlint
+
+MD013:
+  # The same limit as .editorconfig
+  line_length: 100
+  heading_line_length: 120
+  # Tables are exempt by convention
+  tables: false
+  # Fenced blocks are exempt by convention
+  code_blocks: false
