@@ -26,5 +26,5 @@ It uses only the Python standard library and makes no network calls.
 
 ## Development
 
-See [CLAUDE.md](CLAUDE.md) for the layout, the rules the hook follows, how to
+See [AGENTS.md](AGENTS.md) for the layout, the rules the hook follows, how to
 test it and how releases work.
