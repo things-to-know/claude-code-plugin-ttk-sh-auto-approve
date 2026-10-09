@@ -9,7 +9,7 @@ through the things-to-know plugin catalog.
 - `plugin/` is the plugin root and the **only directory that ships** to users.
   Tests, CI, this file and `.claude/` stay in the repo.
 - `plugin/hooks/hooks.json` runs
-  `python3 -I ${CLAUDE_PLUGIN_ROOT}/scripts/bash_readonly_allow.py` on every
+  `python3 -I ${CLAUDE_PLUGIN_ROOT}/scripts/sh_auto_approve.py` on every
   Bash tool call (exec form, so the path needs no quoting).
 - `tests/test_hook_contract.py` runs the hook exactly as `hooks.json` defines it.
 - `ci/validate-plugin.sh` wraps `claude plugin validate` (see "No `version`").
@@ -32,8 +32,8 @@ through the things-to-know plugin catalog.
   `$CLAUDE_PROJECT_DIR/.claude/settings.local.json`. Both are exported to the
   hook's environment.
 - **Python version.** The hook runs on whatever `python3` is first on the
-  user's `PATH`. Keep the CI matrix's oldest version at or below the oldest one
-  in use.
+  user's `PATH`, and stays silent below `MINIMUM_PYTHON` (3.12) or outside
+  Linux and macOS. Keep the CI matrix's oldest version at that minimum.
 
 ## No `version`
 
@@ -81,15 +81,14 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
 
 ## Migrating the real hook
 
-The script in `plugin/scripts/` is a placeholder that never approves anything.
+`plugin/scripts/sh_auto_approve.py` is the real hook. Its second tier reads the operator's allow
+and deny rules from `.claude/settings.json` and `.claude/settings.local.json` under
+`$CLAUDE_PROJECT_DIR`. What remains:
 
 1. This repo is public. Before committing, review the implementation and its
    test fixtures for code you don't own and for infrastructure details
    (hostnames, bucket names, account IDs, internal paths).
-2. Replace `plugin/scripts/bash_readonly_allow.py` and add the existing suites
-   under `tests/`. Keep `tests/test_hook_contract.py` passing.
-3. Point the second tier (operator allow/deny rules) at
-   `$CLAUDE_PROJECT_DIR/.claude/settings.local.json`.
-4. In each repo that had the hook configured directly, remove that entry from
+2. Add the existing suites under `tests/`. Keep `tests/test_hook_contract.py` passing.
+3. In each repo that had the hook configured directly, remove that entry from
    `.claude/settings*.json` once the plugin is enabled there. Hooks aren't
    namespaced, so both copies would run.

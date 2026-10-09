@@ -5,7 +5,8 @@ that auto-approves Bash commands it can prove are read-only. Everything else,
 including errors, timeouts and unexpected input, goes through Claude Code's
 normal permission prompt.
 
-> **Status:** placeholder. The current hook never approves anything.
+> **Status:** not released yet. Requires Python 3.12 or later on Linux or macOS;
+> anywhere else the hook stays silent and every command prompts.
 
 ## Install
 
@@ -20,7 +21,7 @@ claude --plugin-dir ./plugin
 ## What runs on your machine
 
 A plugin runs with your user privileges. This one registers a single hook on
-the Bash tool that runs `python3 -I plugin/scripts/bash_readonly_allow.py`.
+the Bash tool that runs `python3 -I plugin/scripts/sh_auto_approve.py`.
 It uses only the Python standard library and makes no network calls.
 
 ## Development
