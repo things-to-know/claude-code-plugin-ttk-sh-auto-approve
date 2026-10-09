@@ -1,4 +1,4 @@
-# ttm-sh-auto-approve
+# ttk-sh-auto-approve
 
 Claude Code plugin: a `PreToolUse` hook that auto-approves Bash commands it can
 prove are read-only, so they don't raise a permission prompt. Distributed
@@ -64,11 +64,11 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
 
    ```json
    {
-     "name": "ttm-sh-auto-approve",
+     "name": "ttk-sh-auto-approve",
      "description": "Auto-approves Bash commands it can prove are read-only",
      "source": {
        "source": "git-subdir",
-       "url": "things-to-know/claude-code-plugin-ttm-sh-auto-approve",
+       "url": "things-to-know/claude-code-plugin-ttk-sh-auto-approve",
        "path": "plugin",
        "sha": "<sha>"
      }
@@ -77,7 +77,7 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
 
 3. Users receive it through marketplace auto-update, if they turned it on, or
    `claude plugin marketplace update <catalog>` followed by
-   `claude plugin update ttm-sh-auto-approve@<catalog>`.
+   `claude plugin update ttk-sh-auto-approve@<catalog>`.
 
 ## Migrating the real hook
 

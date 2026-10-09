@@ -1,4 +1,4 @@
-# ttm-sh-auto-approve
+# ttk-sh-auto-approve
 
 A [Claude Code](https://code.claude.com/docs) plugin with a `PreToolUse` hook
 that auto-approves Bash commands it can prove are read-only. Everything else,

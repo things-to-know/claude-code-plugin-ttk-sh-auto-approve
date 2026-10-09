@@ -44,7 +44,7 @@ def decide(payload: object) -> dict | None:
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
-            "permissionDecisionReason": "ttm-sh-auto-approve: read-only command",
+            "permissionDecisionReason": "ttk-sh-auto-approve: read-only command",
         }
     }
 

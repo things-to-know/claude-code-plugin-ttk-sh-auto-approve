@@ -1,9 +1,9 @@
 {
-  "name": "ttm-sh-auto-approve",
+  "name": "ttk-sh-auto-approve",
   "description": "PreToolUse hook that auto-approves Bash commands it can prove are read-only, and stays silent otherwise",
   "author": {
     "name": "things-to-know",
     "url": "https://github.com/things-to-know"
   },
-  "repository": "https://github.com/things-to-know/claude-code-plugin-ttm-sh-auto-approve"
+  "repository": "https://github.com/things-to-know/claude-code-plugin-ttk-sh-auto-approve"
 }
