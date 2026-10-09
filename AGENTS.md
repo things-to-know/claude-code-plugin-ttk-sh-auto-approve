@@ -61,7 +61,7 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   after edits. A `--plugin-dir` plugin with the same manifest name replaces the
   installed one for that session; `claude plugin list` still shows the
   installed one as enabled.
-- Tests: `python3 -m unittest discover -s tests -v`
+- Tests: `python3 -m unittest discover -s tests`
 - Validate: `bash ci/validate-plugin.sh plugin` (needs `claude` on `PATH`)
 - Live debugging: start with `claude --debug`; `~/.claude/debug/<session-id>.txt`
   records which hooks matched and their exit codes.
