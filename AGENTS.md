@@ -32,6 +32,13 @@ insists on its own filename, symlink to this file rather than copying it.
   any error, exit 0 with no output. Never exit 2: that blocks the call instead
   of handing it to the user. A crash or timeout also falls back to the normal
   permission prompt, but shows the user a hook error.
+- **`gh`**
+  - The hook reads `gh api` GETs and the read-only `pr`, `run`, `issue` and `repo` subcommands
+    itself (`GH_READ_SPECS`); any other subcommand, or a flag the table doesn't list,
+    is left to the operator's rules.
+  - A `--jq` that reads the environment is refused, which no rule overturns.
+    Operators can drop native `Bash(gh ... view|list *)` allow rules: a native rule still approves
+    `--jq '$ENV.GH_TOKEN'`, and only a native deny rule stops that.
 - **Stdlib only, isolated interpreter.** `-I` ignores `PYTHONPATH` and user
   site-packages, and keeps the script's own directory off `sys.path`. If the
   hook is split into modules, add its directory explicitly:
