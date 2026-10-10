@@ -68,10 +68,37 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   after edits. A `--plugin-dir` plugin with the same manifest name replaces the
   installed one for that session; `claude plugin list` still shows the
   installed one as enabled.
-- Tests: `python3 -m unittest discover -s tests`
-- Validate: `bash ci/validate-plugin.sh plugin` (needs `claude` on `PATH`)
+- Verify with `make check`, which lints and tests as CI does, or with one target such as
+  `make test` or `make lint-py`; `make help` lists them.
+  - `make` runs ruff from `$(RUFF)`: pass e.g. `RUFF=../.venv/bin/ruff` when it isn't on
+    `PATH`.
+  - `make validate` runs `claude plugin validate` through `ci/validate-plugin.sh` and needs
+    `claude` on `PATH`; `make check` leaves it out.
 - Live debugging: start with `claude --debug`; `~/.claude/debug/<session-id>.txt`
   records which hooks matched and their exit codes.
+- Triage a command that prompted by replaying it in its session's context, never a guessed one:
+  - Find the session's transcript by its id: `ls ~/.claude/projects/*/<session-id>.jsonl`. It
+    moves when the session is resumed elsewhere, and every directory there starts with `-`, so
+    pass paths after `--` or prefixed with `./`
+  - The transcript records the shell's working directory as `cwd` on each entry. The project
+    directory is the one in the session's scratchpad path, or in "Shell cwd was reset to ..."
+
+## Linting
+
+When a linter flags content that is correct, fix the linter's configuration, not the content.
+For example:
+
+- The hanging indent of a docstring or a Markdown list item: `editorconfig-checker` reads it as
+  a wrong indent, so the `Makefile` passes `-disable-indent-size`.
+- A CommonMark list continuation: keep it, and adjust the markdownlint rule that flags it.
+- A line that can't be wrapped, such as a long URL or command: exempt it in the
+  configuration rather than breaking it.
+
+## Commits
+
+- Conventional commits
+- The subject line comes first and stands alone: `type(scope): Summary`, as in `git log`.
+- Add a body only when the subject isn't enough, but not too verbose.
 
 ## Release
 
