@@ -16,6 +16,8 @@ insists on its own filename, symlink to this file rather than copying it.
   Bash tool call (exec form, so the path needs no quoting).
 - `tests/test_hook_contract.py` runs the hook exactly as `hooks.json` defines it.
 - `ci/validate-plugin.sh` wraps `claude plugin validate` (see "No `version`").
+- `tools/explain.py` prints the hook's verdict and reason for each command, for a given
+  session (see [Develop](#develop))
 
 ## Rules for the hook
 
@@ -90,6 +92,9 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
     pass paths after `--` or prefixed with `./`
   - The transcript records the shell's working directory as `cwd` on each entry. The project
     directory is the one in the session's scratchpad path, or in "Shell cwd was reset to ..."
+  - Replay with `make explain` (i.e. `tools/explain.py`):
+    - `make explain PROJECT=<dir> CWD=<dir> < commands.txt`
+    - Add `HOOK=<path>` to ask the installed copy instead of the working copy
 
 ## Linting
 
