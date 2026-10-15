@@ -39,6 +39,14 @@ insists on its own filename, symlink to this file rather than copying it.
   - A `--jq` that reads the environment is refused, which no rule overturns.
     Operators can drop native `Bash(gh ... view|list *)` allow rules: a native rule still approves
     `--jq '$ENV.GH_TOKEN'`, and only a native deny rule stops that.
+- **Widening**: a change that approves more records where it stops, as
+  `TheWideningsHaveAnEdge` does for the loop and splice widenings
+  - Each new approval comes with its paired refusals
+  - Each refusal sits beside a control approved under the same setup, so a setup that silently
+    does nothing fails instead of passing
+  - For a path-based widening, the refusals include a recursive read, such as `grep -r`, of the
+    directory holding each credential store: Layer B refuses a word that names a store, not one
+    that names its parent
 - **Stdlib only, isolated interpreter.** `-I` ignores `PYTHONPATH` and user
   site-packages, and keeps the script's own directory off `sys.path`. If the
   hook is split into modules, add its directory explicitly:

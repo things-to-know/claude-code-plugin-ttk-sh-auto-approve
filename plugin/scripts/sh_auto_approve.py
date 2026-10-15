@@ -278,8 +278,9 @@ SCRATCH_PATH = (
 # the boundary.
 #
 # Layer A is the boundary, for the readers this module knows: a file operand must resolve
-# inside the project, an `additionalDirectories` entry, or this session's scratch
-# directory. Anything else, and anything the module cannot resolve, is not this module's to
+# inside the project, an `additionalDirectories` entry of the project's settings files
+# (`_read_roots`), or this session's scratch directory. The same roots bound where `git -C`
+# may point. Anything else, and anything the module cannot resolve, is not this module's to
 # approve and falls through to the operator's own rules.
 # --------------------------------------------------------------------------------------
 
@@ -675,6 +676,7 @@ GIT_READ_SUBCOMMANDS = {
     "log",
     "ls-files",
     "ls-tree",
+    "rev-list",
     "rev-parse",
     "shortlog",
     "show",
@@ -683,6 +685,22 @@ GIT_READ_SUBCOMMANDS = {
     "tag",
     "worktree",
 }
+
+# `git branch` lists unless it is handed a name, which creates a branch, or a flag that
+# deletes, moves, copies, or sets an upstream. So only the listing flags are read, and
+# a name only beside a flag that forces list mode, where it is a pattern or a commit.
+# `-l` is left out: before git 2.19 it was `--create-reflog`, so `git branch -l x` created x.
+GIT_BRANCH_BARE_FLAGS = frozenset(
+    {"--all", "--remotes", "--verbose", "--quiet", "--ignore-case", "--list"}
+    | {"--show-current", "--omit-empty", "--no-abbrev", "--no-color", "--no-column"}
+)
+GIT_BRANCH_BARE_SHORTS = frozenset("arvqi")
+# Optional values git reads only when attached: `--abbrev 7` makes 7 a branch name.
+GIT_BRANCH_ATTACHED_ONLY = frozenset({"--abbrev", "--color", "--column"})
+GIT_BRANCH_VALUE_FLAGS = frozenset({"--sort", "--format", "--points-at"})
+GIT_BRANCH_LIST_MODE = frozenset(
+    {"--list", "--points-at", "--contains", "--no-contains", "--merged", "--no-merged"}
+)
 
 
 class NotReadOnly(Exception):
@@ -1608,8 +1626,82 @@ def _check_git(args: list[str]) -> None:
             raise NotReadOnly("git worktree mutation")
         return
 
+    if subcommand == "branch":
+        _check_git_branch(sub_args)
+        return
+
+    if subcommand == "remote":
+        _check_git_remote(sub_args)
+        return
+
     if subcommand not in GIT_READ_SUBCOMMANDS:
         raise NotReadOnly(f"git non-read subcommand: {subcommand}")
+
+
+def _check_git_branch(args: list[str]) -> None:
+    """Validate ``git branch``: the listing forms only.
+
+    See ``GIT_BRANCH_BARE_FLAGS``.
+
+    A flag is matched exactly, so an abbreviation git would accept (``--del``) is refused along
+    with the long form it abbreviates.
+    """
+    list_mode = False
+    names = 0
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if not arg.startswith("-"):
+            names += 1
+            continue
+        name, equals, _ = arg.partition("=")
+        if arg in GIT_BRANCH_BARE_FLAGS or name in GIT_BRANCH_ATTACHED_ONLY:
+            pass
+        elif name in GIT_BRANCH_VALUE_FLAGS:
+            index += 0 if equals else 1
+        elif name in GIT_BRANCH_LIST_MODE:
+            pass  # an optional commit, attached or next; either way list mode is on
+        elif arg.startswith("--") or not set(arg[1:]) <= GIT_BRANCH_BARE_SHORTS or arg == "-":
+            raise NotReadOnly(f"git branch flag that is not a listing flag: {arg}")
+        list_mode = list_mode or name in GIT_BRANCH_LIST_MODE
+    if names and not list_mode:
+        raise NotReadOnly("git branch given a name outside list mode, which creates a branch")
+
+
+def _check_git_remote(args: list[str]) -> None:
+    """Validate ``git remote``: the listing, and ``get-url``.
+
+    ``show`` is left out because it contacts the remote unless given ``-n``, and every other
+    verb rewrites the configuration or fetches. A URL with a token in it is printed no more
+    than ``cat .git/config`` prints it.
+    """
+    if args in ([], ["-v"], ["--verbose"]):
+        return
+    if args[:1] == ["get-url"]:
+        flags = [arg for arg in args[1:] if arg.startswith("-")]
+        names = [arg for arg in args[1:] if not arg.startswith("-")]
+        if set(flags) <= {"--push", "--all"} and len(names) == 1:
+            return
+    raise NotReadOnly(f"git remote other than a listing or get-url: {' '.join(args)}")
+
+
+def _git_directories(args: list[str]) -> list[int]:
+    """Indexes into ``args`` of each ``-C`` directory, read from the global options only.
+
+    After the subcommand ``-C`` is another flag: copy detection in ``log``, ``diff`` and
+    ``blame``. The walk is the one ``_check_git`` does to find the subcommand.
+    """
+    found: list[int] = []
+    index = 0
+    while index < len(args) and args[index].startswith("-"):
+        if args[index] in ("-C", "-c"):
+            if args[index] == "-C" and index + 1 < len(args):
+                found.append(index + 1)
+            index += 2
+        else:
+            index += 1
+    return found
 
 
 def _git_option_is(arg: str, option: str) -> bool:
@@ -2141,6 +2233,57 @@ def _check_hostname(args: list[str]) -> None:
         raise NotReadOnly("hostname modification")
 
 
+def _check_command_builtin(args: list[str]) -> None:
+    """Validate the ``command`` builtin: ``command -v NAME...`` and nothing else.
+
+    ``-v`` prints how each name resolves, as ``which`` does. Without it ``command`` runs its
+    operand with functions bypassed, so ``command rm -rf build/`` is ``rm``.
+    zsh reads ``command -v`` as ``whence``, which tells no more than zsh's own ``which``.
+
+    ``-V`` is left out because it **prints a function's whole body**.
+    """
+    if args[:1] != ["-v"] or len(args) < 2 or any(arg.startswith("-") for arg in args[1:]):
+        raise NotReadOnly("command other than `command -v NAME...` runs its operand")
+
+
+# `base64` flags, GNU's and macOS's, that neither write nor take a file to write to. macOS has
+# `-o FILE` and `--output=FILE`, which is why this is an allowlist. `-i` is GNU's `--ignore-garbage`
+# and macOS's input file; `READER_SPECS` checks the word after it as a file either way.
+# macOS's `--input=FILE` is not listed: `READER_SPECS` cannot read an attached file, so it would be
+# a path nothing checked.
+BASE64_BARE_FLAGS = frozenset({"-d", "-D", "--decode", "-i", "--ignore-garbage"})
+BASE64_VALUE_FLAGS = frozenset({"-w", "--wrap", "-b", "--break"})
+
+
+def _check_base64(args: list[str]) -> None:
+    """Validate base64: listed flags only, and one input at most.
+
+    Decoding prints whatever bytes were encoded, terminal escapes included, which jq's
+    ``@base64d`` and ``tr``'s octal escapes already do; see ``TERMINAL_CONTROL_BYTE``.
+    """
+    inputs = 0
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "-" or not arg.startswith("-"):
+            inputs += 1
+            continue
+        name, equals, _ = arg.partition("=") if arg.startswith("--") else (arg, "", "")
+        if arg in BASE64_BARE_FLAGS or arg in ("--help", "--version"):
+            continue
+        if name in BASE64_VALUE_FLAGS:
+            index += 0 if equals else 1
+            continue
+        if arg[:2] in ("-w", "-b") and arg[2:].isdigit():
+            continue
+        if not arg.startswith("--") and set(arg[1:]) <= set("dDi"):
+            continue
+        raise NotReadOnly(f"base64 flag not known to be read-only: {arg}")
+    if inputs > 1:
+        raise NotReadOnly("base64 with more than one operand")
+
+
 def _check_cd(args: list[str]) -> None:
     """Validate cd: one directory operand, resolving inside the project.
 
@@ -2211,7 +2354,9 @@ GLOB_AWARE = frozenset({"find", "sed", "sort"})
 PROGRAM_VALIDATORS = {
     "aws": _check_aws,
     "awk": _check_awk,
+    "base64": _check_base64,
     "cd": _check_cd,
+    "command": _check_command_builtin,
     "date": _check_date,
     "file": _check_file,
     "find": _check_find,
@@ -2396,6 +2541,19 @@ def _check_command(
             PROGRAM_VALIDATORS[program](args, live_globs)
         else:
             PROGRAM_VALIDATORS[program](args)
+        # `-C` points git at the repository there, and so at that repository's config, which
+        # can name a program git runs: `core.fsmonitor` on `status`, `gpg.program` on a `log`
+        # that shows signatures. That is `--git-dir` under another name, so a directory
+        # outside the read roots is not this module's to approve. It is checked after the
+        # validator, so a write the validator found keeps its verdict whatever a rule says.
+        if program == "git" and scope is not None:
+            directories = _git_directories(args)
+            if len(directories) > 1:
+                raise NoOpinion("git -C given more than once, each relative to the last")
+            for index in directories:
+                problem = _read_scope_problem(arg_tokens[index], args[index], parts, scope)
+                if problem is not None:
+                    raise NoOpinion(f"git -C points at {problem}")
     elif program in READ_ONLY:
         return
     else:
@@ -2459,7 +2617,9 @@ def _rule_pattern(rule: str, blanket: bool = False) -> "_GlobRule | None":
     return _GlobRule(body)
 
 
-def _operator_rules() -> tuple[list[_GlobRule], list[_GlobRule]]:
+def _operator_rules(
+    settings: tuple[list[dict], bool] | None = None,
+) -> tuple[list[_GlobRule], list[_GlobRule]]:
     """The allow and deny rules the operator has already written, as patterns.
 
     This is the second tier, and the whole of its safety argument: a command that matches
@@ -2472,15 +2632,8 @@ def _operator_rules() -> tuple[list[_GlobRule], list[_GlobRule]]:
     Nothing is cached: the file is small, it is read once per Bash call, and a rule the
     operator saved a moment ago through "yes, and don't ask again" applies immediately.
 
-    Only a regular file under ``SETTINGS_SIZE_CAP`` is opened, and the decision is made
-    from ``stat`` so that a file failing either test costs nothing at all. A named pipe
-    with no writer blocks in ``open`` forever, and the host's own hook timeout is ten
-    minutes: that is not a bypass, but it is the whole Bash call spent waiting for a file
-    that was never going to answer.
-
-    A file that is missing is the ordinary case and means nothing. A file that exists and
-    cannot be used -- wrong kind, too large, unreadable, not JSON -- is a file whose
-    rules this module cannot see, so the second tier is turned off for the call rather
+    A file that exists and cannot be used is a file whose rules this module cannot see
+    (see ``_settings_permissions``), so the second tier is turned off for the call rather
     than run on a partial reading of what the operator wrote. Allow rules are what tier 2
     spends, and dropping them can only cost a prompt; deny rules that were read stay, and
     the host evaluates its own regardless of what this hook returns.
@@ -2488,13 +2641,40 @@ def _operator_rules() -> tuple[list[_GlobRule], list[_GlobRule]]:
     allow: list[_GlobRule] = []
     deny: list[_GlobRule] = []
 
+    found, usable = settings or _settings_permissions()
+    for permissions in found:
+        for key, target, blanket in (("allow", allow, False), ("deny", deny, True)):
+            for rule in permissions.get(key) or []:
+                if not isinstance(rule, str):
+                    continue
+                pattern = _rule_pattern(rule, blanket=blanket)
+                if pattern is not None:
+                    target.append(pattern)
+
+    return (allow if usable else []), deny
+
+
+def _settings_permissions() -> tuple[list[dict], bool]:
+    """The ``permissions`` object of each settings file, and whether every file there was usable.
+
+    Only a regular file under ``SETTINGS_SIZE_CAP`` is opened, and the decision is made
+    from ``stat`` so that a file failing either test costs nothing at all. A named pipe
+    with no writer blocks in ``open`` forever, and the host's own hook timeout is ten
+    minutes: that is not a bypass, but it is the whole Bash call spent waiting for a file
+    that was never going to answer.
+
+    A file that is missing is the ordinary case and means nothing. A file that exists and
+    cannot be used -- wrong kind, too large, unreadable, not JSON, no ``permissions`` --
+    makes the second value false, and each caller decides what that costs it.
+    """
     override = os.environ.get(SETTINGS_ENV)
     if override is None:
         paths = [REPO_ROOT / name for name in SETTINGS_FILES]
     else:
         paths = [Path(piece) for piece in override.split(os.pathsep) if piece]
 
-    unusable = False
+    found: list[dict] = []
+    usable = True
     for path in paths:
         try:
             info = path.stat()  # follows a link, and raises for one that dangles
@@ -2509,18 +2689,58 @@ def _operator_rules() -> tuple[list[_GlobRule], list[_GlobRule]]:
             document = json.loads(path.read_text(encoding="utf-8", errors="replace"))
             permissions = document["permissions"]
         except (OSError, ValueError, KeyError, TypeError, RecursionError):
-            unusable = True  # it is there and it cannot be read; see the docstring
+            usable = False  # it is there and it cannot be read; see the docstring
             continue
-        for key, target, blanket in (("allow", allow, False), ("deny", deny, True)):
-            rules = permissions.get(key) if isinstance(permissions, dict) else None
-            for rule in rules or []:
-                if not isinstance(rule, str):
-                    continue
-                pattern = _rule_pattern(rule, blanket=blanket)
-                if pattern is not None:
-                    target.append(pattern)
+        if isinstance(permissions, dict):
+            found.append(permissions)
+    return found, usable
 
-    return ([] if unusable else allow), deny
+
+def _read_roots(settings: tuple[list[dict], bool] | None = None) -> list[str]:
+    """The directories a reader may read inside: the project and its ``additionalDirectories``.
+
+    The entries come from the same two files as the operator's rules: a directory there is
+    one the operator already made a working directory. Claude Code also reads the user's own
+    settings file, which this module leaves alone as it does for the rules, and one added for
+    the session with ``/add-dir`` is in no file and not in the hook's payload, so this module
+    cannot see either.
+
+    An entry is resolved the way a ``cd`` target is: ``~`` expanded, a relative entry taken
+    from the project root, then ``realpath``. A settings file that cannot be read leaves the
+    project alone, since what it would have added is unknown. An entry is dropped when:
+
+    - it is not a directory
+    - it is or contains the home directory, which ``_project_root`` refuses as a project
+      for the same reason: every dotfile would be in scope
+    - it is, contains or sits inside a credential store or ``/proc``. Layer B refuses a word
+      that names a store, and a store's parent is not one: with ``~/.config`` as a root,
+      ``grep -r token ~/.config`` reads ``~/.config/gh/hosts.yml`` and names nothing Layer B
+      knows
+    """
+    roots = [os.path.realpath(REPO_ROOT)]
+    found, usable = settings or _settings_permissions()
+    if not usable:
+        return roots
+    home = os.path.realpath(_home())
+    stores = [os.path.realpath(store) for store in _credential_roots()] + ["/proc"]
+    for permissions in found:
+        entries = permissions.get("additionalDirectories")
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, str) or not entry.strip():
+                continue
+            try:
+                path = os.path.expanduser(entry) if entry.startswith("~") else entry
+                path = os.path.realpath(os.path.join(str(REPO_ROOT), path))
+                if (
+                    _is_under(home, path)
+                    or any(_is_under(store, path) or _is_under(path, store) for store in stores)
+                    or not os.path.isdir(path)
+                ):
+                    continue
+            except (OSError, ValueError):
+                continue
+            roots.append(path)
+    return roots
 
 
 def _home() -> str:
@@ -2848,6 +3068,7 @@ READER_SPECS = {
         }
     },
     "xxd": {"values": {"-c", "-g", "-l", "-s", "-o", "-cols", "-len", "-seek"}},
+    "base64": {"values": {"-w", "--wrap", "-b", "--break"}, "files": {"-i"}},
     "md5sum": {},
     "sha1sum": {},
     "sha256sum": {},
@@ -2993,7 +3214,7 @@ def _scratch_redirect() -> "re.Pattern[str]":
     return re.compile(r"(?<![^\s;|&(])&?>>?\s*(?:" + path + r")(?=[\s;|&)]|$)")
 
 
-def _readable_input_target(target: str, parts: list[tuple[str, str]]) -> bool:
+def _readable_input_target(target: str, parts: list[tuple[str, str]], roots: list[str]) -> bool:
     """Whether ``< target`` names a file the operator wrote out, not one the shell computes.
 
     The pseudo-device check in ``_classify`` reads literal text, so a target assembled at
@@ -3014,8 +3235,7 @@ def _readable_input_target(target: str, parts: list[tuple[str, str]]) -> bool:
     if target.startswith("~"):
         expanded = os.path.expanduser(expanded)
     if expanded.startswith("/"):
-        scope = _ReadScope([os.path.realpath(REPO_ROOT)], [str(REPO_ROOT)], {}, {})
-        return _in_scope(expanded, scope)
+        return _in_scope(expanded, _ReadScope(roots, [str(REPO_ROOT)], {}, {}))
     return ".." not in Path(expanded).parts
 
 
@@ -3082,13 +3302,19 @@ def _classify(command: str, depth: int = 0) -> None:
         if ZSH_PARAMETER_FLAGS.search(text) or ZSH_GLOB_SUBST.search(text):
             raise NotReadOnly("zsh expansion that re-evaluates a value")
 
+    # Read once, for both tiers: the read roots below and the operator's rules further down.
+    settings = _settings_permissions()
+    roots = _read_roots(settings)
+
     # Normalize stream discards before tokenization, then the two redirections that are
     # reads or contained writes. Everything `_segments` still meets after this is a `>` at
     # a path this module could not account for, which is the one it has to refuse.
     stripped = SAFE_REDIRECTS.sub(" ", reduced)
     stripped = _scratch_redirect().sub(" ", stripped)
     stripped = FILE_INPUT_REDIRECT.sub(
-        lambda match: " " if _readable_input_target(match.group(1), parts) else match.group(0),
+        lambda match: (
+            " " if _readable_input_target(match.group(1), parts, roots) else match.group(0)
+        ),
         stripped,
     )
 
@@ -3101,7 +3327,7 @@ def _classify(command: str, depth: int = 0) -> None:
     if not segments:
         raise NotReadOnly("no command")
 
-    allow, deny = _operator_rules()
+    allow, deny = _operator_rules(settings)
 
     # Loop variables whose `in` list is all literal non-flag words. Collected across every
     # segment first, because the header that binds a name and the body that uses it are
@@ -3127,7 +3353,7 @@ def _classify(command: str, depth: int = 0) -> None:
     if _SESSION_CWD and os.path.isabs(_SESSION_CWD):
         bases.append(_SESSION_CWD)
     scope = _ReadScope(
-        roots=[os.path.realpath(REPO_ROOT)],
+        roots=roots,
         bases=bases,
         splice_vars=splice_vars,
         loop_values=_literal_loop_values(segments, parts),
