@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Tests for the read-only Bash classifier behind the `PreToolUse` hook.
 
@@ -77,7 +76,8 @@ from a command that prompted in a real session.
           RefusesGitConfigDrivenExecution, RefusesGitSubcommandsOutsideTheReadSet,
           RefusesAwsCallsThatWriteOrExecute, RefusesAwsCallsThatPrintASecret,
           ApprovesGcloudHelpForABlockedVerb, RefusesGcloudCallsThatWriteLocallyOrExecute,
-          RefusesGhApiCallsThatWriteOrLeak
+          RefusesGhApiCallsThatWriteOrLeak, ApprovesReadOnlyGhSubcommands,
+          RefusesGhFlagsThatOpenOrWait, RefusesGhJqThatReadsTheEnvironment
     14  The operator's own rules: the second tier
           OperatorRules, OperatorRuleFileRobustness, ARepresentativeRuleFile
     15  The classifier as a function
@@ -457,8 +457,9 @@ SITE_APPROVED_BEYOND_HOST: frozenset[str] = frozenset(
     # here bare, because `-f` takes its program from a file and `$ENV` prints the session's
     # credentials; nothing in its grammar writes a file or runs a program.
     | {"jq"}
-    # `gh`, for `gh api` GETs only; its validator gives every other subcommand back to the
-    # operator's rules, and refuses any method, body, host or header that is not a read.
+    # `gh`, for `gh api` GETs and the read-only `pr`, `run`, `issue` and `repo` subcommands; its
+    # validators give every other subcommand back to the operator's rules, and refuse any
+    # method, body, host, header or `--jq` that is not a read.
     | {"gh"}
     # Exit-status primitives, which run inside `if` and `while` tests
     | {"false", "test", "true"}
@@ -486,9 +487,11 @@ def settings_at(path):
 
 
 @contextlib.contextmanager
-def operator_rules(allow=(), deny=()):
-    """Run the second tier against a rule file written for one test."""
+def operator_rules(allow=(), deny=(), additional_directories=()):
+    """Run the second tier, and the read scope, against a rule file written for one test."""
     document = {"permissions": {"allow": list(allow), "deny": list(deny)}}
+    if additional_directories:
+        document["permissions"]["additionalDirectories"] = list(additional_directories)
     with tempfile.TemporaryDirectory(prefix="readonly_hook_rules_") as directory:
         path = Path(directory) / "settings.local.json"
         path.write_text(json.dumps(document))
@@ -1486,6 +1489,22 @@ class ObservedCommandsStayApproved(Verdicts, unittest.TestCase):
     rather than discover in a session three weeks later.
     """
 
+    def test_a_branch_status_check_with_gh_pr_and_run_reads(self):
+        """`gh pr` and `gh run` had no validator, so each of these three prompted on the one
+        `gh` segment; the `git log --format='--- ...%n...'`, `ls` and redirects beside it
+        were never the blocker."""
+        self.assert_allowed(
+            "git log --format='--- %h %s%n%b' origin/main..HEAD && git diff --stat "
+            "origin/main...HEAD && ls && gh pr list --head feat/first-version 2>&1 | head"
+        )
+        self.assert_allowed(
+            "gh pr list --head feat/first-version --state all 2>&1; "
+            "gh run list --branch feat/first-version --limit 5 2>&1"
+        )
+        self.assert_allowed(
+            "gh pr checks 2 2>&1; gh run view 37991862400 --log-failed 2>&1 | tail -80"
+        )
+
     def test_a_sed_range_read_from_a_named_file(self):
         """`sed` was pipeline-only: one script plus a file operand was refused outright,
         so every `sed -n '/a/,/b/p' file` had to be rewritten as a `cat` into a pipe."""
@@ -1557,6 +1576,40 @@ class ObservedCommandsStayApproved(Verdicts, unittest.TestCase):
                 f't="guides/tracker.md"; f1="{LOG}"; echo \'--- check-docs\'; '
                 'scripts/check-docs.py "$t" "$f1" --no-fixme 2>&1 | tail -10'
             )
+
+    def test_counting_commits_between_two_branches(self):
+        """`git non-read subcommand: rev-list`. It is plumbing, and it only reads."""
+        self.assert_allowed(
+            "git rev-list --count main..HEAD; git rev-list --count HEAD..main; "
+            "git ls-tree --name-only main -- docs/ | grep -c 'a'"
+        )
+
+    def test_listing_branches_and_remotes(self):
+        """`git non-read subcommand: branch`, and the same for `remote`. Both write with a
+        name or a verb, and list without one; only the listing forms are read."""
+        self.assert_allowed("git branch -r --contains HEAD", "lists remote branches")
+        self.assert_allowed("git branch --show-current", "prints one name")
+        self.assert_allowed("git branch -vv --sort=-committerdate --list 'x'", "a pattern")
+        self.assert_allowed("git remote get-url origin", "prints a URL")
+        self.assert_allowed("git remote -v", "lists the remotes")
+
+    def test_looking_up_the_tools_before_a_lint_run(self):
+        """`unrecognized program: command`. `command -v` is `which` as a builtin; the
+        `awk` beside it, a comparison and not a redirection, was never the blocker."""
+        self.assert_allowed(
+            "command -v ruff markdownlint-cli2 docker; "
+            'awk \'length > 100 {print FILENAME": "FNR": "length}\' AGENTS.md'
+        )
+
+    def test_decoding_a_file_fetched_through_gh_api(self):
+        """`unrecognized program: base64`. Also approved, without it: `gh api ... -H
+        'Accept: application/vnd.github.raw'`, which returns the file undecoded."""
+        self.assert_allowed(
+            "gh api repos/org-slug/repo-name/contents/.github/workflows/ci.yml "
+            "--jq .content | base64 -d | grep -n -A14 '^jobs:'"
+        )
+        self.assert_allowed("echo aGkK | base64 -d", "decodes stdin to stdout")
+        self.assert_allowed("base64 -w0 AGENTS.md | head -c 40", "encodes a file in scope")
 
 
 class AllowsALoopVariableBoundToLiterals(Verdicts, unittest.TestCase):
@@ -2638,6 +2691,76 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         """Bash ends a string at a NUL, so the hook and bash would read different commands."""
         self.assert_refused("cat AGENTS.md\x00 ~/.aws/credentials", "bash truncates here")
 
+    def test_an_additional_directory_is_in_scope(self):
+        """An `additionalDirectories` entry is a working directory the operator already
+        granted, so a read there is as approved as one in the project. That includes where
+        `git -C` may point; outside every root `-C` stays refused."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_root_") as directory:
+            other = os.path.realpath(directory)
+            commands = (
+                f"cat {other}/notes.md",
+                f"grep -n x {other}/docs/a.md | head",
+                f"ls -a {other}/.claude 2>&1 | head",
+                f"wc -l < {other}/notes.md",
+                f"git -C {other} log --oneline -5",
+                f"git -C {other} remote get-url origin",
+            )
+            for command in commands:
+                with self.subTest(command=command, listed=False):
+                    self.assert_refused(command, "not listed, so outside the working directories")
+            with operator_rules(additional_directories=[other]):
+                for command in commands:
+                    with self.subTest(command=command, listed=True):
+                        self.assert_allowed(command, "inside a listed additional directory")
+                self.assert_refused(f"cat {other}/../x", "climbs out of it")
+                self.assert_refused(f"git -C {other} push", "a write, wherever it points")
+
+    def test_entries_that_are_not_given_scope(self):
+        """An entry that is or contains the home directory would put every dotfile in scope,
+        and one that is not a directory names nothing."""
+        for entries in (["/"], [str(Path.home())], ["~"], ["/etc/os-release"]):
+            with self.subTest(entries=entries), operator_rules(additional_directories=entries):
+                self.assert_refused("cat /etc/os-release", "no usable root covers it")
+
+    def test_an_unreadable_settings_file_adds_no_root(self):
+        """What a file that cannot be parsed would have added is unknown, so nothing is."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_root_") as directory:
+            other = os.path.realpath(directory)
+            good = Path(directory) / "settings.json"
+            good.write_text(json.dumps({"permissions": {"additionalDirectories": [other]}}))
+            bad = Path(directory) / "settings.local.json"
+            bad.write_text("{not json")
+            with settings_at(f"{good}{os.pathsep}{bad}"):
+                self.assert_refused(f"cat {other}/notes.md", "the second file is unreadable")
+            with settings_at(good):
+                self.assert_allowed(f"cat {other}/notes.md", "the control: one good file")
+
+    def test_no_root_reaches_a_credential_store(self):
+        """Every store in `CREDENTIAL_HOME_PATHS`, with the directory holding it listed as a
+        root: `~/.aws` itself, `~/.config` for `~/.config/gh`. Layer B refuses a word naming a
+        store, but not a word naming its parent, so `grep -r token ~/.config` is refused only
+        because `~/.config` is dropped as a root. The control shows the roots are read."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_home_") as directory:
+            home = Path(os.path.realpath(directory))
+            tops = sorted({entry.split("/")[0] for entry in hook.CREDENTIAL_HOME_PATHS})
+            for top in tops:
+                (home / top).mkdir()
+            (home / ".config" / "app").mkdir()
+            with (
+                unittest.mock.patch.dict(os.environ, {"HOME": str(home)}),
+                operator_rules(
+                    additional_directories=[f"~/{top}" for top in tops] + ["~/.config/app"]
+                ),
+            ):
+                for entry in hook.CREDENTIAL_HOME_PATHS:
+                    with self.subTest(entry=entry):
+                        self.assert_refused(f"cat ~/{entry}", "a credential store")
+                        self.assert_refused(f"cat {home}/{entry}", "the same, spelled out")
+                for top in tops:
+                    with self.subTest(top=top):
+                        self.assert_refused(f"grep -r token ~/{top}", "reads every store under it")
+                self.assert_allowed("cat ~/.config/app/settings.toml", "a root holding no store")
+
     def test_reads_inside_the_scope_stay_approved(self):
         for command in (
             "cat AGENTS.md",
@@ -2777,6 +2900,21 @@ class RefusesBuiltinsThatRunAProgram(Verdicts, unittest.TestCase):
             "exec touch PWNED",
             "read x",
             "[ -f a ]",
+        ):
+            with self.subTest(command=command):
+                self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
+
+    def test_command_only_looks_up(self):
+        """`command -v` is read; every other form runs its operand or prints a function's
+        body, and an operand the shell supplies could be either."""
+        for command in (
+            "command ls",
+            "command -p ls",
+            "command -V ls",
+            "command -v -p ls",
+            "command -v",
+            'command "$x" ls',
+            'command -v "$x"',
         ):
             with self.subTest(command=command):
                 self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
@@ -3055,6 +3193,22 @@ class RefusesAllowlistedProgramsThatWrite(Verdicts, unittest.TestCase):
             "git worktree prune",
         ):
             self.assert_refused(command, "mutates refs or the worktree list")
+
+    def test_base64_writes_only_through_a_flag_or_an_operand(self):
+        """macOS's `base64 -o FILE` writes, so the flags are an allowlist, and an input
+        beyond the first is refused rather than guessed at."""
+        for command in (
+            "base64 -o out AGENTS.md",
+            "base64 --output=out AGENTS.md",
+            "base64 -do out",
+            "base64 AGENTS.md out",
+            "base64 -i AGENTS.md out",
+            "base64 --input=/etc/os-release",
+            "base64 -i/etc/os-release",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command)
+        self.assert_refused("base64 /etc/os-release", "reads outside the working directories")
 
     def test_the_listing_forms_stay_approved(self):
         """The fix for A-05 must not cost the read forms."""
@@ -3579,6 +3733,42 @@ class RefusesGitSubcommandsOutsideTheReadSet(Verdicts, unittest.TestCase):
         self.assert_refused("git --work-tree=/tmp status", "operates on another tree")
         self.assert_refused("git --namespace=x log", "reads another ref namespace")
 
+    def test_the_branch_and_remote_verbs_that_write(self):
+        """`branch` and `remote` are read in their listing forms only. A name outside list
+        mode creates a branch, `-l` was `--create-reflog` before git 2.19, and an
+        abbreviation git accepts is refused along with the flag it abbreviates."""
+        for subcommand in (
+            "branch x",
+            "branch -d x",
+            "branch -D x",
+            "branch --del x",
+            "branch -m a b",
+            "branch -c a b",
+            "branch -C a b",
+            "branch -f x HEAD",
+            "branch -u origin/x",
+            "branch --set-upstream-to=origin/x",
+            "branch --unset-upstream",
+            "branch --edit-description",
+            "branch -t x origin/x",
+            "branch -l x",
+            "branch -r x",
+            "branch --abbrev 7",
+            "branch --color always",
+            "branch -- x",
+            "remote add o https://x",
+            "remote remove origin",
+            "remote rename origin o",
+            "remote set-head origin -a",
+            "remote prune origin",
+            "remote update",
+            "remote show origin",
+            "remote get-url origin upstream",
+            "remote get-url --bogus origin",
+        ):
+            with self.subTest(subcommand=subcommand):
+                self.assert_refused(f"git {subcommand}")
+
     def test_submodule_foreach_runs_a_shell_command(self):
         self.assert_refused("git submodule foreach 'touch PWNED'", "runs a shell per module")
         self.assert_refused("git submodule foreach --recursive id", "runs id per module")
@@ -3849,7 +4039,8 @@ class RefusesGcloudCallsThatWriteLocallyOrExecute(Verdicts, unittest.TestCase):
 class RefusesGhApiCallsThatWriteOrLeak(Verdicts, unittest.TestCase):
     """`gh api` is a generic HTTP client holding the operator's token. A GET to a REST path
     is a read; everything that changes the method, sends a body, picks the host, or prints
-    the token is not. Other `gh` subcommands are the operator's rules' to grant."""
+    the token is not. `gh pr|run|issue|repo` reads have their own classes below; every other
+    subcommand is the operator's rules' to grant."""
 
     def test_a_get_to_a_rest_path_is_approved(self):
         self.assert_allowed(
@@ -3897,9 +4088,165 @@ class RefusesGhApiCallsThatWriteOrLeak(Verdicts, unittest.TestCase):
     def test_other_subcommands_are_left_to_the_rules(self):
         """No opinion, so a rule can still grant them, as before `gh` had a validator."""
         with self.assertRaises(hook.NoOpinion):
-            hook._classify("gh issue view 6 -R o/r --json title")
-        with operator_rules(allow=["Bash(gh issue view *)"]):
-            self.assert_allowed("gh issue view 6 -R o/r --json title")
+            hook._classify("gh release view v1 -R o/r --json name")
+        with operator_rules(allow=["Bash(gh release view *)"]):
+            self.assert_allowed("gh release view v1 -R o/r --json name")
+
+
+class ApprovesReadOnlyGhSubcommands(Verdicts, unittest.TestCase):
+    """`gh pr|run|issue|repo` reads are approved without a rule, flag by flag. The first four
+    are the segments that prompted in a real session, with the redirects and filters they
+    came with."""
+
+    def test_the_commands_that_prompted(self):
+        self.assert_allowed("gh pr list --head feat/first-version 2>&1 | head")
+        self.assert_allowed("gh pr list --head feat/first-version --state all 2>&1")
+        self.assert_allowed("gh run list --branch feat/first-version --limit 5 2>&1")
+        self.assert_allowed(
+            "gh pr checks 2 2>&1; gh run view 37991862400 --log-failed 2>&1 | tail -80"
+        )
+        self.assert_allowed(
+            "gh run view 37991862400 --log-failed 2>&1"
+            ' | grep -E "Would reformat|reformat|ruff|error|make" | head -20'
+        )
+
+    def test_one_approval_per_subcommand(self):
+        for command in (
+            "gh pr view 3 --comments --json title,body",
+            "gh pr list --author someone --label bug --limit 50 --state merged",
+            "gh pr diff 3 --name-only",
+            "gh pr diff 3 --patch --color never",
+            "gh pr checks 3 --required",
+            "gh run list --workflow ci.yml --status failure",
+            "gh run view 1 --log",
+            "gh run view 1 --job 2 --exit-status",
+            "gh issue view 6 -R o/r --json title",
+            "gh issue list --repo o/r --state all --search 'is:open'",
+            "gh repo view o/r --json name",
+            "gh repo view --branch main",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+
+    def test_every_spelling_of_a_value(self):
+        self.assert_allowed("gh pr list --limit=5 --state=all")
+        self.assert_allowed("gh pr list -L5 -sall")
+        self.assert_allowed("gh pr list -L 5 -s all")
+        self.assert_allowed("gh pr view --help", "prints help, no request")
+        self.assert_allowed("gh issue view 1 --json title --jq '.title'")
+
+    def test_a_filter_may_use_dollar_signs_that_are_not_the_environment(self):
+        self.assert_allowed("gh pr list --json number --jq 'map(select(.number > 3))'")
+
+
+class RefusesGhFlagsThatOpenOrWait(Verdicts, unittest.TestCase):
+    """What a flag table cannot vouch for is left to the operator's rules: it opens a
+    browser, blocks, prints escapes, or names a host. Each is a prompt, not a block."""
+
+    def assert_no_opinion(self, command: str, why: str = "") -> None:
+        with self.assertRaises(hook.NoOpinion, msg=why or command):
+            hook._classify(command)
+
+    def test_a_browser_a_watch_and_a_template(self):
+        for command in (
+            "gh pr view 3 --web",
+            "gh pr list -w",
+            "gh pr checks 3 --watch",
+            "gh pr checks 3 -i 5",
+            "gh pr view 3 --template '{{.title}}'",
+            "gh pr diff 3 --allow-escape-sequences",
+        ):
+            with self.subTest(command=command):
+                self.assert_no_opinion(command)
+
+    def test_an_unknown_flag_a_cluster_and_a_terminator(self):
+        self.assert_no_opinion("gh pr view 3 --foo")
+        self.assert_no_opinion("gh pr view -dc 3", "a cluster is not guessed at")
+        self.assert_no_opinion("gh pr view 3 --", "what follows is not a flag")
+        self.assert_no_opinion("gh pr list --state", "a value flag with no value")
+        self.assert_no_opinion("gh pr view 3 --comments=false", "a bare flag with a value")
+        self.assert_no_opinion("gh pr view 1 2", "more operands than the verb takes")
+
+    def test_w_is_the_workflow_only_where_the_verb_says_so(self):
+        self.assert_allowed("gh run list -w ci.yml")
+        self.assert_no_opinion("gh run view 1 -w", "`-w` opens the run in a browser here")
+
+    def test_nothing_is_sent_to_another_host(self):
+        self.assert_no_opinion("gh pr view 3 -R host/o/r")
+        self.assert_no_opinion("gh pr view 3 --repo=host/o/r")
+        self.assert_no_opinion("gh pr view https://example.com/o/r/pull/3")
+        self.assert_no_opinion("gh run view https://example.com/o/r/actions/runs/1")
+        self.assert_no_opinion("gh repo view host/o/r")
+        self.assert_no_opinion("gh repo view https://github.com/o/r")
+
+    def test_a_word_the_shell_builds_is_not_read(self):
+        self.assert_no_opinion('gh pr view "$n"')
+        self.assert_no_opinion("gh pr view $n")
+        self.assert_no_opinion("gh pr view $(echo 3)")
+        self.assert_no_opinion("gh pr view *", "the shell fills in the operands")
+        self.assert_no_opinion("gh pr list --head $b")
+
+    def test_a_rule_can_still_grant_what_was_left_alone(self):
+        with operator_rules(allow=["Bash(gh pr view *)"]):
+            self.assert_allowed("gh pr view 3 --web")
+            self.assert_allowed('gh pr view "$n"')
+
+    def test_subcommands_outside_the_read_set_are_left_alone(self):
+        for command in (
+            "gh auth token",
+            "gh secret list",
+            "gh pr merge 1",
+            "gh pr create --fill",
+            "gh pr comment 1 --body x",
+            "gh run rerun 1",
+            "gh run cancel 1",
+            "gh issue delete 1",
+            "gh pr",
+            "gh",
+        ):
+            with self.subTest(command=command):
+                self.assert_no_opinion(command)
+
+
+class RefusesGhJqThatReadsTheEnvironment(Verdicts, unittest.TestCase):
+    """gh's own jq has `env` and `$ENV`, so `--jq` can print the token. The refusal is a
+    finding, not a lack of opinion, so an allow rule does not overturn it, on a subcommand
+    the hook reads and on one it leaves to the rules alike."""
+
+    FILTERS = ("'$ENV.GH_TOKEN'", "env", "'env.GH_TOKEN'", "'.a | $ENV'")
+
+    def spellings(self, filter_text: str):
+        return (
+            f"--jq {filter_text}",
+            f"--jq={filter_text}",
+            f"-q {filter_text}",
+            f"-q{filter_text}",
+        )
+
+    def test_every_spelling_on_a_subcommand_the_hook_reads(self):
+        for filter_text in self.FILTERS:
+            for spelling in self.spellings(filter_text):
+                command = f"gh issue view 1 {spelling}"
+                with self.subTest(command=command):
+                    self.assert_refused(command, "the filter prints the environment")
+                    with self.assertRaises(hook.NotReadOnly) as raised:
+                        hook._classify(command)
+                    self.assertNotIsInstance(raised.exception, hook.NoOpinion)
+
+    def test_a_rule_does_not_overturn_it(self):
+        with operator_rules(allow=["Bash(gh issue view *)", "Bash(gh release view *)"]):
+            for command in (
+                "gh issue view 1 --jq '$ENV.GH_TOKEN'",
+                "gh issue view 1 -qenv",
+                "gh release view v1 --jq '$ENV.GH_TOKEN'",
+                "gh pr list -dq env",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command, "the rule says yes and the filter says no")
+
+    def test_a_field_named_env_is_not_the_environment(self):
+        self.assert_allowed("gh pr list --json number --jq '.[] | .env_name'")
+        self.assert_allowed("gh pr list --json number --jq '.[] | \"env\"'")
 
 
 # ======================================================================================
@@ -3924,16 +4271,16 @@ class OperatorRules(Verdicts, unittest.TestCase):
     """
 
     def test_a_rule_supplies_a_program_the_module_does_not_know(self):
-        with operator_rules(allow=["Bash(gh issue list *)"]):
-            self.assert_allowed("gh issue list --repo org-slug/repo-name --state all")
+        with operator_rules(allow=["Bash(gh release list *)"]):
+            self.assert_allowed("gh release list --repo org-slug/repo-name --state all")
             self.assert_allowed(
-                "printf '=== issues ===\\n'; gh issue list --repo org-slug/repo-name "
+                "printf '=== releases ===\\n'; gh release list --repo org-slug/repo-name "
                 "--limit 400 --json number,title 2>&1 | grep -iE 'key|secret'",
                 "the rule covers the one segment the classifier cannot read",
             )
 
     def test_a_rule_covers_only_what_it_says(self):
-        with operator_rules(allow=["Bash(gh issue list *)"]):
+        with operator_rules(allow=["Bash(gh release list *)"]):
             self.assert_refused("gh pr merge 1", "no rule covers it")
             self.assert_refused("gh issue delete 1", "no rule covers it")
             self.assert_refused("ls; gh pr merge 1", "no rule covers the second segment")
@@ -3970,15 +4317,15 @@ class OperatorRules(Verdicts, unittest.TestCase):
             self.assert_allowed('firebase database:get "/.settings/rules" --project x')
 
     def test_a_rule_reaches_inside_a_substitution(self):
-        with operator_rules(allow=["Bash(gh issue list *)"]):
-            self.assert_allowed("n=$(gh issue list --repo x --json number)")
+        with operator_rules(allow=["Bash(gh release list *)"]):
+            self.assert_allowed("n=$(gh release list --repo x --json number)")
         with operator_rules():
-            self.assert_refused("n=$(gh issue list --repo x --json number)")
+            self.assert_refused("n=$(gh release list --repo x --json number)")
 
     def test_no_rule_file_leaves_the_classifier_alone(self):
         with settings_at(Path(tempfile.gettempdir()) / "no-such-file"):
             self.assert_allowed("wc -l AGENTS.md", "the classifier still decides")
-            self.assert_refused("gh issue list --repo x", "and nothing else does")
+            self.assert_refused("gh release list --repo x", "and nothing else does")
 
     def test_a_malformed_rule_file_is_not_a_crash(self):
         with tempfile.TemporaryDirectory(prefix="readonly_hook_rules_") as directory:
@@ -3987,7 +4334,7 @@ class OperatorRules(Verdicts, unittest.TestCase):
                 path.write_text(content)
                 with settings_at(path), self.subTest(content=content):
                     self.assert_allowed("wc -l AGENTS.md")
-                    self.assert_refused("gh issue list --repo x")
+                    self.assert_refused("gh release list --repo x")
 
 
 @approvals_budgeted
@@ -4006,7 +4353,7 @@ class OperatorRuleFileRobustness(Verdicts, unittest.TestCase):
             tempfile.TemporaryDirectory(prefix="readonly_hook_rules_") as directory,
             settings_at(directory),
         ):
-            self.assert_refused("gh issue list --repo x", "no rule can be read")
+            self.assert_refused("gh release list --repo x", "no rule can be read")
 
     def test_rule_entries_that_are_not_strings(self):
         document = {
@@ -4019,7 +4366,7 @@ class OperatorRuleFileRobustness(Verdicts, unittest.TestCase):
             path = Path(directory) / "settings.local.json"
             path.write_text(json.dumps(document))
             with settings_at(path):
-                self.assert_refused("gh issue list --repo x", "no rule covers it")
+                self.assert_refused("gh release list --repo x", "no rule covers it")
 
     def test_rules_for_other_tools_are_not_bash_rules(self):
         document = {
@@ -4038,7 +4385,7 @@ class OperatorRuleFileRobustness(Verdicts, unittest.TestCase):
             path = Path(directory) / "settings.local.json"
             path.write_text(json.dumps(document))
             with settings_at(path):
-                self.assert_refused("gh issue list --repo x", "none of these is a Bash rule")
+                self.assert_refused("gh release list --repo x", "none of these is a Bash rule")
                 self.assert_refused("touch PWNED", "and none of them grants a write")
 
     def test_a_deeply_nested_document(self):
@@ -5177,6 +5524,16 @@ class PolicyAlreadyDecidedToRefuse(Verdicts, unittest.TestCase):
         self.assert_refused("cat /proc/self/mem", "reads this process's memory")
         self.assert_refused("cat /sys/class/net/eth0/address", "outside the working tree")
 
+    def test_a_repository_outside_the_working_directories(self):
+        """Decided: refused. `git -C` was approved and recorded as undecided, on the reading
+        that it only relocates the read. It relocates the config as well, which is why
+        `--git-dir` is refused (G-04): `core.fsmonitor` runs on `status`, `gpg.program` on a
+        `log` that shows signatures. Inside the read roots it stays approved, in
+        `RefusesGitConfigDrivenExecution` and `ApprovesOrdinaryOptionForms`."""
+        for command in ("git -C /tmp log", "git --no-pager -C /tmp log"):
+            with self.subTest(command=command):
+                self.assert_refused(command, "loads the config of the repository at /tmp")
+
     def test_resource_exhaustion(self):
         """A field width is what makes output unbounded. The `find` case was recorded as
         `-printf '%p%p%p'`, which only triples a listing, and is the width form instead."""
@@ -5216,15 +5573,15 @@ class PolicyStillUndecided(Verdicts, unittest.TestCase):
 
     Reads outside the working directories and the `/proc` pseudo-files were here and have
     been decided: they are refused, and `RefusesReadsOutsideTheWorkingDirectories` holds them.
+    So was `git -C` outside them, now in `PolicyAlreadyDecidedToRefuse`.
     """
 
-    def test_reads_that_leave_the_working_tree_through_a_flag(self):
-        """`git -C` and `--git-dir` point git at another tree. `--git-dir` is refused
-        elsewhere because a foreign config runs code; `-C` only relocates the read, so it
-        is here rather than there."""
-        for command in ("git -C /tmp log", "git --no-pager -C /tmp log"):
-            with self.subTest(command=command):
-                self.assert_allowed(command, "reads another repository; approved today")
+    def test_a_nested_repository_brings_its_own_config(self):
+        """`git -C` into a directory inside the project is approved, and if that directory
+        is a repository of its own -- a vendored checkout, an unpacked archive -- git loads
+        its config, which can name a program to run, as `--git-dir` would. The module reads
+        the path, not the disk, so it cannot tell. `cd vendor/lib && git status` is the same."""
+        self.assert_allowed("git -C vendor/lib status", "a nested repository; approved today")
 
 
 @unittest.skip("recorded, not asserted: see the class docstring")

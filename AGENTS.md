@@ -16,6 +16,8 @@ insists on its own filename, symlink to this file rather than copying it.
   Bash tool call (exec form, so the path needs no quoting).
 - `tests/test_hook_contract.py` runs the hook exactly as `hooks.json` defines it.
 - `ci/validate-plugin.sh` wraps `claude plugin validate` (see "No `version`").
+- `tools/explain.py` prints the hook's verdict and reason for each command, for a given
+  session (see [Develop](#develop))
 
 ## Rules for the hook
 
@@ -32,6 +34,21 @@ insists on its own filename, symlink to this file rather than copying it.
   any error, exit 0 with no output. Never exit 2: that blocks the call instead
   of handing it to the user. A crash or timeout also falls back to the normal
   permission prompt, but shows the user a hook error.
+- **`gh`**
+  - The hook reads `gh api` GETs and the read-only `pr`, `run`, `issue` and `repo` subcommands
+    itself (`GH_READ_SPECS`); any other subcommand, or a flag the table doesn't list,
+    is left to the operator's rules.
+  - A `--jq` that reads the environment is refused, which no rule overturns.
+    Operators can drop native `Bash(gh ... view|list *)` allow rules: a native rule still approves
+    `--jq '$ENV.GH_TOKEN'`, and only a native deny rule stops that.
+- **Widening**: a change that approves more records where it stops, as
+  `TheWideningsHaveAnEdge` does for the loop and splice widenings
+  - Each new approval comes with its paired refusals
+  - Each refusal sits beside a control approved under the same setup, so a setup that silently
+    does nothing fails instead of passing
+  - For a path-based widening, the refusals include a recursive read, such as `grep -r`, of the
+    directory holding each credential store: Layer B refuses a word that names a store, not one
+    that names its parent
 - **Stdlib only, isolated interpreter.** `-I` ignores `PYTHONPATH` and user
   site-packages, and keeps the script's own directory off `sys.path`. If the
   hook is split into modules, add its directory explicitly:
@@ -61,10 +78,40 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   after edits. A `--plugin-dir` plugin with the same manifest name replaces the
   installed one for that session; `claude plugin list` still shows the
   installed one as enabled.
-- Tests: `python3 -m unittest discover -s tests`
-- Validate: `bash ci/validate-plugin.sh plugin` (needs `claude` on `PATH`)
+- Verify with `make check`, which lints and tests as CI does, or with one target such as
+  `make test` or `make lint-py`; `make help` lists them.
+  - `make` runs ruff from `$(RUFF)`: pass e.g. `RUFF=../.venv/bin/ruff` when it isn't on
+    `PATH`.
+  - `make validate` runs `claude plugin validate` through `ci/validate-plugin.sh` and needs
+    `claude` on `PATH`; `make check` leaves it out.
 - Live debugging: start with `claude --debug`; `~/.claude/debug/<session-id>.txt`
   records which hooks matched and their exit codes.
+- Triage a command that prompted by replaying it in its session's context, never a guessed one:
+  - Find the session's transcript by its id: `ls ~/.claude/projects/*/<session-id>.jsonl`. It
+    moves when the session is resumed elsewhere, and every directory there starts with `-`, so
+    pass paths after `--` or prefixed with `./`
+  - The transcript records the shell's working directory as `cwd` on each entry. The project
+    directory is the one in the session's scratchpad path, or in "Shell cwd was reset to ..."
+  - Replay with `make explain` (i.e. `tools/explain.py`):
+    - `make explain PROJECT=<dir> CWD=<dir> < commands.txt`
+    - Add `HOOK=<path>` to ask the installed copy instead of the working copy
+
+## Linting
+
+When a linter flags content that is correct, fix the linter's configuration, not the content.
+For example:
+
+- The hanging indent of a docstring or a Markdown list item: `editorconfig-checker` reads it as
+  a wrong indent, so the `Makefile` passes `-disable-indent-size`.
+- A CommonMark list continuation: keep it, and adjust the markdownlint rule that flags it.
+- A line that can't be wrapped, such as a long URL or command: exempt it in the
+  configuration rather than breaking it.
+
+## Commits
+
+- Conventional commits
+- The subject line comes first and stands alone: `type(scope): Summary`, as in `git log`.
+- Add a body only when the subject isn't enough, but not too verbose.
 
 ## Release
 

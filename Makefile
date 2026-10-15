@@ -24,6 +24,12 @@ SH_FILES = $(shell git ls-files '*.sh')
 JSON_FILES = $(shell git ls-files '*.json')
 ALL_FILES = $(shell git ls-files)
 
+# The session to explain a verdict for, and the copy of the hook to ask, e.g.
+# `make explain PROJECT=~/ws/app CWD=~/ws/app/sub < commands.txt`
+PROJECT ?= $(CURDIR)
+CWD ?= $(PROJECT)
+HOOK ?= plugin/scripts/sh_auto_approve.py
+
 # $(call container,<binary>,<image>,<workdir>): <binary> from <image>, with the repository
 # mounted at <workdir>. The entrypoint is named, since not every image sets one.
 container = docker run --rm --user "$$(id -u):$$(id -g)" \
@@ -82,6 +88,10 @@ lint-json: ## Check that every JSON file parses
 .PHONY: test
 test: ## Run the tests
 	$(PYTHON) -m unittest discover -s tests
+
+.PHONY: explain
+explain: ## Print the hook's verdict and reason for each command on stdin
+	$(PYTHON) -I tools/explain.py --project "$(PROJECT)" --cwd "$(CWD)" --hook "$(HOOK)"
 
 .PHONY: validate
 validate: ## Run `claude plugin validate` (needs `claude` on PATH)
