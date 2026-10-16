@@ -2249,8 +2249,8 @@ def _check_command_builtin(args: list[str]) -> None:
 # `base64` flags, GNU's and macOS's, that neither write nor take a file to write to. macOS has
 # `-o FILE` and `--output=FILE`, which is why this is an allowlist. `-i` is GNU's `--ignore-garbage`
 # and macOS's input file; `READER_SPECS` checks the word after it as a file either way.
-# macOS's `--input=FILE` is not listed: `READER_SPECS` cannot read an attached file, so it would be
-# a path nothing checked.
+# macOS's `--input=FILE` is not listed: adding it here means adding it to `READER_SPECS` as well,
+# so that its file is checked.
 BASE64_BARE_FLAGS = frozenset({"-d", "-D", "--decode", "-i", "--ignore-garbage"})
 BASE64_VALUE_FLAGS = frozenset({"-w", "--wrap", "-b", "--break"})
 
@@ -2526,38 +2526,48 @@ def _check_command(
         ):
             raise NotReadOnly(f"{program} expands a value in a command that spells an escape")
 
-    # Layer A: a reader this module knows may only open files inside the working directories.
-    # Outside them, or unresolvable, is not a verdict this module can give; the operator's
-    # own allow rules decide, as they do for any program the module cannot read.
-    if scope is not None and program in READER_SPECS:
-        for index in _file_operands(program, args):
-            problem = _read_scope_problem(arg_tokens[index], args[index], parts, scope)
-            if problem is not None:
-                raise NoOpinion(f"{program} reads {problem}")
-
     # Fail-closed dispatch: either a dedicated validator, a purely read-only program, or reject
     if program in PROGRAM_VALIDATORS:
         if program in GLOB_AWARE:
             PROGRAM_VALIDATORS[program](args, live_globs)
         else:
             PROGRAM_VALIDATORS[program](args)
-        # `-C` points git at the repository there, and so at that repository's config, which
-        # can name a program git runs: `core.fsmonitor` on `status`, `gpg.program` on a `log`
-        # that shows signatures. That is `--git-dir` under another name, so a directory
-        # outside the read roots is not this module's to approve. It is checked after the
-        # validator, so a write the validator found keeps its verdict whatever a rule says.
-        if program == "git" and scope is not None:
-            directories = _git_directories(args)
-            if len(directories) > 1:
-                raise NoOpinion("git -C given more than once, each relative to the last")
-            for index in directories:
-                problem = _read_scope_problem(arg_tokens[index], args[index], parts, scope)
-                if problem is not None:
-                    raise NoOpinion(f"git -C points at {problem}")
-    elif program in READ_ONLY:
-        return
-    else:
+    elif program not in READ_ONLY:
         raise NoOpinion(f"unrecognized program: {program}")
+
+    # The read scope comes after the validator, so a write the validator found keeps its
+    # verdict whatever a rule says: `sort -o out /etc/hostname` writes `out` wherever it reads.
+    if scope is None:
+        return
+
+    # Layer A: a reader this module knows may only open files inside the working directories.
+    # Outside them, or unresolvable, is not a verdict this module can give; the operator's
+    # own allow rules decide, as they do for any program the module cannot read.
+    if program in READER_SPECS:
+        for index, start in _file_operands(program, args):
+            token, text = arg_tokens[index], args[index]
+            if start:
+                # A path attached to its flag: the flag must be written out, so that the token
+                # can be cut where the text is. `'--from-file=/x'` quotes both together.
+                if token[:start] != text[:start]:
+                    raise NoOpinion(f"{program} given a file flag it cannot split: {text}")
+                token, text = token[start:], text[start:]
+            problem = _read_scope_problem(token, text, parts, scope)
+            if problem is not None:
+                raise NoOpinion(f"{program} reads {problem}")
+
+    # `-C` points git at the repository there, and so at that repository's config, which
+    # can name a program git runs: `core.fsmonitor` on `status`, `gpg.program` on a `log`
+    # that shows signatures. That is `--git-dir` under another name, so a directory
+    # outside the read roots is not this module's to approve.
+    if program == "git":
+        directories = _git_directories(args)
+        if len(directories) > 1:
+            raise NoOpinion("git -C given more than once, each relative to the last")
+        for index in directories:
+            problem = _read_scope_problem(arg_tokens[index], args[index], parts, scope)
+            if problem is not None:
+                raise NoOpinion(f"git -C points at {problem}")
 
 
 class _GlobRule:
@@ -2940,12 +2950,21 @@ def _read_scope_problem(
     return None
 
 
-# How each known reader takes its arguments. `pattern` is a first operand that is a
-# pattern, script or filter rather than a file -- unless a flag in `script_flags` supplied
-# it. `values` take a following argument that is not a file; `files` take one that is.
-# `pairs` take two, of which the second is a file when the flag is in `pair_files`. A flag
-# missing from every set is treated as taking nothing, so its neighbour is checked as a
-# file: a mistake in this table costs a prompt, never a skipped path.
+# How each known reader takes its arguments.
+# - `pattern` is a first operand that is a pattern, script or filter rather than a file -- unless
+#   a flag in `script_flags` supplied it
+# - `values` take a following argument that is not a file
+# - `files` take a following argument that is a file
+# - `file_lists` take a file that names the files to read, which the command never shows, so no path
+#    is there to check: `sort --files0-from=list` prints whatever `list` names
+# - `pairs` take two, of which the second is a file when the flag is in `pair_files`
+# - `attached_values` take a value only when it is attached (`--color=auto`, `-w16`), so the word
+#   after one is not its value
+# - A flag missing from every set is treated as taking nothing, so its neighbour is checked as
+#   a file, and so is a value attached to it with `=`: a mistake in this table costs a prompt,
+#   never a skipped path
+# - `no_bundles` marks a program whose single-dash options are whole words (`xxd -cols`),
+#   not bundles of letters (`grep -rf`)
 READER_SPECS = {
     "cat": {},
     "tac": {"values": {"-s", "--separator"}},
@@ -2969,8 +2988,6 @@ READER_SPECS = {
             "--include",
             "--exclude",
             "--exclude-dir",
-            "--color",
-            "--colour",
             "--label",
             "-d",
             "-D",
@@ -2979,6 +2996,7 @@ READER_SPECS = {
             "--binary-files",
             "--group-separator",
         },
+        "attached_values": {"--color", "--colour"},
         "files": {"-f", "--file", "--exclude-from"},
     },
     "sed": {
@@ -2996,13 +3014,13 @@ READER_SPECS = {
     "jq": {
         "pattern": True,
         "script_flags": {"-f", "--from-file"},
-        "values": {"--indent", "--seq"},
+        "values": {"--indent"},
         "files": {"-f", "--from-file", "-L"},
         "pairs": {"--arg", "--argjson", "--slurpfile", "--rawfile"},
         "pair_files": {"--slurpfile", "--rawfile"},
         "positional_stop": {"--args", "--jsonargs"},
     },
-    "wc": {"files": {"--files0-from"}},
+    "wc": {"files": {"--files0-from"}, "file_lists": {"--files0-from"}},
     "sort": {
         "values": {
             "-k",
@@ -3017,6 +3035,7 @@ READER_SPECS = {
             "--batch-size",
         },
         "files": {"--files0-from"},
+        "file_lists": {"--files0-from"},
     },
     "uniq": {"values": {"-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"}},
     "cut": {
@@ -3036,8 +3055,6 @@ READER_SPECS = {
         "values": {
             "-U",
             "-C",
-            "--unified",
-            "--context",
             "--label",
             "-I",
             "--ignore-matching-lines",
@@ -3046,6 +3063,7 @@ READER_SPECS = {
             "-W",
             "--width",
         },
+        "attached_values": {"--unified", "--context"},
         "files": {"-X", "--exclude-from", "--from-file", "--to-file"},
     },
     "cmp": {"values": {"-i", "--ignore-initial", "-n", "--bytes"}},
@@ -3059,15 +3077,17 @@ READER_SPECS = {
             "-j",
             "-N",
             "-t",
-            "-w",
             "--address-radix",
             "--skip-bytes",
             "--read-bytes",
             "--format",
-            "--width",
-        }
+        },
+        "attached_values": {"-w", "--width"},
     },
-    "xxd": {"values": {"-c", "-g", "-l", "-s", "-o", "-cols", "-len", "-seek"}},
+    "xxd": {
+        "values": {"-c", "-g", "-l", "-s", "-o", "-cols", "-len", "-seek"},
+        "no_bundles": True,
+    },
     "base64": {"values": {"-w", "--wrap", "-b", "--break"}, "files": {"-i"}},
     "md5sum": {},
     "sha1sum": {},
@@ -3077,6 +3097,7 @@ READER_SPECS = {
     "file": {
         "values": {"-F", "--separator", "-e", "--exclude", "-P", "--parameter"},
         "files": {"-m", "--magic-file", "-f", "--files-from"},
+        "file_lists": {"-f", "--files-from"},
     },
     "du": {
         "values": {
@@ -3090,6 +3111,7 @@ READER_SPECS = {
             "--time-style",
         },
         "files": {"--files0-from", "-X", "--exclude-from"},
+        "file_lists": {"--files0-from"},
     },
     "ls": {
         "values": {
@@ -3102,13 +3124,13 @@ READER_SPECS = {
             "--time",
             "-T",
             "--tabsize",
-            "--color",
             "--block-size",
             "--hide",
             "--indicator-style",
             "--quoting-style",
             "--time-style",
-        }
+        },
+        "attached_values": {"--color"},
     },
     "column": {
         "values": {
@@ -3126,7 +3148,8 @@ READER_SPECS = {
     },
     "date": {
         "operands_are_not_files": True,
-        "values": {"-d", "--date", "-I", "--iso-8601", "--rfc-3339"},
+        "values": {"-d", "--date", "--rfc-3339"},
+        "attached_values": {"-I", "--iso-8601"},
         "files": {"-r", "--reference", "-f", "--file"},
     },
 }
@@ -3134,18 +3157,62 @@ READER_SPECS["egrep"] = READER_SPECS["fgrep"] = READER_SPECS["grep"]
 READER_SPECS["gawk"] = READER_SPECS["awk"]
 
 
-def _file_operands(program: str, args: list[str]) -> list[int]:
-    """Indexes into `args` of the words this reader will open as files."""
+def _long_flag(name: str, listed: set[str], files: set[str]) -> str:
+    """The listed flag that the long option ``name`` stands for, or ``name`` itself.
+
+    ``getopt_long`` accepts any unambiguous prefix, so ``diff --from-f=X`` reads ``X`` as
+    ``--from-file=X`` does. A prefix of several listed flags is ambiguous, and the program
+    rejects it, but if one of them takes a file it is read as that one, so the path is checked
+    either way.
+    """
+    if name in listed:
+        return name
+    candidates = sorted(flag for flag in listed if flag.startswith(name))
+    for flag in candidates:
+        if flag in files:
+            return flag
+    return candidates[0] if len(candidates) == 1 else name
+
+
+def _short_flag(arg: str, takes_value: set[str], bundles: bool) -> tuple[str, int]:
+    """The flag in the single-dash word ``arg`` that takes a value, and where that value starts.
+
+    getopt reads ``-rfX`` as ``-r -f X``: the first letter that takes a value takes the rest of
+    the word, or the next word when nothing is left, so the start is 0 then. A word with no
+    such letter is a bundle of flags that take nothing, returned whole. Without ``bundles``
+    only the first letter is read: ``xxd -ps`` is one option, not ``-p -s``.
+    """
+    if arg in takes_value:
+        return arg, 0
+    for position in range(1, len(arg) if bundles else 2):
+        flag = "-" + arg[position]
+        if flag in takes_value:
+            rest = position + 1
+            return flag, rest if rest < len(arg) else 0
+    return arg, 0
+
+
+def _file_operands(program: str, args: list[str]) -> list[tuple[int, int]]:
+    """Where in `args` the words this reader will open as files are.
+
+    Each entry is an index into `args`, and where the path starts in that word: past
+    `--from-file=` or `-rf` when it is attached to its flag, 0 when the word is all path.
+    Raises `NoOpinion` for a flag in `file_lists`, whose files no word names.
+    """
     spec = READER_SPECS[program]
     values = spec.get("values", set())
+    attached_values = spec.get("attached_values", set())
     files = spec.get("files", set())
+    file_lists = spec.get("file_lists", set())
     pairs = spec.get("pairs", set())
     pair_files = spec.get("pair_files", set())
     script_flags = spec.get("script_flags", set())
     stop_flags = spec.get("positional_stop", set())
     operands_are_files = not spec.get("operands_are_not_files", False)
+    bundles = not spec.get("no_bundles", False)
+    listed = values | attached_values | files | pairs | script_flags | stop_flags
 
-    found: list[int] = []
+    found: list[tuple[int, int]] = []
     pattern_pending = bool(spec.get("pattern"))
     positional_stop = False
     options_done = False
@@ -3157,28 +3224,37 @@ def _file_operands(program: str, args: list[str]) -> list[int]:
             index += 1
             continue
         if not options_done and arg.startswith("-") and arg != "-":
-            flag, _, attached = arg.partition("=") if arg.startswith("--") else (arg, "", "")
-            if not arg.startswith("--") and len(arg) > 2 and arg[:2] in files | values:
-                flag, attached = arg[:2], arg[2:]  # `-fFILE`, `-n5`
+            if arg.startswith("--"):
+                name, equals, _ = arg.partition("=")
+                flag = _long_flag(name, listed, files)
+                start = len(name) + 1 if equals else 0
+                if start and flag not in listed:
+                    found.append((index, start))  # a value attached to a flag the table lacks
+                    index += 1
+                    continue
+            else:
+                flag, start = _short_flag(arg, values | attached_values | files, bundles)
             if flag in script_flags:
                 pattern_pending = False
             if flag in stop_flags:
                 positional_stop = True
             if flag in pairs:
                 if flag in pair_files and index + 2 < len(args):
-                    found.append(index + 2)
+                    found.append((index + 2, 0))
                 index += 3
                 continue
+            if flag in file_lists:
+                raise NoOpinion(f"{program} {flag} reads the files another file names")
             if flag in files:
-                if attached:
-                    found.append(index)
+                if start:
+                    found.append((index, start))
                     index += 1
                 else:
                     if index + 1 < len(args):
-                        found.append(index + 1)
+                        found.append((index + 1, 0))
                     index += 2
                 continue
-            if flag in values and not attached:
+            if flag in values and not start:
                 index += 2
                 continue
             index += 1
@@ -3186,7 +3262,7 @@ def _file_operands(program: str, args: list[str]) -> list[int]:
         if pattern_pending:
             pattern_pending = False
         elif operands_are_files and not positional_stop:
-            found.append(index)
+            found.append((index, 0))
         index += 1
     return found
 

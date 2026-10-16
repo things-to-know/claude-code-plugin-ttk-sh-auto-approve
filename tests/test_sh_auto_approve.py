@@ -2675,6 +2675,96 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_refused(command)
 
+    def test_a_path_wherever_getopt_finds_it(self):
+        """A file flag's path is checked wherever the program reads it from: after `=`,
+        attached to a short flag, at the end of a bundle, or after a prefix of the long flag,
+        which getopt_long accepts. Each spelling is approved with a file in the project."""
+        for spelling in (
+            "diff --from-file {} AGENTS.md",
+            "diff --from-file={} AGENTS.md",
+            "diff --from-f={} AGENTS.md",
+            "diff -X{} AGENTS.md README.md",
+            "diff -aX{} AGENTS.md README.md",
+            "grep -f{} AGENTS.md",
+            "grep -rf {} .",
+            "du --exclude-from={} .",
+            "date --reference={}",
+            "date --ref={}",
+            "date -ur {}",
+            "sort -R --random-source={} AGENTS.md",
+            "xxd -ps {}",
+        ):
+            with self.subTest(spelling=spelling):
+                self.assert_refused(spelling.format("/etc/os-release"), "reads /etc/os-release")
+                self.assert_allowed(spelling.format("docs/a.md"), "a file in the project")
+
+    def test_an_attached_path_that_cannot_be_cut_from_its_flag(self):
+        """The path is checked as the token after the flag, so the flag has to be written
+        out. Quoted together with its path, it is not split, and a rule decides."""
+        self.assert_refused("diff '--from-file=AGENTS.md' README.md", "flag and path in one quote")
+        self.assert_allowed("diff --from-file='AGENTS.md' README.md", "only the path quoted")
+        self.assert_refused("diff --from-file=~/notes.md AGENTS.md", "the home directory")
+        self.assert_refused('f=/etc/os-release; diff --from-file="$f" AGENTS.md')
+        self.assert_allowed('f=AGENTS.md; diff --from-file="$f" README.md')
+
+    def test_a_value_that_must_be_attached(self):
+        """`--color`, `--unified`, `od -w` and `date -I` take a value only after `=` or
+        attached, and `jq --seq` takes none, so the word after one is a file."""
+        for spelling in (
+            "grep --color x {}",
+            "ls --color {}",
+            "diff --unified {} AGENTS.md",
+            "diff --context {} AGENTS.md",
+            "od -w {}",
+            "od --width {}",
+            "jq --seq . {}",
+            "date -I -r {}",
+        ):
+            with self.subTest(spelling=spelling):
+                self.assert_refused(spelling.format("/etc/os-release"), "reads /etc/os-release")
+                self.assert_allowed(spelling.format("docs/a.md"), "a file in the project")
+        self.assert_allowed("grep --color=auto x AGENTS.md", "an attached value is not a file")
+        self.assert_allowed("od -w16 AGENTS.md", "an attached value is not a file")
+
+    def test_a_list_of_files_is_not_read(self):
+        """`--files0-from` names the files to open inside a file, where no check can see
+        them: `sort --files0-from=list` prints each one. In the project or not, a rule
+        decides, abbreviated or not."""
+        for command in (
+            "sort --files0-from=docs/list",
+            "sort --files0-from docs/list",
+            "sort --files0=docs/list",
+            "wc -l --files0-from=docs/list",
+            "du --files0-from=docs/list",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command, "opens the files the list names")
+        self.assert_allowed("sort docs/list", "the control: the list read as a file")
+
+    def test_the_reader_table_is_consistent(self):
+        """A flag in both `values` and `attached_values` skips the word after it, which is
+        how `ls --color /etc` was approved."""
+        known = {
+            "pattern",
+            "script_flags",
+            "values",
+            "attached_values",
+            "files",
+            "file_lists",
+            "pairs",
+            "pair_files",
+            "positional_stop",
+            "operands_are_not_files",
+            "no_bundles",
+        }
+        for program, spec in hook.READER_SPECS.items():
+            with self.subTest(program=program):
+                self.assertLessEqual(set(spec), known, "a key the parser does not read")
+                values = spec.get("values", set())
+                self.assertFalse(values & spec.get("attached_values", set()))
+                self.assertLessEqual(spec.get("file_lists", set()), spec.get("files", set()))
+                self.assertLessEqual(spec.get("pair_files", set()), spec.get("pairs", set()))
+
     def test_a_path_that_cannot_be_resolved_is_not_vouched_for(self):
         """The case that makes layer A necessary: `printf '/etc/%s' shadow` never names a
         credential store literally, so layer B cannot see it. Only the refusal to vouch for
@@ -4293,6 +4383,15 @@ class OperatorRules(Verdicts, unittest.TestCase):
             self.assert_refused("git diff --output=PWNED", "writes PWNED")
             self.assert_refused("sed -i 's/a/b/' AGENTS.md", "edits in place")
             self.assert_refused("find . -name x -delete", "deletes")
+
+    def test_a_finding_outranks_a_read_outside_the_project(self):
+        """The read scope gives no opinion, which a rule may grant, so it runs after the
+        validator: otherwise a read outside the project hides the write beside it."""
+        with operator_rules(allow=["Bash(sed *)", "Bash(sort *)"]):
+            self.assert_refused("sort -o PWNED /etc/hostname", "writes PWNED")
+            self.assert_refused("sed -i 's/a/b/' /etc/hostname", "edits in place")
+            self.assert_allowed("sort /etc/hostname", "the control: the rule grants the read")
+            self.assert_allowed("sed -n 1p /etc/hostname", "the control: the rule grants the read")
 
     def test_a_deny_rule_refuses_whatever_else_matches(self):
         with operator_rules(allow=["Bash(ls *)"], deny=["Bash(ls *)"]):
