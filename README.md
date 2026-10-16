@@ -1,12 +1,15 @@
 # ttk-sh-auto-approve
 
-A [Claude Code](https://code.claude.com/docs) plugin with a `PreToolUse` hook
-that auto-approves Bash commands it can prove are read-only. Everything else,
-including errors, timeouts and unexpected input, goes through Claude Code's
-normal permission prompt.
+A [Claude Code](https://code.claude.com/docs) plugin with 2 hooks:
+
+- A `PreToolUse` hook that auto-approves Bash commands it can prove are read-only. Everything
+  else, including errors, timeouts and unexpected input, goes through Claude Code's normal
+  permission prompt.
+- A `PostToolUse` hook that restores the final newline a `Write` or `Edit` left out. A `Write`
+  approved at a permission prompt saves the file without one.
 
 > **Status:** not released yet. Requires Python 3.12 or later on Linux or macOS;
-> anywhere else the hook stays silent and every command prompts.
+> anywhere else both hooks do nothing, and every command prompts.
 
 ## The Bash tool may run zsh
 
@@ -31,9 +34,13 @@ claude --plugin-dir ./plugin
 
 ## What runs on your machine
 
-A plugin runs with your user privileges. This one registers a single hook on
-the Bash tool that runs `python3 -I plugin/scripts/sh_auto_approve.py`.
-It uses only the Python standard library and makes no network calls.
+A plugin runs with your user privileges. This one registers 2 hooks. Both use only the Python
+standard library and make no network calls.
+
+- Before each Bash tool call, `python3 -I plugin/scripts/sh_auto_approve.py`. It writes nothing.
+- After each `Write` and `Edit`, `python3 -I plugin/scripts/ensure_final_newline.py`. It appends
+  a single newline to the file just written, when that is a non-empty text file without one,
+  inside the project, a git repository or `~/.claude`.
 
 ## Development
 

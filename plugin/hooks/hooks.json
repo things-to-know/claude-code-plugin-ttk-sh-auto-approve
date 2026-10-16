@@ -11,6 +11,18 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["-I", "${CLAUDE_PLUGIN_ROOT}/scripts/ensure_final_newline.py"]
+          }
+        ]
+      }
     ]
   }
 }

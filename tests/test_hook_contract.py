@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -17,24 +18,33 @@ HOOKS_JSON = PLUGIN_ROOT / "hooks" / "hooks.json"
 DECISIONS = {"allow", "deny", "ask", "defer"}
 
 
-def bash_hook_handlers():
+def handlers(event, matcher):
     config = json.loads(HOOKS_JSON.read_text())
     return [
         handler
-        for group in config["hooks"]["PreToolUse"]
-        if group.get("matcher") == "Bash"
+        for group in config["hooks"][event]
+        if group.get("matcher") == matcher
         for handler in group["hooks"]
     ]
 
 
-def run_hook(stdin_text):
-    """Spawn the Bash PreToolUse handler the way Claude Code's exec form does."""
-    (handler,) = bash_hook_handlers()
+def bash_hook_handlers():
+    return handlers("PreToolUse", "Bash")
+
+
+def newline_hook_handlers():
+    return handlers("PostToolUse", "Write|Edit")
+
+
+def run_hook(stdin_text, handler=None, project_dir=None):
+    """Spawn a handler, the Bash PreToolUse one by default, the way Claude Code's exec form does."""
+    if handler is None:
+        (handler,) = bash_hook_handlers()
     root = str(PLUGIN_ROOT)
     argv = [shutil.which(handler["command"])] + [
         arg.replace("${CLAUDE_PLUGIN_ROOT}", root) for arg in handler["args"]
     ]
-    env = dict(os.environ, CLAUDE_PLUGIN_ROOT=root, CLAUDE_PROJECT_DIR=os.getcwd())
+    env = dict(os.environ, CLAUDE_PLUGIN_ROOT=root, CLAUDE_PROJECT_DIR=project_dir or os.getcwd())
     return subprocess.run(
         argv, input=stdin_text, capture_output=True, text=True, env=env, timeout=30
     )
@@ -66,12 +76,29 @@ def decision_of(result):
 
 class WiringTest(unittest.TestCase):
     def test_single_exec_form_handler_pointing_inside_plugin(self):
-        (handler,) = bash_hook_handlers()
-        self.assertEqual(handler["type"], "command")
-        self.assertIn("args", handler, "use exec form so the path needs no quoting")
-        self.assertIn("-I", handler["args"], "run Python in isolated mode")
-        script = handler["args"][-1].replace("${CLAUDE_PLUGIN_ROOT}", str(PLUGIN_ROOT))
-        self.assertTrue(Path(script).is_file(), script)
+        for name, find in (("bash", bash_hook_handlers), ("newline", newline_hook_handlers)):
+            with self.subTest(hook=name):
+                (handler,) = find()
+                self.assertEqual(handler["type"], "command")
+                self.assertIn("args", handler, "use exec form so the path needs no quoting")
+                self.assertIn("-I", handler["args"], "run Python in isolated mode")
+                script = handler["args"][-1].replace("${CLAUDE_PLUGIN_ROOT}", str(PLUGIN_ROOT))
+                self.assertTrue(Path(script).is_file(), script)
+
+    def test_the_newline_hook_runs_as_wired(self):
+        (handler,) = newline_hook_handlers()
+        with tempfile.TemporaryDirectory() as project:
+            path = Path(project) / "doc.md"
+            path.write_bytes(b"last line")
+            event = {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(path)},
+            }
+            result = run_hook(json.dumps(event), handler, project_dir=project)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "", "a PostToolUse hook has nothing to decide")
+            self.assertEqual(path.read_bytes(), b"last line\n")
 
     def test_no_version_field_in_manifest(self):
         # Versions are derived from the sha pinned in the catalog (see AGENTS.md).

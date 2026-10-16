@@ -1,8 +1,12 @@
 # ttk-sh-auto-approve
 
-Claude Code plugin: a `PreToolUse` hook that auto-approves Bash commands it can
-prove are read-only, so they don't raise a permission prompt. Distributed
-through the things-to-know plugin catalog.
+Claude Code plugin:
+
+- A `PreToolUse` hook that auto-approves Bash commands it can prove are read-only, so they don't
+  raise a permission prompt
+- A `PostToolUse` hook that restores the final newline a `Write` or `Edit` left out
+
+Distributed through the `things-to-know` plugin catalog.
 
 This file is canonical and tool-agnostic. `CLAUDE.md` imports it. If your tool
 insists on its own filename, symlink to this file rather than copying it.
@@ -12,14 +16,15 @@ insists on its own filename, symlink to this file rather than copying it.
 - `plugin/` is the plugin root and the **only directory that ships** to users.
   Tests, CI, this file, `CLAUDE.md` and `.claude/` stay in the repo.
 - `plugin/hooks/hooks.json` runs
-  `python3 -I ${CLAUDE_PLUGIN_ROOT}/scripts/sh_auto_approve.py` on every
-  Bash tool call (exec form, so the path needs no quoting).
-- `tests/test_hook_contract.py` runs the hook exactly as `hooks.json` defines it.
+  `python3 -I ${CLAUDE_PLUGIN_ROOT}/scripts/sh_auto_approve.py` on every Bash tool call,
+  and `.../scripts/ensure_final_newline.py` after every `Write` and `Edit` (exec form, so the path
+  needs no quoting)
+- `tests/test_hook_contract.py` runs both hooks exactly as `hooks.json` defines them
 - `ci/validate-plugin.sh` wraps `claude plugin validate` (see "No `version`").
 - `tools/explain.py` prints the hook's verdict and reason for each command, for a given
   session (see [Develop](#develop))
 
-## Rules for the hook
+## Rules for the approval hook
 
 - **Threat model:** the hook may run while Claude's context is poisoned. An
   approval for a command that isn't read-only is the failure to avoid.
@@ -61,6 +66,20 @@ insists on its own filename, symlink to this file rather than copying it.
 - **Python version.** The hook runs on whatever `python3` is first on the
   user's `PATH`, and stays silent below `MINIMUM_PYTHON` (3.12) or outside
   Linux and macOS. Keep the CI matrix's oldest version at that minimum.
+
+## Rules for the newline hook
+
+- **One write**:
+  - `ensure_final_newline.py` appends a single line ending, the one the file uses, to the file
+    a `Write` or `Edit` named, and only inside the directories its docstring lists
+  - It changes nothing else
+- **Errors exit 1, never 2**: For a `PostToolUse` hook, exit 2 hands stderr to Claude as feedback;
+  exit 1 only shows the user an error
+- **The approval hook's last 3 rules hold for it too**:
+  - stdlib only and `-I`
+  - the paths
+  - the Python version (tested to keep its `MINIMUM_PYTHON` and platforms in sync with the
+    other hook's)
 
 ## No `version`
 
@@ -119,10 +138,11 @@ For example:
 2. In the catalog repo, set this plugin's `source.sha` to the merged commit
    (full 40-character lowercase sha):
 
+   <!-- editorconfig-checker-disable: a JSON string cannot be wrapped -->
    ```json
    {
      "name": "ttk-sh-auto-approve",
-     "description": "Auto-approves Bash commands it can prove are read-only",
+     "description": "Auto-approves Bash commands it can prove are read-only, and restores the final newline a Write loses",
      "source": {
        "source": "git-subdir",
        "url": "things-to-know/claude-code-plugin-ttk-sh-auto-approve",
@@ -131,6 +151,7 @@ For example:
      }
    }
    ```
+   <!-- editorconfig-checker-enable -->
 
 3. Users receive it through marketplace auto-update, if they turned it on, or
    `claude plugin marketplace update <catalog>` followed by
