@@ -1,0 +1,20 @@
+# The development tools, which uv installs into .venv: `make install-dev`, or any `make` target
+# that runs one. Nothing here ships: the plugin is the stdlib-only scripts in plugin/.
+
+[project]
+name = "ttk-sh-auto-approve-dev"
+# Required in a `[project]` table, and unused: nothing is built, and the plugin's version comes
+# from the commit the catalog pins (see AGENTS.md, "No `version`")
+version = "0"
+# The oldest Python the hook supports, as in ruff.toml
+requires-python = ">=3.12"
+
+[dependency-groups]
+dev = [
+    # The formatter: its output has to match on every machine and in CI, so the version is exact
+    "ruff==0.16.10",
+]
+
+[tool.uv]
+# A set of tools, not a package: uv installs the dependencies and never builds this directory
+package = false

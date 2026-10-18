@@ -17,7 +17,8 @@ jobs:
       matrix:
         # The hook runs on whatever `python3` is first on each user's PATH.
         # Keep the oldest version your teammates have in this list.
-        python: ["3.12", "3.14"]
+        # Warning: keep in sync with `TEST_PYTHON_VERSIONS` in the Makefile
+        python: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -26,7 +27,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Run tests
-        run: python3 -m unittest discover -s tests
+        run: make test
 
   lint:
     name: lint
@@ -38,19 +39,23 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
-      # The version in the local virtualenv, so CI formats exactly as `make fmt` does
-      - name: Install ruff
-        run: python3 -m pip install 'ruff==0.16.10'
-      # markdownlint-cli2 and editorconfig-checker run from their pinned images (see Makefile);
-      # shellcheck comes with the runner
+      # `make` runs ruff through uv, at the version uv.lock pins, so CI formats exactly as
+      # `make lint-fix` does
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.21"
+      # Every other linter runs from its image, pinned by digest in the Makefile, even where the
+      # runner ships its own copy, as it does shellcheck
       - name: Lint
-        run: make lint
+        run: make lint LINTERS_FROM_IMAGES=1
 
   validate:
     name: claude plugin validate
     runs-on: ubuntu-latest
     env:
-      CLAUDE_CODE_VERSION: "2.1.295"
+      # The version `make validate` runs locally is whichever `claude` is on PATH, which updates
+      # itself: bump this one to match it
+      CLAUDE_CODE_VERSION: "2.1.302"
       DISABLE_AUTOUPDATER: "1"
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
     steps:
@@ -63,4 +68,4 @@ jobs:
       - name: Install Claude Code
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
       - name: Validate plugin
-        run: bash ci/validate-plugin.sh plugin
+        run: make validate

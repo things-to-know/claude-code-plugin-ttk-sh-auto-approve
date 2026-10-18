@@ -1,4 +1,4 @@
-# Ruff, used as the Python formatter: `make fmt` applies it, `make lint` checks it.
+# Ruff, used as the Python formatter: `make lint-fix` applies it, `make lint` checks it.
 # Kept in this repository rather than inherited, so that a fresh clone formats the same way.
 
 # The same limit as .editorconfig
