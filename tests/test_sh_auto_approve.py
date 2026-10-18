@@ -270,6 +270,9 @@ spec = importlib.util.spec_from_file_location("sh_auto_approve", MODULE_PATH)
 assert spec is not None and spec.loader is not None, f"no hook at {MODULE_PATH}"
 hook = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = hook
+# No bytecode next to the hook, whatever runs the tests: a local marketplace install copies
+# `plugin/` along with any `__pycache__` in it
+sys.dont_write_bytecode = True
 spec.loader.exec_module(hook)
 
 # The classifier is one tier and the operator's own rule file is the other, and almost

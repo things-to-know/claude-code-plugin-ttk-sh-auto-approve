@@ -43,11 +43,17 @@ WORKING_COPY = Path(__file__).resolve().parents[1] / "plugin" / "scripts" / "sh_
 
 
 def load_hook(path: Path) -> ModuleType:
-    """Import the hook from ``path`` under a name of its own, without running ``main``."""
+    """Import the hook from ``path`` under a name of its own, without running ``main``.
+
+    No bytecode is written next to it: ``path`` may be the installed copy, or ``plugin/``, which
+    a local marketplace install copies along with the scripts. ``-I`` ignores
+    ``PYTHONDONTWRITEBYTECODE``, so the script sees to it itself.
+    """
     spec = importlib.util.spec_from_file_location("sh_auto_approve", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load the hook from {path}")
     module = importlib.util.module_from_spec(spec)
+    sys.dont_write_bytecode = True
     spec.loader.exec_module(module)
     return module
 
