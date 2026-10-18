@@ -1,0 +1,34 @@
+# Dependabot bumps the GitHub Actions in `.github/workflows/` (their pinned shas included) and the
+# dev tools in `pyproject.toml` and `uv.lock`.
+#
+# Warning: it can't see the following version pins, which need bumping by hand:
+# - The container images in the Makefile (`*_IMAGE`, pinned by digest): Dependabot reads images
+#   from Dockerfiles, Compose files and Kubernetes manifests only
+# - In `.github/workflows/ci.yml`:
+#   - `CLAUDE_CODE_VERSION`, an environment variable
+#   - uv's `version`, an input of `astral-sh/setup-uv`
+#   - The Python and Node versions given to `actions/setup-python` and `actions/setup-node`,
+#     and the test matrix
+#     - The matrix also lives in the Makefile, as `TEST_PYTHON_VERSIONS`
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # A release gets two weeks before it lands here
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: ci
+      include: scope
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: build
+      include: scope
