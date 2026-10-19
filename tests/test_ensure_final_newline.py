@@ -23,9 +23,14 @@ HOOK_PATH = SCRIPTS / "ensure_final_newline.py"
 
 
 def load(name: str):
-    """Import one of the plugin's scripts by path, without running its ``main``."""
+    """Import one of the plugin's scripts by path, without running its ``main``.
+
+    No bytecode is written next to it, whatever runs the tests: a local marketplace install copies
+    ``plugin/`` along with any ``__pycache__`` in it.
+    """
     spec = importlib.util.spec_from_file_location(name, SCRIPTS / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
+    sys.dont_write_bytecode = True
     spec.loader.exec_module(module)
     return module
 

@@ -1,5 +1,6 @@
 """`tools/explain.py` prints the hook's verdict with its reason, for the session it is given."""
 
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,16 @@ class Explains(unittest.TestCase):
         self.assertEqual(inside[0], "allow")
         self.assertEqual(outside[0], "no-opinion")
         self.assertIn("outside the working directories", outside[1])
+
+    def test_writes_no_bytecode_next_to_the_hook(self):
+        """The hook it asks may be the installed copy, or the working copy, which a local
+        marketplace install copies along with its `__pycache__`."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_copy_") as directory:
+            hook = Path(directory) / "sh_auto_approve.py"
+            shutil.copyfile(ROOT / "plugin" / "scripts" / "sh_auto_approve.py", hook)
+            (allowed,) = explain("--hook", str(hook), "ls")
+            self.assertEqual(allowed[0], "allow", "the copy was loaded and asked")
+            self.assertEqual(list(Path(directory).iterdir()), [hook])
 
 
 if __name__ == "__main__":

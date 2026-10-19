@@ -23,6 +23,8 @@ insists on its own filename, symlink to this file rather than copying it.
 - `ci/validate-plugin.sh` wraps `claude plugin validate` (see "No `version`").
 - `tools/explain.py` prints the hook's verdict and reason for each command, for a given
   session (see [Develop](#develop))
+- `pyproject.toml` and `uv.lock` pin the dev tools (`ruff`), which `uv` installs into `.venv`;
+  neither ships
 
 ## Rules for the approval hook
 
@@ -63,9 +65,10 @@ insists on its own filename, symlink to this file rather than copying it.
   are found through `${CLAUDE_PROJECT_DIR}`, e.g.
   `$CLAUDE_PROJECT_DIR/.claude/settings.local.json`. Both are exported to the
   hook's environment.
-- **Python version.** The hook runs on whatever `python3` is first on the
-  user's `PATH`, and stays silent below `MINIMUM_PYTHON` (3.12) or outside
-  Linux and macOS. Keep the CI matrix's oldest version at that minimum.
+- **Python version**:
+  - The hook runs on whatever `python3` is first on the user's `PATH`, and stays silent below
+    `MINIMUM_PYTHON` (3.12) or outside Linux and macOS
+  - Keep `MINIMUM_PYTHON` in the CI matrix, and in the Makefile's `TEST_PYTHON_VERSIONS`
 
 ## Rules for the newline hook
 
@@ -97,12 +100,26 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   after edits. A `--plugin-dir` plugin with the same manifest name replaces the
   installed one for that session; `claude plugin list` still shows the
   installed one as enabled.
-- Verify with `make check`, which lints and tests as CI does, or with one target such as
-  `make test` or `make lint-py`; `make help` lists them.
-  - `make` runs ruff from `$(RUFF)`: pass e.g. `RUFF=../.venv/bin/ruff` when it isn't on
-    `PATH`.
+- Verify with `make check`, or with one target such as `make test` or `make lint-py`;
+  `make help` lists them.
+  - `make check` lints and tests as CI does, but with the linters installed on your machine and
+    your `python3`
+  - For exactly CI's checks: `make check LINTERS_FROM_IMAGES=1`, `make test-all-python-matrix`
+    and `make validate`
+  - `make` runs `ruff` through `uv`, which has to be on `PATH`: from `.venv`, at the version
+    `uv.lock` pins
+    - `pyproject.toml` lists the dev tools; after changing it, `make compile-deps` relocks
   - `make validate` runs `claude plugin validate` through `ci/validate-plugin.sh` and needs
     `claude` on `PATH`; `make check` leaves it out.
+  - Python version testing:
+    - CI tests every Python version in its matrix
+    - `make test` runs your `python3`
+    - For a failure CI shows on one version: `make test PYTHON="$(uv python find 3.12)"`, after
+      `uv python install 3.12` if that version is missing
+- CI runs every check through its `make` target, never the tool directly, so that a local `make`
+  checks what CI does
+  - A new check gets a target first, and then a CI step that calls it
+  - Steps that only set up the runner, such as installing Python, uv or Claude Code, run directly
 - Live debugging: start with `claude --debug`; `~/.claude/debug/<session-id>.txt`
   records which hooks matched and their exit codes.
 - Triage a command that prompted by replaying it in its session's context, never a guessed one:
@@ -125,6 +142,9 @@ For example:
 - A CommonMark list continuation: keep it, and adjust the markdownlint rule that flags it.
 - A line that can't be wrapped, such as a long URL or command: exempt it in the
   configuration rather than breaking it.
+
+`make lint-fix` applies the fixes the linters can make on their own. Review its diff like any
+other change: where a fix rewrote content that was correct, revert it and adjust the rule instead.
 
 ## Commits
 

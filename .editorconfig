@@ -79,7 +79,9 @@ ij_editorconfig_spaces_around_assignment_operators = true
 [Makefile]
 indent_style = tab
 
-# Lines that cannot be wrapped: a comment copied verbatim from a GitHub template, and a manifest
-# whose `description` is a single JSON string
+# Lines that cannot be wrapped:
+# - a comment copied verbatim from a GitHub template
+# - a manifest whose `description` is a single JSON string
+# - `uv.lock`: excluded by default so it's unnecessary to include it here
 [{.gitignore,plugin/.claude-plugin/plugin.json}]
 max_line_length = off
