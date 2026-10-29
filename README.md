@@ -32,6 +32,9 @@ To try it for one session from a clone of this repo:
 claude --plugin-dir ./plugin
 ```
 
+If you registered either hook yourself, in a `settings.json`, remove that entry once the plugin
+is enabled: hooks aren't namespaced, so both copies would run.
+
 ## What runs on your machine
 
 A plugin runs with your user privileges. This one registers 2 hooks. Both use only the Python

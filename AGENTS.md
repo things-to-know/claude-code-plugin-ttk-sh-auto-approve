@@ -208,16 +208,7 @@ other change: where a fix rewrote content that was correct, revert it and adjust
    `claude plugin marketplace update <catalog>` followed by
    `claude plugin update ttk-sh-auto-approve@<catalog>`.
 
-## Migrating the real hook
+## Public repository
 
-`plugin/scripts/sh_auto_approve.py` is the real hook. Its second tier reads the operator's allow
-and deny rules from `.claude/settings.json` and `.claude/settings.local.json` under
-`$CLAUDE_PROJECT_DIR`. What remains:
-
-1. This repo is public. Before committing, review the implementation and its
-   test fixtures for code you don't own and for infrastructure details
-   (hostnames, bucket names, account IDs, internal paths).
-2. Add the existing suites under `tests/`. Keep `tests/test_hook_contract.py` passing.
-3. In each repo that had the hook configured directly, remove that entry from
-   `.claude/settings*.json` once the plugin is enabled there. Hooks aren't
-   namespaced, so both copies would run.
+This repo is public. Before committing, review the change, its test fixtures included, for code
+you don't own and for infrastructure details: hostnames, bucket names, account IDs, internal paths.
