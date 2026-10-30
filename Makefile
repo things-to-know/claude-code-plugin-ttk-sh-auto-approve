@@ -160,11 +160,14 @@ lint-fix: lint-py-fix
 lint-fix: lint-md-fix
 lint-fix: ## Apply the fixes the linters can make on their own
 
-# `-B` ("write no `.pyc` files"): it keeps the tests' imports of the hooks from writing bytecode
-# into `plugin/`, which a local marketplace install copies along with the scripts
+# The interpreter's arguments for `test` and `test-all-python-matrix`
+# - `-B` ("write no `.pyc` files"): it keeps the tests' imports of the hooks from writing bytecode
+#   into `plugin/`, which a local marketplace install copies along with the scripts
+UNITTEST = -B -m unittest discover -s tests ${TEST_ARGS}
+
 .PHONY: test
 test: ## Run the tests, e.g. `make test TEST_ARGS='-k Widening'`
-	${PYTHON} -B -m unittest discover -s tests ${TEST_ARGS}
+	${PYTHON} ${UNITTEST}
 
 # `test` under Coverage.py, which lists, for each hook, the lines and branches no test runs
 # - It sets no minimum, so only a failing test fails it
@@ -180,11 +183,15 @@ test-coverage: ## Run the tests under coverage, and list each hook's lines and b
 	${COVERAGE} html
 
 # `test` once per version, on the interpreter uv finds for it, which uv installs first if missing
+# - The loop runs the tests itself rather than through `${MAKE} test`: make runs a recipe line
+#   that names `MAKE` even under `-n`, so `make -n` would have run the whole loop, installs included
 .PHONY: test-all-python-matrix
 test-all-python-matrix: ## Run the tests on each Python version in CI's matrix, from uv
 	@for version in ${TEST_PYTHON_VERSIONS}; do \
 		${UV} python install --quiet "$${version}"; \
-		${MAKE} --no-print-directory test PYTHON="$$(${UV} python find "$${version}")"; \
+		python="$$(${UV} python find "$${version}")"; \
+		echo "$${python} ${UNITTEST}"; \
+		"$${python}" ${UNITTEST}; \
 	done
 
 # Coverage writes `.coverage`, a `.coverage.*` file per process until `combine` merges them, and
