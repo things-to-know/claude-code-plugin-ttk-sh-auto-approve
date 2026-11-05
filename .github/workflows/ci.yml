@@ -69,3 +69,23 @@ jobs:
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
       - name: Validate plugin
         run: make validate
+
+  # The one check the `main` ruleset requires, so a change to the matrix needs no ruleset edit
+  # - A new job goes in `needs`, or a PR can merge with that job failing
+  # - `always()`: it runs even after a failure or a cancellation, since a required check that is
+  #   skipped counts as passed
+  # - It checks no code, so it calls no `make` target
+  ci-passed:
+    name: ci passed
+    if: ${{ always() }}
+    needs: [test, lint, validate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless every job above succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: ${RESULTS}"
+          for result in ${RESULTS}; do
+            [[ "${result}" == success ]] || exit 1
+          done
