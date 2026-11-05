@@ -125,6 +125,9 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   - A new job goes in the `needs` of `ci-passed`, or a PR can merge with that job failing
 - Live debugging: start with `claude --debug`; `~/.claude/debug/<session-id>.txt`
   records which hooks matched and their exit codes.
+- Before saying the hook approves, refuses or has no opinion on a command, run the command
+  through `make explain` and quote the verdict it prints: reading the code is not a verdict
+  - e.g. `printf '%s\n' 'grep -rf /etc/os-release .' | make explain`
 - Triage a command that prompted by replaying it in its session's context, never a guessed one:
   - Find the session's transcript by its id: `ls ~/.claude/projects/*/<session-id>.jsonl`. It
     moves when the session is resumed elsewhere, and every directory there starts with `-`, so
