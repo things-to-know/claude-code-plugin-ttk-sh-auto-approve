@@ -12,7 +12,7 @@ requires-python = ">=3.12"
 [dependency-groups]
 dev = [
     # The formatter: its output has to match on every machine and in CI, so the version is exact
-    "ruff==0.16.10",
+    "ruff==0.17.1",
 ]
 
 [tool.uv]
