@@ -53,8 +53,8 @@ jobs:
     name: claude plugin validate
     runs-on: ubuntu-latest
     env:
-      # The version `make validate` runs locally is whichever `claude` is on PATH, which updates
-      # itself: bump this one to match it
+      # `make validate` runs locally on whichever `claude` is on PATH, which updates itself almost
+      # daily: bump this pin when the two give different results, not on every release
       CLAUDE_CODE_VERSION: "2.1.302"
       DISABLE_AUTOUPDATER: "1"
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
