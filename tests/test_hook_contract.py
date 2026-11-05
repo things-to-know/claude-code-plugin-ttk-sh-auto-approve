@@ -44,9 +44,11 @@ def run_hook(stdin_text, handler=None, project_dir=None):
     argv = [shutil.which(handler["command"])] + [
         arg.replace("${CLAUDE_PLUGIN_ROOT}", root) for arg in handler["args"]
     ]
-    env = dict(os.environ, CLAUDE_PLUGIN_ROOT=root, CLAUDE_PROJECT_DIR=project_dir or os.getcwd())
+    env = dict(
+        os.environ, CLAUDE_PLUGIN_ROOT=root, CLAUDE_PROJECT_DIR=project_dir or str(Path.cwd())
+    )
     return subprocess.run(
-        argv, input=stdin_text, capture_output=True, text=True, env=env, timeout=30
+        argv, input=stdin_text, capture_output=True, text=True, env=env, timeout=30, check=False
     )
 
 
@@ -54,7 +56,7 @@ def payload(command, tool_name="Bash"):
     return json.dumps(
         {
             "session_id": "test",
-            "cwd": os.getcwd(),
+            "cwd": str(Path.cwd()),
             "hook_event_name": "PreToolUse",
             "tool_name": tool_name,
             "tool_input": {"command": command, "description": "test"},

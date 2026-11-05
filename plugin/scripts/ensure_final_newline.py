@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restore the final newline that a ``Write`` or ``Edit`` left out.
+r"""Restore the final newline that a ``Write`` or ``Edit`` left out.
 
 A Claude Code ``PostToolUse`` hook, which the plugin's ``hooks/hooks.json`` runs after every
 ``Write`` and ``Edit``. It is the plugin's one hook that writes, and what it writes is a single
@@ -23,14 +23,14 @@ The home directory and ``/`` never count as one of these, so a file outside ever
 such as a token file meant to end without a newline, is left alone.
 
 The hook reads the tool call on stdin and appends a single line ending to the file it names:
-the one its first line ends with, ``\\r\\n`` or ``\\n``, and ``\\n`` when no line has ended yet.
-A file that ends in a bare ``\\r`` with ``\\r\\n`` endings gets the ``\\n`` that completes it.
+the one its first line ends with, ``\r\n`` or ``\n``, and ``\n`` when no line has ended yet.
+A file that ends in a bare ``\r`` with ``\r\n`` endings gets the ``\n`` that completes it.
 It changes nothing else, and leaves the file alone when it is:
 
 - named by a tool other than ``Write`` or ``Edit``, or by a relative path
 - outside the directories above, once symlinks are resolved
 - not a regular file, or empty
-- already ending in ``\\n``
+- already ending in ``\n``
 - binary, judged by a NUL byte in its first 8 KiB
 
 A text file meant to end without a newline, such as a test fixture, gets one too: write it from

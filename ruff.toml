@@ -1,4 +1,5 @@
-# Ruff, used as the Python formatter: `make lint-fix` applies it, `make lint` checks it.
+# Ruff, the Python formatter and linter: `make lint` checks both, and `make lint-fix` applies the
+# formatting and the fixes ruff marks safe.
 # Kept in this repository rather than inherited, so that a fresh clone formats the same way.
 
 # The same limit as .editorconfig
@@ -6,3 +7,72 @@ line-length = 100
 
 # The oldest Python the hook supports, and the oldest in the CI matrix
 target-version = "py312"
+
+[lint]
+# Every rule, less those below, each with the reason it doesn't fit this repository
+select = ["ALL"]
+ignore = [
+    # Conflicts with the formatter, as ruff's documentation warns
+    "COM812",
+    # The hook's verdicts are exceptions whose message is the reason `make explain` prints
+    "EM101",
+    "EM102",
+    "TRY003",
+    # The classifier follows the shell's grammar branch by branch: splitting it to meet a count
+    # would move security-relevant logic around for no change in behavior
+    "C901",
+    "PLR0911",
+    "PLR0912",
+    "PLR0913",
+    "PLR0915",
+    "PLR0917",
+    # Argument counts and positions read better as numbers than as names
+    "PLR2004",
+    # A docstring says what a function returns or does ("Whether this word reaches a credential
+    # store"), rather than commanding it
+    # TODO: review this exclusion
+    "D401",
+    # A docstring may start with a name spelled in lowercase, such as zsh, macOS or git
+    "D403",
+    # The tests use unittest, not pytest
+    "PT",
+    # No file carries a copyright header
+    "CPY001",
+    # A "TODO" states a known limit and its reasoning in place, with no author or issue to name
+    "FIX002",
+    "TD002",
+    "TD003",
+    # A standard library import costs nothing at run time, while a `TYPE_CHECKING` block would
+    # import `typing` on every Bash call
+    "TC003",
+]
+
+[lint.pydocstyle]
+convention = "pep257"
+
+[lint.per-file-ignores]
+# The hook works on paths as the shell spells them: `pathlib` drops trailing slashes and `.`
+# segments, which can change what a path names
+"plugin/scripts/*.py" = ["PTH"]
+"tests/*.py" = [
+    # Test names say what they check, and unittest is what calls the methods
+    "ANN",
+    "D1",
+    # A test's docstring is a sentence or two about the case, not a summary line and a body
+    "D205",
+    "D209",
+    # Tests assert, run the hooks as subprocesses, use /tmp paths as data, pick inputs at
+    # random, reach into the hook's private functions, and print open findings when run as a
+    # script
+    "S101",
+    "S108",
+    "S311",
+    "S603",
+    "SLF001",
+    "T201",
+]
+# A development tool: it reads the hook's private functions and prints its verdicts
+"tools/*.py" = [
+    "SLF001",
+    "T201",
+]

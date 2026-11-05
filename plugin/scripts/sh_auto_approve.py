@@ -104,6 +104,7 @@ import os
 import re
 import shlex
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from stat import S_ISREG
 
@@ -257,8 +258,9 @@ SCRATCH_ENV = "SH_AUTO_APPROVE_SCRATCH"
 # `"../../x"` (a placeholder by now), a `$d` the shell fills in, and a `..*` the shell globs,
 # each of which lands wherever it likes.
 SCRATCH_COMPONENT = r"(?:/(?!\.\.?(?:/|$|[\s;|&)]))[A-Za-z0-9._@%+=,-]+)"
+# The scratchpad's path, matched, never written: hence the `noqa`
 SCRATCH_PATH = (
-    r"/tmp/claude-\d+/(?!\.\.?/)[A-Za-z0-9._-]+/[0-9a-fA-F-]{36}/scratchpad"
+    r"/tmp/claude-\d+/(?!\.\.?/)[A-Za-z0-9._-]+/[0-9a-fA-F-]{36}/scratchpad"  # noqa: S108
     + SCRATCH_COMPONENT
     + r"+"
 )
@@ -703,7 +705,7 @@ GIT_BRANCH_LIST_MODE = frozenset(
 )
 
 
-class NotReadOnly(Exception):
+class NotReadOnly(Exception):  # noqa: N818 - a verdict, not an error
     """Raised when any command component is not provably read-only."""
 
 
@@ -816,7 +818,7 @@ def _skip_arithmetic(text: str, index: int) -> int:
     raise NotReadOnly("unterminated arithmetic expansion")
 
 
-def _scan_double_quoted(text: str, index: int, emit) -> int:
+def _scan_double_quoted(text: str, index: int, emit: Callable[[str, str], None]) -> int:
     """Scan a ``"..."`` span at word level, emitting its literal runs and substitutions.
 
     Each piece is emitted separately and the placeholders land side by side in the same
@@ -1300,8 +1302,9 @@ def _segments(tokens: list[str]) -> list[list[str]]:
 
 
 def _strip_structure(words: list[str]) -> list[str]:
-    """
-    Strip loop control structure, rejecting dangerous environment variables and prefix assignments.
+    """Strip loop control structure.
+
+    Rejects dangerous environment variables and prefix assignments.
     """
     index = 0
     while index < len(words):
@@ -1375,11 +1378,11 @@ def _skip_sed_address(script: str, index: int) -> int:
 
 
 def _scan_sed_script(script: str) -> None:
-    """Walk a ``sed`` script command by command, allowing only what cannot write or execute.
+    r"""Walk a ``sed`` script command by command, allowing only what cannot write or execute.
 
     An allowlist, because the denylist this replaces searched for ``w``, ``r`` or ``e`` after a
     numeric address, and ``sed`` accepts many more address forms than that. Every one of
-    ``/re/w out``, ``/a/,/b/w out``, ``1!w out``, ``\\%re%w out`` and ``2d;/re/w out`` walked past
+    ``/re/w out``, ``/a/,/b/w out``, ``1!w out``, ``\%re%w out`` and ``2d;/re/w out`` walked past
     it, and ``/re/e cmd`` runs a program rather than merely writing a file.
     """
     index, length, commands = 0, len(script), 0
@@ -1850,7 +1853,7 @@ def _check_gh(args: list[str]) -> None:
         arg = args[index]
         name, _, attached = arg.partition("=") if arg.startswith("--") else (arg, "", "")
         if name in ("-f", "-F", "--field", "--raw-field"):
-            value = attached if attached else (args[index + 1] if index + 1 < len(args) else "")
+            value = attached or (args[index + 1] if index + 1 < len(args) else "")
             if not attached:
                 index += 1
             fields.append(value)
@@ -2079,7 +2082,7 @@ def _check_find(args: list[str], live_globs: list[bool]) -> None:
 
 
 def _check_jq(args: list[str]) -> None:
-    """Validate jq: a filter language with no write and no exec, given two restrictions.
+    r"""Validate jq: a filter language with no write and no exec, given two restrictions.
 
     jq cannot create a file or run a program -- there is no `system`, no output
     redirection, and no shell-out anywhere in its grammar -- which is what makes it safe
@@ -2092,8 +2095,8 @@ def _check_jq(args: list[str]) -> None:
       Claude's context, which under a poisoned prompt is the point of the exercise.
 
     String literals come out before the environment check, so a filter selecting a field
-    named `"env"` is not mistaken for one reading it -- except a literal carrying `\\(...)`,
-    which is interpolation: code that runs, kept in so that `"\\(env)"` is still seen.
+    named `"env"` is not mistaken for one reading it -- except a literal carrying `\(...)`,
+    which is interpolation: code that runs, kept in so that `"\(env)"` is still seen.
     `import` and `include` load code from a file this module never read, which is `-f`
     under another name, and so does `-L`, which says where those files are looked for.
     """
@@ -2182,14 +2185,14 @@ def _check_file(args: list[str]) -> None:
 
 
 def _check_printf(args: list[str]) -> None:
-    """Validate printf: no ``-v``, and a format the operator wrote rather than the shell.
+    r"""Validate printf: no ``-v``, and a format the operator wrote rather than the shell.
 
     ``printf -v name ...`` assigns without an ``=`` anywhere in the command, which is the
     handover ``_strip_structure`` is looking for spelled so that it cannot find it.
 
     The format is argument one and nothing else can be a flag, so it is the only word
     checked for a leading expansion -- which is also what keeps the safe spelling working:
-    ``printf '%s\\n' "${var}"`` is approved, and ``printf "${var}"``, whose format the shell
+    ``printf '%s\n' "${var}"`` is approved, and ``printf "${var}"``, whose format the shell
     supplies, is not.
     """
     if any(arg == "-v" or _bundled_short(arg, "v") for arg in args):
@@ -2391,7 +2394,7 @@ def _check_command(
     depth: int = 0,
     safe_names: frozenset[str] = frozenset(),
     splice_vars: dict[str, list[str]] | None = None,
-    scope: "_ReadScope | None" = None,
+    scope: _ReadScope | None = None,
 ) -> None:
     """Inspect simple command name and argument list with strict fail-closed dispatch.
 
@@ -2455,7 +2458,7 @@ def _check_command(
     # words, and this is a word the shell has not finished building. The reduced tokens are
     # tested so a quoted `'{a,b}'`, a single literal to bash, stays approved. A spliced
     # value was already cleared of braces when it was accepted as a literal assignment.
-    for word in [words[0]] + [t for t, s in zip(arg_tokens, spliced) if not s]:
+    for word in [words[0]] + [t for t, s in zip(arg_tokens, spliced, strict=True) if not s]:
         if _carries_brace_expansion(word):
             raise NotReadOnly(f"unquoted brace expansion: {_expand(word, parts)}")
 
@@ -2491,9 +2494,9 @@ def _check_command(
     # For `printf` only argument one can be an option, and it is the format, so that is
     # the one word read -- which is what leaves `printf '%s\n' "${var}"` alone.
     if program == "printf":
-        suspect = list(zip(arg_tokens[:1], spliced[:1]))
+        suspect = list(zip(arg_tokens[:1], spliced[:1], strict=True))
     elif program in EXPANSION_UNSAFE:
-        suspect = list(zip(arg_tokens, spliced))
+        suspect = list(zip(arg_tokens, spliced, strict=True))
     else:
         suspect = []
     for word, was_spliced in suspect:
@@ -2608,7 +2611,7 @@ class _GlobRule:
         return True
 
 
-def _rule_pattern(rule: str, blanket: bool = False) -> "_GlobRule | None":
+def _rule_pattern(rule: str, *, blanket: bool = False) -> _GlobRule | None:
     """A ``Bash(...)`` permission rule as a pattern over one simple command's text.
 
     Quotes are dropped from both sides of the comparison, because the text a segment is
@@ -2693,9 +2696,10 @@ def _settings_permissions() -> tuple[list[dict], bool]:
         try:
             # A directory, a FIFO, a device or an oversized file is never opened: the
             # first would block for the length of the Bash call and the last would be
-            # read on every one of them.
+            # read on every one of them. Raising sends it to the `except` below, as a file
+            # that cannot be read.
             if not S_ISREG(info.st_mode) or info.st_size > SETTINGS_SIZE_CAP:
-                raise ValueError("not a settings file this module will read")
+                raise ValueError("not a settings file this module will read")  # noqa: TRY301
             document = json.loads(path.read_text(encoding="utf-8", errors="replace"))
             permissions = document["permissions"]
         except (OSError, ValueError, KeyError, TypeError, RecursionError):
@@ -2768,7 +2772,7 @@ def _is_under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
-def _expand_home(text: str, tilde: bool) -> str:
+def _expand_home(text: str, *, tilde: bool) -> str:
     """Replace a leading `~`, `~user`, `$HOME` or `${HOME}` with the directory it names."""
     if tilde and text.startswith("~"):
         return os.path.expanduser(text)
@@ -2778,14 +2782,14 @@ def _expand_home(text: str, tilde: bool) -> str:
     return text
 
 
-def _names_a_credential(text: str, tilde: bool = True) -> bool:
+def _names_a_credential(text: str, *, tilde: bool = True) -> bool:
     try:
-        return _names_a_credential_unguarded(text, tilde)
+        return _names_a_credential_unguarded(text, tilde=tilde)
     except (OSError, ValueError):
         return True  # cannot be resolved, and this is the layer that refuses outright
 
 
-def _names_a_credential_unguarded(text: str, tilde: bool = True) -> bool:
+def _names_a_credential_unguarded(text: str, *, tilde: bool = True) -> bool:
     """Whether this word reaches a credential store, however it is spelled.
 
     A word whose final text the shell still decides -- a glob, an expansion -- is judged by
@@ -2803,7 +2807,7 @@ def _names_a_credential_unguarded(text: str, tilde: bool = True) -> bool:
         tilde = True
     if not text:
         return False
-    text = _expand_home(text, tilde)
+    text = _expand_home(text, tilde=tilde)
     roots = _credential_roots()
 
     special = PATH_SPECIAL.search(text)
@@ -2851,9 +2855,17 @@ def _refuse_credential_paths(reduced: str, parts: list[tuple[str, str]]) -> None
 class _ReadScope:
     """Where a reader may read from, and what is known about the command's variables."""
 
-    __slots__ = ("roots", "bases", "splice_vars", "loop_values", "spells_escape")
+    __slots__ = ("bases", "loop_values", "roots", "spells_escape", "splice_vars")
 
-    def __init__(self, roots, bases, splice_vars, loop_values, spells_escape=False):
+    def __init__(
+        self,
+        roots: list[str],
+        bases: list[str],
+        splice_vars: dict[str, list[str]],
+        loop_values: dict[str, list[str]],
+        *,
+        spells_escape: bool = False,
+    ) -> None:
         self.roots = roots
         self.bases = bases
         self.splice_vars = splice_vars
@@ -2909,8 +2921,9 @@ def _resolve_variables(text: str, scope: _ReadScope) -> list[str] | None:
                 values = scope.loop_values[name]
             else:
                 return None
-            for value in values:
-                expanded.append(candidate[: match.start()] + value + candidate[match.end() :])
+            expanded.extend(
+                candidate[: match.start()] + value + candidate[match.end() :] for value in values
+            )
         if len(expanded) > 64:
             return None
         texts = expanded
@@ -2933,8 +2946,8 @@ def _read_scope_problem(
     candidates = _resolve_variables(text, scope)
     if candidates is None:
         return "a path this module cannot resolve"
-    for candidate in candidates:
-        candidate = _expand_home(candidate, tilde=False)
+    for spelled in candidates:
+        candidate = _expand_home(spelled, tilde=False)
         if _carries_live_glob(token):
             # The directory the glob runs in: everything up to the last `/` before it.
             head = PATH_SPECIAL.split(candidate, 1)[0]
@@ -3174,7 +3187,7 @@ def _long_flag(name: str, listed: set[str], files: set[str]) -> str:
     return candidates[0] if len(candidates) == 1 else name
 
 
-def _short_flag(arg: str, takes_value: set[str], bundles: bool) -> tuple[str, int]:
+def _short_flag(arg: str, takes_value: set[str], *, bundles: bool) -> tuple[str, int]:
     """The flag in the single-dash word ``arg`` that takes a value, and where that value starts.
 
     getopt reads ``-rfX`` as ``-r -f X``: the first letter that takes a value takes the rest of
@@ -3233,7 +3246,7 @@ def _file_operands(program: str, args: list[str]) -> list[tuple[int, int]]:
                     index += 1
                     continue
             else:
-                flag, start = _short_flag(arg, values | attached_values | files, bundles)
+                flag, start = _short_flag(arg, values | attached_values | files, bundles=bundles)
             if flag in script_flags:
                 pattern_pending = False
             if flag in stop_flags:
@@ -3267,7 +3280,7 @@ def _file_operands(program: str, args: list[str]) -> list[tuple[int, int]]:
     return found
 
 
-def _scratch_path_pattern() -> "re.Pattern[str]":
+def _scratch_path_pattern() -> re.Pattern[str]:
     """This session's scratch directory, or anything under it, as a whole-path pattern."""
     override = os.environ.get(SCRATCH_ENV, "").rstrip("/")
     path = (
@@ -3278,7 +3291,7 @@ def _scratch_path_pattern() -> "re.Pattern[str]":
     return re.compile(path)
 
 
-def _scratch_redirect() -> "re.Pattern[str]":
+def _scratch_redirect() -> re.Pattern[str]:
     """The redirection shape that writes into this session's scratch directory.
 
     Built per call rather than at import so that `SH_AUTO_APPROVE_SCRATCH` can name an
@@ -3508,7 +3521,7 @@ def main() -> int:
             return 0
         # Claude Code's shell keeps its working directory between calls, so a relative path
         # is read from wherever the session last stood. The payload says where that is.
-        global _SESSION_CWD, REPO_ROOT
+        global _SESSION_CWD, REPO_ROOT  # noqa: PLW0603 - one process per Bash call
         cwd = payload.get("cwd")
         _SESSION_CWD = os.path.realpath(cwd) if isinstance(cwd, str) and cwd else None
         root = _project_root(_SESSION_CWD or os.getcwd())
@@ -3530,7 +3543,7 @@ def main() -> int:
             },
             sys.stdout,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - fail closed, whatever the error
         # Fall back to silence on any unexpected error or malformed input
         return 0
     return 0

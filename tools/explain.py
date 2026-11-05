@@ -72,6 +72,7 @@ def verdict(hook: ModuleType, command: str) -> tuple[str, str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Print the verdict and reason for each command, from the arguments or stdin."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("commands", nargs="*", help="commands to explain; stdin when none")
     parser.add_argument("--project", required=True, help="the session's CLAUDE_PROJECT_DIR")
