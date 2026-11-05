@@ -22,6 +22,19 @@ A [Claude Code](https://code.claude.com/docs) plugin with 2 hooks:
 > would expand. What it can't see is your aliases: if one turns a read-only program such as `ls`
 > or `grep` into something that writes, the hook still approves it.
 
+## Secrets inside your project
+
+> [!WARNING]
+> The hook approves reads anywhere inside the project and its `additionalDirectories`, and a
+> secret kept there is a file like any other: `cat .env` and `grep -r PASSWORD .` are approved.
+> It refuses a command that names a credential store under your home directory, such as `~/.aws`
+> or `~/.ssh`, but not a project's own `.env` file.
+>
+> A native deny rule such as `Read(//**/.env)` in `~/.claude/settings.json` still stops some of
+> these reads: Claude Code applies it even when a hook approves, to the programs its documentation
+> lists (`cat`, `head`, `tail`, `sed` and `tee`). `grep` is not among them. Every entry you add to
+> `additionalDirectories` widens what the hook may read.
+
 ## Install
 
 Through the things-to-know plugin catalog (not published yet).
