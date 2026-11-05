@@ -120,6 +120,9 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   checks what CI does
   - A new check gets a target first, and then a CI step that calls it
   - Steps that only set up the runner, such as installing Python, uv or Claude Code, run directly
+- The `main` ruleset requires a single check, `ci passed`, which fails unless every other CI job
+  succeeded
+  - A new job goes in the `needs` of `ci-passed`, or a PR can merge with that job failing
 - Live debugging: start with `claude --debug`; `~/.claude/debug/<session-id>.txt`
   records which hooks matched and their exit codes.
 - Triage a command that prompted by replaying it in its session's context, never a guessed one:
