@@ -93,7 +93,7 @@ class EnsureFinalNewline(unittest.TestCase):
         self.assertEqual(path.read_bytes(), b"last line\n")
 
     def test_appends_the_line_ending_the_file_uses(self) -> None:
-        """The first line's ending decides, so a file in `\\r\\n` does not end in a bare `\\n`."""
+        r"""The first line's ending decides, so a file in `\r\n` does not end in a bare `\n`."""
         cases = {
             "crlf": (b"a\r\nlast line", b"a\r\nlast line\r\n"),
             "crlf, cut after the cr": (b"a\r\nlast line\r", b"a\r\nlast line\r\n"),

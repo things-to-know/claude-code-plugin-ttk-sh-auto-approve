@@ -1,4 +1,4 @@
-"""
+r"""
 Tests for the read-only Bash classifier behind the `PreToolUse` hook.
 
 Run from the repository root, with no third-party dependency:
@@ -197,8 +197,8 @@ Each of these was run before it was written down, and
 `CorpusIsSafeToExecute.test_every_attack_really_mutates_the_tree` re-runs the executable
 ones on every invocation so none can rot into a case that passes for free:
 
-    echo 'a\\'; touch PWNED                     touch runs: `\\` is literal inside '...'
-    echo a\\\\; touch PWNED                       touch runs: `\\\\` is an escaped backslash
+    echo 'a\'; touch PWNED                     touch runs: `\` is literal inside '...'
+    echo a\\; touch PWNED                       touch runs: `\\` is an escaped backslash
     { ls; } > PWNED / (ls) > PWNED              both write
     for f in a; do echo $f; done > PWNED        writes
     ls > >(cat > PWNED) / coproc touch PWNED    both write
@@ -208,7 +208,7 @@ ones on every invocation so none can rot into a case that passes for free:
     sort "$(echo -o)" PWNED AGENTS.md           writes PWNED
     find . -name AGENTS.md "$(echo -delete)"    deletes
     awk 'BEGIN{"touch PWNED" | getline x}'      runs touch
-    cd $'\\x2ftmp'                               lands in /tmp
+    cd $'\x2ftmp'                               lands in /tmp
     f() { touch PWNED; } then f                 runs across two commands in one shell
     trap 'touch PWNED' DEBUG then wc -l         fires on the next command
     printf -v v hello                           assigns without an `=` anywhere
@@ -618,9 +618,9 @@ def snapshot(root: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for directory, _, files in os.walk(root):
         for name in files:
-            path = os.path.join(directory, name)
+            path = Path(directory, name)
             try:
-                with open(path, "rb") as handle:
+                with path.open("rb") as handle:
                     out[os.path.relpath(path, root)] = hashlib.sha256(handle.read()).hexdigest()
             except OSError as exc:  # a socket or a vanished file is still a change
                 out[os.path.relpath(path, root)] = f"unreadable: {exc.errno}"
@@ -769,7 +769,7 @@ def _literal_first_arguments(tree: ast.AST, method: str) -> list[str]:
     return found
 
 
-def _harvest(path: Path, method: str, skip_rule_dependent: bool = False) -> list[str]:
+def _harvest(path: Path, method: str, *, skip_rule_dependent: bool = False) -> list[str]:
     """Every string literal passed as the first argument to `method` in one file.
 
     Only literals: a command built by an f-string is not a fixed claim about a fixed
@@ -1882,9 +1882,9 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
         self.assert_refused("wc -l < /dev/udp/example.com/53")
 
     def test_jq_string_literals_hide_nothing(self):
-        """The literal-stripping that lets a field named `env` through must not swallow
+        r"""The literal-stripping that lets a field named `env` through must not swallow
         code: an escaped backslash once ended the match late and hid the `env` after it,
-        and `\\(...)` inside a literal is interpolation, which runs."""
+        and `\(...)` inside a literal is interpolation, which runs."""
         self.assert_refused('jq -n \'"\\\\" | env | "x"\'')
         self.assert_refused("jq -n '\"\\(env)\"'")
         self.assert_refused("jq -n '\"\\($ENV.HOME)\"'")
@@ -2098,18 +2098,18 @@ class ResolvesQuotingBeforeLexing(Verdicts, unittest.TestCase):
 
 @approvals_budgeted
 class RefusesQuotingBashReadsDifferently(Verdicts, unittest.TestCase):
-    """Two ways to get the end of a word wrong, in the direction that costs a write.
+    r"""Two ways to get the end of a word wrong, in the direction that costs a write.
 
     Resolving quoting before lexing is the right design, and
     `ResolvesQuotingBeforeLexing` covers the ordinary cases. What it does not cover is
     the two rules a hand-written resolver is most likely to get backwards:
 
-    * inside `'...'` a backslash is an ordinary character, so `'a\\'` is a complete word
+    * inside `'...'` a backslash is an ordinary character, so `'a\'` is a complete word
       and everything after the closing quote is syntax;
-    * inside `$'...'` a backslash *is* an escape, and `\\x2f` is a slash that was not
+    * inside `$'...'` a backslash *is* an escape, and `\x2f` is a slash that was not
       there before the shell expanded it.
 
-    A resolver that honours backslashes inside `'...'` reads `echo 'a\\'; touch PWNED` as
+    A resolver that honours backslashes inside `'...'` reads `echo 'a\'; touch PWNED` as
     one quoted string and approves it. Both forms were executed; both run touch.
     """
 
@@ -2130,8 +2130,8 @@ class RefusesQuotingBashReadsDifferently(Verdicts, unittest.TestCase):
         self.assert_refused("echo a\\\\| sh", "pipes into a shell")
 
     def test_an_escaped_separator_really_is_one_word(self):
-        """The control for Q-02, so a fix cannot be "treat every backslash as nothing".
-        Bash makes `\\;` a literal semicolon in the argument list, and nothing runs."""
+        r"""The control for Q-02, so a fix cannot be "treat every backslash as nothing".
+        Bash makes `\;` a literal semicolon in the argument list, and nothing runs."""
         with scratch_tree() as root:
             self.assertFalse(
                 mutates("echo a\\; touch PWNED", root),
@@ -2143,8 +2143,8 @@ class RefusesQuotingBashReadsDifferently(Verdicts, unittest.TestCase):
         "`$'...'` decodes escapes, so its text is not the text in the command",
     )
     def test_ansi_c_quoting_produces_characters_that_were_not_written(self):
-        """The sharpest instance is a `cd` target, where the check is a path prefix:
-        `$'\\x2ftmp'` is five ordinary characters to a scanner and `/tmp` to bash."""
+        r"""The sharpest instance is a `cd` target, where the check is a path prefix:
+        `$'\x2ftmp'` is five ordinary characters to a scanner and `/tmp` to bash."""
         for command in (
             "cd $'\\x2ftmp' && ls",
             "cd $'\\057tmp' && ls",
@@ -2160,10 +2160,10 @@ class RefusesQuotingBashReadsDifferently(Verdicts, unittest.TestCase):
 
 
 class RefusesMultilineQuotedText(Verdicts, unittest.TestCase):
-    """Finding 1: it did not hold, and the remediation it proposed would have caused it.
+    r"""Finding 1: it did not hold, and the remediation it proposed would have caused it.
 
     Splitting on newline before tokenizing is what the finding calls the bug. It is
-    instead what keeps `ls\\nrm` from being glued into one word, which is finding P-02.
+    instead what keeps `ls\nrm` from being glued into one word, which is finding P-02.
 
     What has changed since is which newlines reach that split. `_scan` resolves quoting
     first, so a newline inside a quoted string is a character in the table and only an
@@ -2561,10 +2561,10 @@ class RefusesRedirectionAttachedToACompound(Verdicts, unittest.TestCase):
         self.assert_refused("coproc CAT { cat; }", "the named form")
 
     def test_every_heredoc_spelling(self):
-        """`RefusesAnythingElse` refuses `<<EOF` and `<<< hi`. These are the rest, and the
+        r"""`RefusesAnythingElse` refuses `<<EOF` and `<<< hi`. These are the rest, and the
         body of a heredoc is text no validator in the module ever looks at.
 
-        `<<-` strips tabs, `<<\\EOF` and the quoted forms suppress expansion; none of
+        `<<-` strips tabs, `<<\EOF` and the quoted forms suppress expansion; none of
         that changes what a splitter does with the delimiter word.
         """
         for command in (
@@ -3528,12 +3528,12 @@ class RefusesStreamEditorAddressForms(Verdicts, unittest.TestCase):
         self.assert_allowed("cat AGENTS.md | sed 's/\\$$//'", "the docs range idiom")
 
     def test_the_ansi_stripping_one_liner(self):
-        """Color codes off captured output, before it goes into a note's code fence.
+        r"""Color codes off captured output, before it goes into a note's code fence.
 
         The idiom the repository will reach for often enough to pin: it names no file,
         its replacement is empty, and `g` is a flag rather than a destination.
 
-        It needs no understanding of `[...]`: the `\\[` is an escape pair outside a class,
+        It needs no understanding of `[...]`: the `\[` is an escape pair outside a class,
         and the `[0-9;]` that follows holds no `/`, so the scan finds the real delimiter
         either way. That is why this one is approved while `s/[/]//g` is not.
         """
@@ -3543,15 +3543,15 @@ class RefusesStreamEditorAddressForms(Verdicts, unittest.TestCase):
         self.assert_allowed("cat AGENTS.md | sed -E 's/\\x1b\\[[0-9;]*m//g'", "extended regexp too")
 
     def test_a_bracket_expression_holding_the_delimiter_is_refused(self):
-        """The scanner does not parse `[...]`, so a `/` inside a class reads as the end
+        r"""The scanner does not parse `[...]`, so a `/` inside a class reads as the end
         of the pattern and the rest becomes nonsense flags. An over-refusal: it costs a
         prompt, and `s#[/]##g` is the spelling that does not.
 
         Teaching it about classes is not the free win it looks like. A scanner that also
-        treated `\\` as an escape inside the class would skip past the `]` that closes it
-        -- sed treats a backslash there as a literal, so `[\\]` is a class holding a
+        treated `\` as an escape inside the class would skip past the `]` that closes it
+        -- sed treats a backslash there as a literal, so `[\]` is a class holding a
         backslash -- and would then find the command letter in the wrong place. On
-        `/[\\]/w ev]il/d` sed reads `w` and writes a file where such a scanner reads `d`.
+        `/[\]/w ev]il/d` sed reads `w` and writes a file where such a scanner reads `d`.
         Refusing the whole shape costs a prompt; parsing it halfway costs a write.
         """
         self.assert_refused("cat AGENTS.md | sed 's/[/]/-/g'", "the class holds /")
@@ -4590,7 +4590,7 @@ class TheClassifierIsAPureFunction(Verdicts, unittest.TestCase):
     def test_a_refusal_does_not_depend_on_the_working_directory(self):
         """A relative path means something different from somewhere else, so approvals
         are allowed to move. A refusal is not: whatever made it unsafe is in the string."""
-        previous = os.getcwd()
+        previous = Path.cwd()
         refused = [c for c in self.PROBES if not hook.is_read_only(c)]
         try:
             os.chdir(tempfile.gettempdir())
@@ -5699,13 +5699,13 @@ class ObservedCommandsNotMadeToPass(Verdicts, unittest.TestCase):
     """
 
     def test_find_exec(self):
-        """`find ... -exec wc -c {} \\;` is read-only in effect and not in form. `-exec`
+        r"""`find ... -exec wc -c {} \;` is read-only in effect and not in form. `-exec`
         launches a program per match, so approving it means validating the argv it builds,
         and once that is validated `find` is a general program launcher rather than a
         program with a validator. It is the primitive in GHSA-cv3g-hj65-pcfh and in
         CVE-2026-55743, both of which are allowlists that made this exact exception.
 
-        Rewrite, approved today: find . -name 'CLAUDE.md' -printf '%s %p\\n'
+        Rewrite, approved today: find . -name 'CLAUDE.md' -printf '%s %p\n'
         """
         self.assert_allowed("find . -name 'CLAUDE.md' -exec wc -c {} \\;")
 

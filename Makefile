@@ -170,11 +170,14 @@ clean: ## Delete Python bytecode and ruff's cache
 # --------------------------------------------------------------------------------------------------
 
 .PHONY: lint-py
-lint-py: ## Check that Python is formatted, showing the diff if not
+lint-py: ## Lint Python with ruff, and check that it is formatted, showing the diff if not
+	${RUFF} check ${PY_FILES}
 	${RUFF} format --check --diff ${PY_FILES}
 
+# Formats after fixing, since a fix can leave code the formatter would change
 .PHONY: lint-py-fix
-lint-py-fix: ## Format Python with ruff, configured by ruff.toml
+lint-py-fix: ## Apply ruff's safe fixes to Python, then format it, configured by ruff.toml
+	${RUFF} check --fix ${PY_FILES}
 	${RUFF} format ${PY_FILES}
 
 .PHONY: lint-md
