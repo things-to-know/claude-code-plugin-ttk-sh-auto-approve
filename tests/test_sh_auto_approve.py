@@ -80,7 +80,7 @@ from a command that prompted in a real session.
           RefusesAwsCallsThatWriteOrExecute, RefusesAwsCallsThatPrintASecret,
           ApprovesGcloudHelpForABlockedVerb, RefusesGcloudCallsThatWriteLocallyOrExecute,
           RefusesGhApiCallsThatWriteOrLeak, ApprovesReadOnlyGhSubcommands,
-          RefusesGhFlagsThatOpenOrWait, RefusesGhJqThatReadsTheEnvironment
+          RefusesGhFlagsThatOpenOrWait, ReadsGhSearchQueries, RefusesGhJqThatReadsTheEnvironment
     14  The operator's own rules: the second tier
           OperatorRules, OperatorRuleFileRobustness, ARepresentativeRuleFile
     15  The classifier as a function
@@ -850,6 +850,17 @@ class Verdicts:
             hook.is_read_only(command),
             f"refused {command!r}" + (f", though {why}" if why else ""),
         )
+
+    def assert_no_opinion(self, command: str, why: str = "") -> None:
+        """Left to the operator's rules, which may still approve it."""
+        with self.assertRaises(hook.NoOpinion, msg=why or command):
+            hook._classify(command)
+
+    def assert_refused_outright(self, command: str, why: str = "") -> None:
+        """Refused, and not as `NoOpinion`, so that no operator rule overturns it."""
+        with self.assertRaises(hook.NotReadOnly, msg=why or command) as raised:
+            hook._classify(command)
+        self.assertNotIsInstance(raised.exception, hook.NoOpinion, why or command)
 
 
 # --------------------------------------------------------------------------------------
@@ -4341,16 +4352,6 @@ class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
         ("git -v branch -D victim", "branch victim"),
     )
 
-    def assert_no_opinion(self, command: str, why: str = "") -> None:
-        with self.assertRaises(hook.NoOpinion, msg=why or command):
-            hook._classify(command)
-
-    def assert_refused_outright(self, command: str, why: str = "") -> None:
-        """Refused, and not as `NoOpinion`, so that no operator rule overturns it."""
-        with self.assertRaises(hook.NotReadOnly, msg=why or command) as raised:
-            hook._classify(command)
-        self.assertNotIsInstance(raised.exception, hook.NoOpinion, why or command)
-
     def test_an_option_that_takes_the_next_word(self):
         """Each refusal was approved as `git log`, and is now refused outright.
 
@@ -4961,10 +4962,6 @@ class RefusesGhFlagsThatOpenOrWait(Verdicts, unittest.TestCase):
     """What a flag table cannot vouch for is left to the operator's rules: it opens a
     browser, blocks, prints escapes, or names a host. Each is a prompt, not a block."""
 
-    def assert_no_opinion(self, command: str, why: str = "") -> None:
-        with self.assertRaises(hook.NoOpinion, msg=why or command):
-            hook._classify(command)
-
     def test_a_browser_a_watch_and_a_template(self):
         for command in (
             "gh pr view 3 --web",
@@ -5026,6 +5023,64 @@ class RefusesGhFlagsThatOpenOrWait(Verdicts, unittest.TestCase):
                 self.assert_no_opinion(command)
 
 
+class ReadsGhSearchQueries(Verdicts, unittest.TestCase):
+    """`gh search issues|prs` reads, as the duplicate check before drafting an issue runs them:
+    the query is any number of words, which only filter what the API returns. Each refusal sits
+    beside a control approved under the same setup."""
+
+    def test_the_duplicate_searches_that_prompted(self):
+        self.assert_allowed(
+            "gh search issues --repo anthropics/claude-code --limit 8 --json number,title,state"
+            " --jq '.[] | \"#\\(.number) \\(.state) \\(.title)\"' newline Write diff"
+        )
+        self.assert_allowed(
+            "gh search issues --repo anthropics/claude-code --limit 15"
+            " --json number,title,state,url -- 'newline Write'"
+        )
+
+    def test_one_approval_per_verb(self):
+        for command in (
+            "gh search issues final newline --repo o/r --state open --limit 8",
+            "gh search issues --include-prs --label bug --sort created --order asc crash",
+            "gh search prs --author someone --merged --json number --jq '.[].number'",
+            "gh search prs -B main -H feat/x --checks failure --draft",
+            "gh search issues -- -label:bug crash",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+
+    def test_a_browser_or_a_template_is_left_to_the_rules(self):
+        self.assert_allowed("gh search issues crash --repo o/r", "the control")
+        self.assert_no_opinion("gh search issues crash --repo o/r --web")
+        self.assert_no_opinion("gh search prs crash -w")
+        self.assert_no_opinion("gh search issues crash --template '{{.title}}'")
+
+    def test_a_word_the_shell_builds_is_not_read(self):
+        self.assert_allowed("gh search issues crash", "the control")
+        self.assert_no_opinion('gh search issues "$q"')
+        self.assert_no_opinion("gh search issues $(cat query.txt)")
+        self.assert_no_opinion("gh search issues crash*", "the shell fills in the words")
+        self.assert_no_opinion('gh search issues -- "$q"', "after the terminator too")
+
+    def test_a_repository_filter_is_owner_slash_repo(self):
+        """For `gh search`, `-R` filters the query, "in OWNER/REPO format" as its help says, so
+        `host/o/r` is a form gh does not document there."""
+        self.assert_allowed("gh search issues crash -R o/r", "the control")
+        self.assert_no_opinion("gh search issues crash -R host/o/r")
+
+    def test_a_filter_that_reads_the_environment_is_refused(self):
+        self.assert_allowed("gh search issues crash --json title --jq '.[].title'", "the control")
+        self.assert_refused_outright("gh search issues crash --json title --jq '$ENV.GH_TOKEN'")
+
+    def test_other_search_verbs_and_flags_are_left_to_the_rules(self):
+        self.assert_allowed("gh search issues crash --locked", "the control")
+        self.assert_no_opinion("gh search code crash")
+        self.assert_no_opinion("gh search repos crash")
+        self.assert_no_opinion("gh search commits crash")
+        self.assert_no_opinion("gh search issues crash --locked=false", "a bare flag with a value")
+        self.assert_no_opinion("gh search issues crash --draft", "`--draft` is for `prs` only")
+
+
 class RefusesGhJqThatReadsTheEnvironment(Verdicts, unittest.TestCase):
     """gh's own jq has `env` and `$ENV`, so `--jq` can print the token. The refusal is a
     finding, not a lack of opinion, so an allow rule does not overturn it, on a subcommand
@@ -5046,10 +5101,7 @@ class RefusesGhJqThatReadsTheEnvironment(Verdicts, unittest.TestCase):
             for spelling in self.spellings(filter_text):
                 command = f"gh issue view 1 {spelling}"
                 with self.subTest(command=command):
-                    self.assert_refused(command, "the filter prints the environment")
-                    with self.assertRaises(hook.NotReadOnly) as raised:
-                        hook._classify(command)
-                    self.assertNotIsInstance(raised.exception, hook.NoOpinion)
+                    self.assert_refused_outright(command, "the filter prints the environment")
 
     def test_a_rule_does_not_overturn_it(self):
         with operator_rules(allow=["Bash(gh issue view *)", "Bash(gh release view *)"]):
