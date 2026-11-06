@@ -117,23 +117,32 @@ def load_hook(path: Path) -> ModuleType:
     return module
 
 
-def verdict(hook: ModuleType, command: str) -> tuple[str, str]:
-    """The decision and its reason, from the hook's own classifier.
+# The verdict on a command the hook's classifier returns from
+ALLOWED = ("allow", "every command only reads, or matches an allow rule")
 
-    Any other exception is a ``refused``, with the exception as its reason: the hook's ``main``
-    stays silent on one, and no allow rule gets a say.
-    """
+
+def verdict(hook: ModuleType, command: str) -> tuple[str, str]:
+    """The decision and its reason, from the hook's own classifier."""
     try:
         hook._classify(command)
-    except hook.NoOpinion as reason:
-        return "no-opinion", str(reason)
-    except hook.NotReadOnly as reason:
-        return "refused", str(reason)
-    except RecursionError:
-        return "refused", "nested too deeply to read"
     except Exception as error:  # noqa: BLE001 - as the hook's `main`, whatever the error
-        return "refused", f"the hook raised {type(error).__name__}: {error}"
-    return "allow", "every command only reads, or matches an allow rule"
+        return refusal(hook, error)
+    return ALLOWED
+
+
+def refusal(hook: ModuleType, error: Exception) -> tuple[str, str]:
+    """The decision and its reason, for an exception the hook's classifier raised.
+
+    An exception other than a ``NotReadOnly`` is a ``refused``, with the exception as its
+    reason: the hook's ``main`` stays silent on one, and no allow rule gets a say.
+    """
+    if isinstance(error, hook.NoOpinion):
+        return "no-opinion", str(error)
+    if isinstance(error, hook.NotReadOnly):
+        return "refused", str(error)
+    if isinstance(error, RecursionError):
+        return "refused", "nested too deeply to read"
+    return "refused", f"the hook raised {type(error).__name__}: {error}"
 
 
 def replay(hook: ModuleType, cwd: str, command: str) -> tuple[str, str]:
