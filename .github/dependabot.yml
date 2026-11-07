@@ -7,8 +7,8 @@
 # - In `.github/workflows/ci.yml`:
 #   - `CLAUDE_CODE_VERSION`, an environment variable
 #   - uv's `version`, an input of `astral-sh/setup-uv`
-#   - The Python and Node versions given to `actions/setup-python` and `actions/setup-node`,
-#     and the test matrix
+#   - The Python and Node versions given to `actions/setup-python`, `astral-sh/setup-uv` and
+#     `actions/setup-node`, and the test matrix
 #     - The matrix also lives in the Makefile, as `TEST_PYTHON_VERSIONS`
 
 version: 2

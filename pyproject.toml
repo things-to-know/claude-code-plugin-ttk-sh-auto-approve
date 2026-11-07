@@ -11,6 +11,8 @@ requires-python = ">=3.12"
 
 [dependency-groups]
 dev = [
+    # `make test-coverage`: `patch = ["subprocess"]`, below, needs 7.10 or later
+    "coverage==7.17.0",
     # The formatter: its output has to match on every machine and in CI, so the version is exact
     "ruff==0.17.1",
 ]
@@ -18,3 +20,18 @@ dev = [
 [tool.uv]
 # A set of tools, not a package: uv installs the dependencies and never builds this directory
 package = false
+
+# `make test-coverage`
+[tool.coverage.run]
+# Branches as well as lines: an `if` whose condition holds in every test has a branch no test takes
+branch = true
+# The hooks, not the tests
+source = ["plugin/scripts"]
+# Also measure the hooks the tests run as separate processes, as Claude Code does, `-I` included.
+# Each process writes its own `.coverage.*` file, which `coverage combine` merges.
+patch = ["subprocess"]
+
+[tool.coverage.report]
+# The line numbers no test runs, and each branch no test takes, as `<line>->exit` or
+# `<line>-><line>`
+show_missing = true

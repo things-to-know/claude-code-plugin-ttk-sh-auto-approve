@@ -12,7 +12,7 @@
 #   - Parentheses stay for Make functions, such as `$(shell ...)`, and for the arguments of a
 #     `$(call ...)`, which would mean something else in bash
 # - About linting/formatting tools:
-#   - `ruff` runs through `uv`, from `.venv`, at the version `uv.lock` pins
+#   - `ruff` runs through `uv`, from `.venv`, at the version `uv.lock` pins, as does `coverage`
 #   - `markdownlint-cli2`, `editorconfig-checker`, `shellcheck` and `actionlint` run from `PATH`
 #     when installed, and otherwise from their container image, pinned by digest, with the
 #     repository mounted read-only and run as the calling user
@@ -45,6 +45,12 @@ UV ?= uv
 
 # `uv run` installs it into .venv first when needed, and fails when uv.lock is out of date
 RUFF ?= ${UV} run --locked ruff
+# Configured in `pyproject.toml`
+# - On .venv's Python, not `PYTHON`: each hook the tests run as a separate process loads coverage
+#   too, and the tests start it with `sys.executable` or the first `python3` on `PATH`, which
+#   `uv run` makes .venv's
+# - `-B`: as for `test`
+COVERAGE ?= ${UV} run --locked python -B -m coverage
 
 # Recipes run without `VIRTUAL_ENV`, the variable that activating a virtualenv sets:
 # - `uv run` always uses the project's own .venv, and while another virtualenv is active it warns
@@ -127,7 +133,7 @@ compile-deps: ## Update uv.lock from pyproject.toml
 	${UV} lock
 
 .PHONY: install-dev
-install-dev: ## Install the dev tools (ruff) into .venv, as uv.lock pins them
+install-dev: ## Install the dev tools (coverage, ruff) into .venv, as uv.lock pins them
 	${UV} sync --locked
 
 .PHONY: lint
@@ -151,6 +157,19 @@ lint-fix: ## Apply the fixes the linters can make on their own
 test: ## Run the tests, e.g. `make test TEST_ARGS='-k Widening'`
 	${PYTHON} -B -m unittest discover -s tests ${TEST_ARGS}
 
+# `test` under Coverage.py, which lists, for each hook, the lines and branches no test runs
+# - It sets no minimum, so only a failing test fails it
+# - `erase` first: a run cut short leaves `.coverage.*` files that `combine` would merge in
+# - `combine` merges the data file of each process, the tests' and each hook's, into `.coverage`
+# - `html` writes `htmlcov/`, which highlights the lines missed in each file
+.PHONY: test-coverage
+test-coverage: ## Run the tests under coverage, and list each hook's lines and branches no test runs
+	${COVERAGE} erase
+	${COVERAGE} run -m unittest discover -s tests ${TEST_ARGS}
+	${COVERAGE} combine --quiet
+	${COVERAGE} report
+	${COVERAGE} html
+
 # `test` once per version, on the interpreter uv finds for it, which uv installs first if missing
 .PHONY: test-all-python-matrix
 test-all-python-matrix: ## Run the tests on each Python version in CI's matrix, from uv
@@ -159,11 +178,13 @@ test-all-python-matrix: ## Run the tests on each Python version in CI's matrix, 
 		${MAKE} --no-print-directory test PYTHON="$$(${UV} python find "$${version}")"; \
 	done
 
+# Coverage writes `.coverage`, a `.coverage.*` file per process until `combine` merges them, and
+# `htmlcov/`
 # .venv is left to `delete-venv`
 .PHONY: clean
-clean: ## Delete Python bytecode and ruff's cache
+clean: ## Delete Python bytecode, ruff's cache, and coverage's data and HTML report
 	find . -path ./.venv -prune -o -name __pycache__ -type d -prune -exec rm -rf -- {} +
-	rm -rf .ruff_cache
+	rm -rf .ruff_cache .coverage .coverage.* htmlcov
 
 # --------------------------------------------------------------------------------------------------
 # Targets / Specific

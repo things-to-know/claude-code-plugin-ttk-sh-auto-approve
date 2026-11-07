@@ -40,6 +40,33 @@ jobs:
           SH_AUTO_APPROVE_REQUIRE_ZSH: "1"
         run: make test
 
+  # Lists, for each hook, the lines and branches no test runs. It sets no minimum, so only a failing
+  # test fails it.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `make test-coverage` runs the tests on .venv's Python, which uv makes with `python-version`,
+      # downloading it if missing
+      # - One version is enough: the only code that depends on it is each hook's Python and platform
+      #   guard, and the tests fake the version for it
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.12.21"
+          python-version: "3.14"
+      - name: Measure coverage
+        run: make test-coverage
+      # It highlights the lines missed in each file, so reading it needs no local run
+      - name: Upload the HTML report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-html
+          path: htmlcov/
+          if-no-files-found: error
+
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -89,7 +116,7 @@ jobs:
   ci-passed:
     name: ci passed
     if: ${{ always() }}
-    needs: [test, lint, validate]
+    needs: [test, coverage, lint, validate]
     runs-on: ubuntu-latest
     steps:
       - name: Fail unless every job above succeeded
