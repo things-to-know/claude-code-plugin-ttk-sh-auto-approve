@@ -49,15 +49,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # `make test-coverage` runs the tests on .venv's Python, which uv makes with `python-version`,
-      # downloading it if missing
-      # - One version is enough: the only code that depends on it is each hook's Python and platform
-      #   guard, and the tests fake the version for it
+      # One version is enough: the only code that depends on it is each hook's Python and platform
+      # guard, and the tests fake the version for it
+      - id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: "0.12.21"
-          python-version: "3.14"
       - name: Measure coverage
+        env:
+          # `make test-coverage` runs the tests on .venv's Python. A path makes uv build .venv on
+          # the interpreter above: given a version, or `python3`, uv prefers a Python it installed
+          # itself, when there is one
+          UV_PYTHON: ${{ steps.python.outputs.python-path }}
         run: make test-coverage
       # It highlights the lines missed in each file, so reading it needs no local run
       - name: Upload the HTML report
