@@ -663,6 +663,24 @@ GIT_EXECUTION_OPTS = (
 # Git options that point it at a repository whose config this module never read
 GIT_LOCATION_OPTS = ("--git-dir", "--work-tree", "--namespace")
 
+# The global options, before the subcommand, that `_git_global_options` walks past besides
+# `-C <dir>`. None takes a value, and git matches each exactly (`handle_options` in `git.c`
+# compares with `strcmp`), so this set is matched exactly too.
+# - An allowlist, because a global option that takes the next word as its value makes that word
+#   look like the subcommand: `git --attr-source log clean -fdx` reads as `git log`, and git runs
+#   `git clean -fdx`. Each of `--attr-source` (git 2.41 and later), `--shallow-file` and
+#   `--super-prefix` (git 2.39 and earlier) does that, and git can add another
+# - Left out:
+#   - `--bare`, which makes the current directory the repository: `--git-dir=.`
+#   - `--help`, `-h`, `--version` and `-v`, which end the options, and git runs `help` or
+#     `version` in their place: `git --help log` is `git help log`, which starts a man viewer
+GIT_GLOBAL_FLAGS = frozenset(
+    {"-p", "--paginate", "-P", "--no-pager"}
+    | {"--no-replace-objects", "--no-lazy-fetch", "--no-optional-locks", "--no-advice"}
+    | {"--literal-pathspecs", "--no-literal-pathspecs", "--glob-pathspecs"}
+    | {"--noglob-pathspecs", "--icase-pathspecs"}
+)
+
 # Exact options that are also a prefix of one above, which git reads as themselves:
 # `git grep --text` and `git diff --text` treat binary files as text.
 GIT_EXACT_SAFE_OPTS = frozenset({"--text"})
@@ -1583,23 +1601,9 @@ def _check_git(args: list[str]) -> None:
         if any(_git_option_is(arg, o) for o in GIT_LOCATION_OPTS):
             raise NotReadOnly(f"git repository location override: {arg}")
 
-    # Consume global `git` options (e.g. `-C <dir>`, `-c <name>=<value>`)
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg in ("-C", "-c"):
-            i += 2
-            continue
-        if arg.startswith("-"):
-            i += 1
-            continue
-        break
-
-    if i >= len(args):
-        raise NotReadOnly("git with no subcommand")
-
-    subcommand = args[i]
-    sub_args = args[i + 1 :]
+    index, _ = _git_global_options(args)
+    subcommand = args[index]
+    sub_args = args[index + 1 :]
 
     # Check for glob expansion in git arguments
     if any("*" in a or "?" in a for a in sub_args):
@@ -1689,22 +1693,29 @@ def _check_git_remote(args: list[str]) -> None:
     raise NotReadOnly(f"git remote other than a listing or get-url: {' '.join(args)}")
 
 
-def _git_directories(args: list[str]) -> list[int]:
-    """Indexes into ``args`` of each ``-C`` directory, read from the global options only.
+def _git_global_options(args: list[str]) -> tuple[int, list[int]]:
+    """The index into ``args`` of ``git``'s subcommand, and of each ``-C`` directory before it.
 
-    After the subcommand ``-C`` is another flag: copy detection in ``log``, ``diff`` and
-    ``blame``. The walk is the one ``_check_git`` does to find the subcommand.
+    Walks past ``-C <dir>`` and ``GIT_GLOBAL_FLAGS`` only, and refuses any other option before
+    the subcommand: whether it takes the next word as its value is what decides which word git
+    runs. After the subcommand ``-C`` is another flag: copy detection in ``log``, ``diff`` and
+    ``blame``.
     """
-    found: list[int] = []
+    directories: list[int] = []
     index = 0
     while index < len(args) and args[index].startswith("-"):
-        if args[index] in ("-C", "-c"):
-            if args[index] == "-C" and index + 1 < len(args):
-                found.append(index + 1)
+        arg = args[index]
+        if arg == "-C":
+            directories.append(index + 1)
             index += 2
-        else:
+        elif arg in GIT_GLOBAL_FLAGS:
             index += 1
-    return found
+        else:
+            raise NotReadOnly(f"git global option not known to be read-only: {arg}")
+    # A `-C` with nothing after it leaves `index` past the end, so each index returned is in range
+    if index >= len(args):
+        raise NotReadOnly("git with no subcommand")
+    return index, directories
 
 
 def _git_option_is(arg: str, option: str) -> bool:
@@ -2564,7 +2575,7 @@ def _check_command(
     # that shows signatures. That is `--git-dir` under another name, so a directory
     # outside the read roots is not this module's to approve.
     if program == "git":
-        directories = _git_directories(args)
+        _, directories = _git_global_options(args)
         if len(directories) > 1:
             raise NoOpinion("git -C given more than once, each relative to the last")
         for index in directories:
