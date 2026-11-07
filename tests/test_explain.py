@@ -2,6 +2,7 @@
 
 import itertools
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -68,23 +69,70 @@ def assistant(*blocks: object, cwd: str | None = str(ROOT), message_id: str | No
     return entry
 
 
-def bash_block(command: object) -> dict:
+def bash_block(command: object, call_id: str | None = None) -> dict:
     """A call to the Bash tool, as a content block."""
     return {
         "type": "tool_use",
-        "id": f"toolu_{next(CALL_NUMBERS):08d}",
+        "id": call_id or f"toolu_{next(CALL_NUMBERS):08d}",
         "name": "Bash",
         "input": {"command": command, "description": "A made-up call"},
     }
 
 
-def bash_call(command: str, cwd: str | None = str(ROOT), message_id: str | None = None) -> dict:
+def bash_call(
+    command: str,
+    cwd: str | None = str(ROOT),
+    message_id: str | None = None,
+    call_id: str | None = None,
+) -> dict:
     """An assistant entry calling the Bash tool once, as a transcript records each call.
 
     Calls Claude made together, in one message, are entries of their own that share the
     message's id: none of 3,337 Bash calls in 58 real transcripts shared an entry.
     """
-    return assistant(bash_block(command), cwd=cwd, message_id=message_id)
+    return assistant(bash_block(command, call_id), cwd=cwd, message_id=message_id)
+
+
+def result(call_id: str, cwd: str) -> dict:
+    """The user entry holding a call's result, with where the call left the shell."""
+    return {
+        "type": "user",
+        "cwd": cwd,
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": call_id, "content": "output"}],
+        },
+    }
+
+
+# A hook that raises on the command `boom`, approves any other, and has what `explain.py` uses of
+# the real one
+RAISING_HOOK = """
+import os
+from pathlib import Path
+
+PROJECT_DIR_ENV = "CLAUDE_PROJECT_DIR"
+SETTINGS_ENV = "SH_AUTO_APPROVE_SETTINGS"
+REPO_ROOT = None
+_SESSION_CWD = None
+
+
+class NotReadOnly(Exception):
+    pass
+
+
+class NoOpinion(NotReadOnly):
+    pass
+
+
+def _project_root(cwd):
+    return Path(os.path.realpath(os.environ[PROJECT_DIR_ENV]))
+
+
+def _classify(command):
+    if command == "boom":
+        raise ValueError("a bug")
+"""
 
 
 def write_transcript(directory: str, *entries: dict | str) -> str:
@@ -166,6 +214,87 @@ class ExplainsATranscript(unittest.TestCase):
         self.assertIn("outside the working directories", lines[1][1])
         self.assertEqual([line[2] for line in lines], [".", elsewhere, ".", "tests"])
 
+    def test_the_directory_as_the_hook_resolves_it(self):
+        """The directory shows where the hook judged the call: a symbolic link to the project,
+        or the project with a trailing slash, is the project. Anywhere else shows as the
+        transcript has it, which a call from the directory holding the link is."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_transcript_") as directory:
+            link = Path(directory) / "link"
+            link.symlink_to(ROOT, target_is_directory=True)
+            path = write_transcript(
+                directory,
+                bash_call("cat AGENTS.md", cwd=str(link)),
+                bash_call("cat AGENTS.md", cwd=str(link / "tests")),
+                bash_call("cat AGENTS.md", cwd=f"{ROOT}/"),
+                bash_call("cat AGENTS.md", cwd=f"{ROOT}/tests/"),
+                bash_call("cat AGENTS.md", cwd=directory),
+            )
+            lines = explain("--transcript", path)
+        self.assertEqual(
+            [(line[0], line[2]) for line in lines],
+            [
+                ("allow", "."),
+                ("allow", "tests"),
+                ("allow", "."),
+                ("allow", "tests"),
+                ("no-opinion", directory),
+            ],
+        )
+
+    def test_a_call_after_another_in_its_message(self):
+        """Claude Code runs the calls of one message together, each from where the message
+        started, or in turn, each from where the one before left the shell, and the
+        transcript records neither: a session's own transcript holds both, with the same
+        entries. Where the two directories give different verdicts, the line says
+        `uncertain`, with each. Where the call's result came before the earlier one's, they
+        ran together, and where the two verdicts agree, the directory does not matter."""
+
+        def calls(left_in: str, *, in_turn: bool) -> list[dict]:
+            results = [result("toolu_cd", left_in), result("toolu_cat", left_in)]
+            return [
+                bash_call("cd elsewhere", call_id="toolu_cd", message_id="msg_both"),
+                bash_call("cat AGENTS.md", call_id="toolu_cat", message_id="msg_both"),
+                *(results if in_turn else reversed(results)),
+            ]
+
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_transcript_") as elsewhere:
+            cases = {
+                "in turn, from elsewhere": calls(elsewhere, in_turn=True),
+                "together": calls(elsewhere, in_turn=False),
+                "in turn, from inside": calls(str(ROOT / "tests"), in_turn=True),
+            }
+            lines = {}
+            for case, entries in cases.items():
+                with tempfile.TemporaryDirectory(prefix="readonly_hook_transcript_") as directory:
+                    path = write_transcript(directory, *entries)
+                    (_, lines[case]) = explain("--transcript", path)
+        self.assertEqual(lines["in turn, from elsewhere"][0], "uncertain")
+        self.assertRegex(
+            lines["in turn, from elsewhere"][1],
+            rf"^allow from \.: .+; no-opinion from {re.escape(elsewhere)}: "
+            r".*outside the working directories",
+        )
+        self.assertEqual(lines["in turn, from elsewhere"][2:], [".", "cat AGENTS.md"])
+        self.assertEqual(lines["together"][0], "allow")
+        self.assertEqual(lines["in turn, from inside"][0], "allow")
+
+    def test_an_error_in_the_hook_is_a_refusal(self):
+        """The hook's `main` stays silent on any exception, so a call the hook raises on is
+        refused, with the exception as its reason, and the calls around it still print."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_transcript_") as directory:
+            hook = Path(directory) / "raising_hook.py"
+            hook.write_text(RAISING_HOOK, encoding="utf-8")
+            path = write_transcript(directory, bash_call("ls"), bash_call("boom"), bash_call("ls"))
+            lines = explain("--hook", str(hook), "--transcript", path)
+        self.assertEqual(
+            [line[:2] for line in lines],
+            [
+                ["allow", "every command only reads, or matches an allow rule"],
+                ["refused", "the hook raised ValueError: a bug"],
+                ["allow", "every command only reads, or matches an allow rule"],
+            ],
+        )
+
     def test_a_command_that_spans_lines_is_judged_whole(self):
         """Not by its first line, which alone would be approved."""
         with tempfile.TemporaryDirectory(prefix="readonly_hook_transcript_") as directory:
@@ -177,16 +306,26 @@ class ExplainsATranscript(unittest.TestCase):
 
     def test_each_command_prints_escaped_on_one_line(self):
         r"""A backslash prints as `\\`, a newline as `\n`, a tab as `\t`, a carriage return as
-        `\r`, and any other control character as `\xNN`, in the directory as in the command. So
+        `\r`, any other control character as `\xNN`, and a format character, a line separator
+        or a lone surrogate as `\uNNNN` or `\UNNNNNNNN`, in the directory as in the command. So
         each output line is one call with 4 fields, which `cut -f1,2 | sort | uniq -c` counts by
         reason; a `\n` in the output is a newline in the command, never one the command
-        spelled; and an escape sequence in a command does not reach the terminal."""
+        spelled; an escape sequence in a command does not reach the terminal; a bidirectional
+        override does not make the command read as another; and a lone surrogate, which no
+        encoding can write, does not end the output early. Any other character prints as it
+        is."""
         commands = (
             "printf 'a\\nb'",
             "printf 'a\tb'",
             "printf 'a\rb'",
             "printf '\x1b[31m'",
             "ls\ngit push",
+            "printf '\x85'",
+            "ls # \u202egnp.txt",
+            "ls\u2028git push",
+            "printf '\U000e0001'",
+            "printf '\ud83d'",
+            "printf 'caf\u00e9 \u4e2d'",
         )
         with tempfile.TemporaryDirectory(prefix="readonly_hook_transcript_") as directory:
             path = write_transcript(
@@ -203,6 +342,12 @@ class ExplainsATranscript(unittest.TestCase):
                 [".", r"printf 'a\rb'"],
                 [".", r"printf '\x1b[31m'"],
                 [".", r"ls\ngit push"],
+                [".", r"printf '\x85'"],
+                [".", r"ls # \u202egnp.txt"],
+                [".", r"ls\u2028git push"],
+                [".", r"printf '\U000e0001'"],
+                [".", r"printf '\ud83d'"],
+                [".", "printf 'caf\u00e9 \u4e2d'"],
                 [r"a\tb", "ls"],
             ],
         )
@@ -293,17 +438,25 @@ class ExplainsATranscript(unittest.TestCase):
         )
 
     def test_a_call_without_a_working_directory_is_an_error(self):
-        """None of 3,337 Bash calls in 58 real transcripts lacked a `cwd`, so one that does is a
-        format this tool does not know, and any verdict for it would be a guess. Nothing is
-        printed: a partial list would read as the whole session."""
+        """None of 3,337 Bash calls in 58 real transcripts lacked a `cwd`, so one that does, or
+        whose `cwd` is not an absolute path, is a format this tool does not know, and any
+        verdict for it would be a guess. Nothing is printed: a partial list would read as the
+        whole session."""
         with tempfile.TemporaryDirectory(prefix="readonly_hook_transcript_") as directory:
             (control,) = explain("--transcript", write_transcript(directory, bash_call("ls")))
-            path = write_transcript(directory, bash_call("ls"), bash_call("ls", cwd=None))
-            result = explain_fails("--transcript", path)
+            for case, cwd in {
+                "missing": None,
+                "empty": "",
+                "relative": "tests",
+                "with a NUL": f"{ROOT}\0",
+            }.items():
+                with self.subTest(case):
+                    path = write_transcript(directory, bash_call("ls"), bash_call("ls", cwd=cwd))
+                    failed = explain_fails("--transcript", path)
+                    self.assertEqual(failed.returncode, 2)
+                    self.assertEqual(failed.stdout, "")
+                    self.assertIn("line 2", error_line(failed))
         self.assertEqual(control[3], "ls")
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stdout, "")
-        self.assertIn("line 2", error_line(result))
 
     def test_cwd_and_a_transcript_together_are_an_error(self):
         """Each call's directory comes from its entry, so a `--cwd` would go unused."""

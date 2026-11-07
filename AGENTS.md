@@ -149,6 +149,9 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
     - Every Bash call of the session, each from its entry's `cwd`, which each line shows before
       the command: `make -s explain PROJECT=<dir> TRANSCRIPT=<transcript>`
       - Count the calls by reason: append `| cut -f1,2 | sort | uniq -c | sort -rn`
+      - `uncertain`: the call came after another in its message, and the transcript doesn't
+        record whether Claude Code ran the two together or in turn; the reason gives the verdict
+        from each directory
       - A subagent's calls are in a transcript of its own, under `<session-id>/subagents/`
     - Chosen commands: `make explain PROJECT=<dir> CWD=<dir> < commands.txt`
     - Add `HOOK=<path>` to ask the installed copy instead of the working copy

@@ -33,14 +33,26 @@ spans lines, such as one with a here-document, goes as an argument.
 Claude made, in order, each from the ``cwd`` its entry records, which is why it takes no
 ``--cwd``. A subagent's calls are in a transcript of their own. Each line gets a field before
 the command, the directory the call ran in: ``.`` for the project, a path relative to it inside
-it, and anywhere else the path as the transcript has it:
+it, both as the hook resolves symbolic links, and anywhere else the path as the transcript has
+it:
 
     allow       <reason>  <directory>  <command>
 
-The fields print escaped, so that each line is one call: ``\\`` for a backslash, ``\n``,
-``\t`` and ``\r``, and ``\xNN`` for any other control character, which also keeps an escape
-sequence away from the terminal. A transcript that cannot be read, or a call without a
-``cwd``, is an error, and nothing is printed: a partial list would read as the whole session.
+The ``cwd`` on a call's entry is where the shell stood when Claude sent the message. A call
+after another one in the same message started there if Claude Code ran the two together, and
+from where the earlier call left the shell if it ran them in turn, which the transcript does
+not record. So such a call is also replayed from the ``cwd`` that each earlier call's result
+records, when that result came before its own, and where that changes the verdict, the line
+says so, with each verdict and the directory it comes from:
+
+    uncertain   <decision> from <directory>: <reason>; ...  <directory>  <command>
+
+The fields print escaped, so that each line is one call and reads as the text it is: ``\\``
+for a backslash, ``\n``, ``\t`` and ``\r``, ``\xNN`` for any other control character, which
+also keeps an escape sequence away from the terminal, and ``\uNNNN`` or ``\UNNNNNNNN`` for a
+format character such as a bidirectional override, a line or paragraph separator, and a lone
+surrogate. A transcript that cannot be read, or a call without an absolute ``cwd``, is an
+error, and nothing is printed: a partial list would read as the whole session.
 """
 
 from __future__ import annotations
@@ -50,24 +62,38 @@ import importlib.util
 import json
 import os
 import sys
+import unicodedata
 from pathlib import Path
 from types import ModuleType
+from typing import NamedTuple
 
 WORKING_COPY = Path(__file__).resolve().parents[1] / "plugin" / "scripts" / "sh_auto_approve.py"
 
-# How `--transcript` prints a command and a reason: a backslash doubled, the characters that
-# would end a line or a field by name, and any other control character by its code
-ESCAPES = {
-    **{code: f"\\x{code:02x}" for code in (*range(0x20), 0x7F, *range(0x80, 0xA0))},
-    ord("\\"): "\\\\",
-    ord("\n"): "\\n",
-    ord("\t"): "\\t",
-    ord("\r"): "\\r",
-}
+# How `--transcript` prints a field: a backslash doubled, and the characters that would end a
+# line or a field by name
+NAMED_ESCAPES = {"\\": "\\\\", "\n": "\\n", "\t": "\\t", "\r": "\\r"}
+
+# ... and by its code, any other character of these categories: a control character, which a
+# terminal acts on; a format character, such as a bidirectional override, which changes how the
+# text around it reads; a line or paragraph separator; and a lone surrogate, which no encoding
+# can write
+CODED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
 
 
 class TranscriptError(Exception):
     """A transcript this module cannot replay; the message says which, and why."""
+
+
+class Call(NamedTuple):
+    """A Bash call from a transcript."""
+
+    # Where the shell stood when Claude sent the call's message, as its entry records it
+    cwd: str
+    command: str
+    # Where an earlier call in the same message left the shell, as that call's result records
+    # it, when the result came before this call's own: the call ran from there instead if
+    # Claude Code ran the two in turn
+    alternatives: tuple[str, ...] = ()
 
 
 def load_hook(path: Path) -> ModuleType:
@@ -87,7 +113,11 @@ def load_hook(path: Path) -> ModuleType:
 
 
 def verdict(hook: ModuleType, command: str) -> tuple[str, str]:
-    """The decision and its reason, from the hook's own classifier."""
+    """The decision and its reason, from the hook's own classifier.
+
+    Any other exception is a ``refused``, with the exception as its reason: the hook's ``main``
+    stays silent on one, and no allow rule gets a say.
+    """
     try:
         hook._classify(command)
     except hook.NoOpinion as reason:
@@ -96,68 +126,168 @@ def verdict(hook: ModuleType, command: str) -> tuple[str, str]:
         return "refused", str(reason)
     except RecursionError:
         return "refused", "nested too deeply to read"
+    except Exception as error:  # noqa: BLE001 - as the hook's `main`, whatever the error
+        return "refused", f"the hook raised {type(error).__name__}: {error}"
     return "allow", "every command only reads, or matches an allow rule"
 
 
-def assistant_entry(line: str) -> dict | None:
-    """The line's entry, when it is a JSON object of type ``assistant``."""
-    try:
-        entry = json.loads(line)
-    except ValueError:
-        return None
-    return entry if isinstance(entry, dict) and entry.get("type") == "assistant" else None
+def replay(hook: ModuleType, cwd: str, command: str) -> tuple[str, str]:
+    """The verdict on ``command`` with the shell in ``cwd``, which the hook's ``main`` resolves."""
+    hook._SESSION_CWD = os.path.realpath(cwd)
+    return verdict(hook, command)
 
 
-def bash_commands(entry: dict) -> list[str]:
-    """The command of each Bash call in an assistant entry's content."""
+def tool_uses(entry: object) -> list[dict]:
+    """The ``tool_use`` blocks in the content of ``entry``, when it is an ``assistant`` entry."""
+    if not isinstance(entry, dict) or entry.get("type") != "assistant":
+        return []
     message = entry.get("message")
     content = message.get("content") if isinstance(message, dict) else None
-    commands = []
-    for block in content if isinstance(content, list) else []:
-        if not isinstance(block, dict) or block.get("type") != "tool_use":
-            continue
-        tool_input = block.get("input")
-        command = tool_input.get("command") if isinstance(tool_input, dict) else None
-        if block.get("name") == "Bash" and isinstance(command, str):
-            commands.append(command)
-    return commands
+    blocks = content if isinstance(content, list) else []
+    return [
+        block for block in blocks if isinstance(block, dict) and block.get("type") == "tool_use"
+    ]
 
 
-def transcript_calls(path: Path) -> list[tuple[str, str]]:
-    """Each Bash call in the transcript at ``path``, in order, with the ``cwd`` it ran in.
+def bash_command(block: dict) -> str | None:
+    """The command of a ``tool_use`` block, when it calls Bash with one."""
+    tool_input = block.get("input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    return command if block.get("name") == "Bash" and isinstance(command, str) else None
+
+
+def bash_commands(entry: object) -> list[str]:
+    """The command of each Bash call in ``entry``, when it is an ``assistant`` entry."""
+    return [command for block in tool_uses(entry) if (command := bash_command(block)) is not None]
+
+
+def answered(entry: dict) -> list[str]:
+    """The id of each call whose result a ``user`` entry holds."""
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return [
+        block["tool_use_id"]
+        for block in (content if isinstance(content, list) else [])
+        if isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and isinstance(block.get("tool_use_id"), str)
+    ]
+
+
+def replayable(cwd: object) -> bool:
+    """Whether a ``cwd`` is one a call can be replayed from: an absolute path, without a NUL."""
+    return isinstance(cwd, str) and "\0" not in cwd and Path(cwd).is_absolute()
+
+
+def transcript_calls(path: Path) -> list[Call]:
+    """Each Bash call in the transcript at ``path``, in order.
 
     A call is a ``tool_use`` block for the Bash tool, with a string ``command``, in the content
-    of an ``assistant`` entry. Other entries can hold copies of earlier calls, an
-    ``api-request-blob`` among them, and are skipped, as is a line that is not a JSON object:
-    the last line of a session still running may not be whole yet.
+    of an ``assistant`` entry, and its result a ``tool_result`` block in a ``user`` entry. Other
+    entries can hold copies of both, an ``api-request-blob`` among them, and are skipped, as is
+    a line that is not a JSON object: the last line of a session still running may not be whole
+    yet.
     """
-    calls = []
+    found: list[tuple[str, str, str | None, str | None]] = []  # cwd, command, call id, message id
+    siblings: dict[str, list[str]] = {}  # message id: the id of each call it holds, in order
+    results: dict[str, tuple[int, str]] = {}  # call id: the line and cwd of its result
     try:
         with path.open(encoding="utf-8") as lines:
             for number, line in enumerate(lines, start=1):
-                entry = assistant_entry(line)
-                commands = bash_commands(entry) if entry is not None else []
-                cwd = entry.get("cwd") if entry is not None else None
-                if commands and not (isinstance(cwd, str) and cwd):
-                    raise TranscriptError(f"{path}, line {number}: a Bash call without a cwd")
-                calls.extend((cwd, command) for command in commands)
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                cwd = entry.get("cwd")
+                if entry.get("type") == "user" and replayable(cwd):
+                    for call_id in answered(entry):
+                        results.setdefault(call_id, (number, cwd))
+                message = entry.get("message")
+                message_id = message.get("id") if isinstance(message, dict) else None
+                message_id = message_id if isinstance(message_id, str) else None
+                for block in tool_uses(entry):
+                    call_id = block.get("id") if isinstance(block.get("id"), str) else None
+                    if call_id is not None and message_id is not None:
+                        siblings.setdefault(message_id, []).append(call_id)
+                    if (command := bash_command(block)) is None:
+                        continue
+                    if not replayable(cwd):
+                        problem = f"{path}, line {number}: a Bash call without an absolute cwd"
+                        raise TranscriptError(problem)
+                    found.append((cwd, command, call_id, message_id))
     except (OSError, UnicodeDecodeError) as error:
         raise TranscriptError(f"cannot read the transcript {path}: {error}") from error
+
+    calls = []
+    for cwd, command, call_id, message_id in found:
+        in_message = siblings.get(message_id, []) if message_id is not None else []
+        earlier = in_message[: in_message.index(call_id)] if call_id in in_message else []
+        own = results[call_id][0] if call_id in results else None
+        alternatives: list[str] = []
+        for sibling in earlier:
+            if sibling not in results:
+                continue
+            line, left_in = results[sibling]
+            # A result after this call's own is a call that finished after this one did, so this
+            # one did not start once it had
+            if own is not None and line > own:
+                continue
+            if left_in != cwd and left_in not in alternatives:
+                alternatives.append(left_in)
+        calls.append(Call(cwd, command, tuple(alternatives)))
     return calls
 
 
-def shown_directory(cwd: str, project: str) -> str:
+def shown_directory(cwd: str, root: str) -> str:
     """The directory a call ran in, as ``--transcript`` prints it.
 
-    ``.`` for the project, a path relative to it inside it, and anywhere else the path as the
+    ``root`` is the project as the hook resolves it. ``.`` for the project and a path relative
+    to it inside it, once ``cwd`` is resolved the same way, and anywhere else the path as the
     transcript has it, so that a call made away from the project stands out.
     """
-    project = os.path.normpath(project)
-    if cwd == project:
+    resolved = os.path.realpath(cwd)
+    if resolved == root:
         return "."
-    if cwd.startswith(project.rstrip(os.sep) + os.sep):
-        return cwd[len(project.rstrip(os.sep)) + 1 :]
+    if resolved.startswith(root + os.sep):
+        return resolved[len(root) + 1 :]
     return cwd
+
+
+def escaped(field: str) -> str:
+    """``field`` as ``--transcript`` prints it, on one line and as the text it is."""
+    return "".join(_escaped(char) for char in field)
+
+
+def _escaped(char: str) -> str:
+    """One character of a field: by name, by its code, or as it is."""
+    if char in NAMED_ESCAPES:
+        return NAMED_ESCAPES[char]
+    if unicodedata.category(char) not in CODED_CATEGORIES:
+        return char
+    code = ord(char)
+    if code <= 0xFF:
+        return f"\\x{code:02x}"
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
+
+
+def transcript_lines(hook: ModuleType, calls: list[Call], root: str) -> list[str]:
+    """The line ``--transcript`` prints for each call, ending in a newline."""
+    lines = []
+    for call in calls:
+        directories = (call.cwd, *call.alternatives)
+        verdicts = [replay(hook, directory, call.command) for directory in directories]
+        decision, reason = verdicts[0]
+        if len(set(verdicts)) > 1:
+            decision = "uncertain"
+            reason = "; ".join(
+                f"{each} from {shown_directory(directory, root)}: {why}"
+                for directory, (each, why) in zip(directories, verdicts, strict=True)
+            )
+        fields = (reason, shown_directory(call.cwd, root), call.command)
+        lines.append("\t".join((decision, *map(escaped, fields))) + "\n")
+    return lines
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -202,12 +332,8 @@ def main(argv: list[str] | None = None) -> int:
             calls = transcript_calls(args.transcript)
         except TranscriptError as error:
             parser.error(str(error))
-        for call_cwd, command in calls:
-            hook._SESSION_CWD = os.path.realpath(call_cwd)
-            decision, reason = verdict(hook, command)
-            directory = shown_directory(call_cwd, args.project)
-            fields = (reason, directory, command)
-            print(decision, *(field.translate(ESCAPES) for field in fields), sep="\t")
+        # Every line first, then all of them in one write: an error leaves nothing printed
+        sys.stdout.write("".join(transcript_lines(hook, calls, str(root))))
         return 0
 
     commands = args.commands or [line.rstrip("\n") for line in sys.stdin if line.strip()]
