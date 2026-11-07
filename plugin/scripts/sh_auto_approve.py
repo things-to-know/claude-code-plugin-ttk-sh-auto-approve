@@ -705,6 +705,7 @@ GIT_READ_SUBCOMMANDS = {
     "log",
     "ls-files",
     "ls-tree",
+    "merge-base",
     "rev-list",
     "rev-parse",
     "shortlog",
@@ -731,6 +732,25 @@ GIT_BRANCH_VALUE_FLAGS = frozenset({"--sort", "--format", "--points-at"})
 GIT_BRANCH_LIST_MODE = frozenset(
     {"--list", "--points-at", "--contains", "--no-contains", "--merged", "--no-merged"}
 )
+
+# `git ls-remote` flags that only shape what is printed. `--sort` is read too, attached only,
+# as `--sort=<key>`. Left out on purpose:
+# - `--upload-pack` (`-u`), which names a program to run
+# - `--server-option` (`-o`), which sends text of the caller's choosing to the server
+GIT_LS_REMOTE_FLAGS = frozenset(
+    {"--heads", "--branches", "--tags", "--refs", "--quiet", "--exit-code", "--get-url"}
+    | {"--symref"}
+)
+GIT_LS_REMOTE_SHORTS = frozenset("hbtq")
+
+# A remote as the repository's config names it, never a URL or a path: no `:`, which a scheme,
+# `ext::` and `host:path` all need, and no `/`.
+GIT_REMOTE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+
+# The section headers of a git config file that `_configured_remotes` reads: a remote, and an
+# include, which could add one from a file this module does not follow.
+GIT_CONFIG_REMOTE_SECTION = re.compile(r'\s*\[\s*remote\s+"([^"\\]*)"\s*\]', re.IGNORECASE)
+GIT_CONFIG_INCLUDE_SECTION = re.compile(r"\s*\[\s*include(?:if)?\b", re.IGNORECASE)
 
 
 class NotReadOnly(Exception):  # noqa: N818 - a verdict, not an error
@@ -1644,6 +1664,10 @@ def _check_git(args: list[str]) -> None:
         _check_git_remote(sub_args)
         return
 
+    if subcommand == "ls-remote":
+        _check_git_ls_remote(sub_args)
+        return
+
     if subcommand not in GIT_READ_SUBCOMMANDS:
         raise NotReadOnly(f"git non-read subcommand: {subcommand}")
 
@@ -1680,11 +1704,16 @@ def _check_git_branch(args: list[str]) -> None:
 
 
 def _check_git_remote(args: list[str]) -> None:
-    """Validate ``git remote``: the listing, and ``get-url``.
+    """Validate ``git remote``: the listing, ``get-url``, and ``show``.
 
-    ``show`` is left out because it contacts the remote unless given ``-n``, and every other
-    verb rewrites the configuration or fetches. A URL with a token in it is printed no more
-    than ``cat .git/config`` prints it.
+    Every other verb rewrites the configuration or fetches. A URL with a token in it is printed
+    no more than ``cat .git/config`` prints it.
+
+    ``show`` contacts each remote it names unless given ``-n``, and writes nothing. It is read
+    for names that ``GIT_REMOTE_NAME`` matches only: git takes a word that names no configured
+    remote as a URL, so a URL in the command would be a host of the caller's choosing. That
+    each name is configured is checked where the command's directories are known:
+    ``_check_git_remote_names``.
     """
     if args in ([], ["-v"], ["--verbose"]):
         return
@@ -1693,7 +1722,120 @@ def _check_git_remote(args: list[str]) -> None:
         names = [arg for arg in args[1:] if not arg.startswith("-")]
         if set(flags) <= {"--push", "--all"} and len(names) == 1:
             return
-    raise NotReadOnly(f"git remote other than a listing or get-url: {' '.join(args)}")
+    if args[:1] == ["show"]:
+        flags = [arg for arg in args[1:] if arg.startswith("-")]
+        names = [arg for arg in args[1:] if not arg.startswith("-")]
+        if set(flags) <= {"-n"} and all(GIT_REMOTE_NAME.fullmatch(name) for name in names):
+            return
+    raise NotReadOnly(f"git remote other than a listing, get-url or show: {' '.join(args)}")
+
+
+def _check_git_ls_remote(args: list[str]) -> None:
+    """Validate ``git ls-remote``: a configured remote's refs, printed and never stored.
+
+    It contacts the remote, with whatever credential helper the environment provides, as
+    ``git remote show`` does. So the repository operand, the first one, must be a remote name
+    that ``GIT_REMOTE_NAME`` matches, or absent, which reads the default remote. A URL, a path
+    or ``ext::`` would make the host, or the command, the caller's choice. The operands after it
+    are ref patterns, which only filter the output.
+
+    A word that names no configured remote is taken as a path, and ``git upload-pack`` then
+    reads that repository, whose config this module never read. So the name must also be
+    configured, which is checked where the command's directories are known:
+    ``_check_git_remote_names``.
+    """
+    operands: list[str] = []
+    for arg in args:
+        if not arg.startswith("-") or arg == "-":
+            operands.append(arg)
+            continue
+        name, equals, _ = arg.partition("=")
+        if arg in GIT_LS_REMOTE_FLAGS or (name == "--sort" and equals):
+            continue
+        if not arg.startswith("--") and set(arg[1:]) <= GIT_LS_REMOTE_SHORTS:
+            continue
+        raise NotReadOnly(f"git ls-remote flag that only a listing does not need: {arg}")
+    if operands and not GIT_REMOTE_NAME.fullmatch(operands[0]):
+        raise NotReadOnly(f"git ls-remote of other than a configured remote: {operands[0]}")
+
+
+def _git_remote_names(args: list[str]) -> list[str]:
+    """The remote names an ``ls-remote`` or a ``remote show`` is given.
+
+    Read after ``_check_git`` has cleared its flags, with the walk to the subcommand that
+    ``_check_git`` does.
+    """
+    index, _ = _git_global_options(args)
+    subcommand, rest = args[index : index + 1], args[index + 1 :]
+    if subcommand == ["ls-remote"]:
+        return [arg for arg in rest if not arg.startswith("-") or arg == "-"][:1]
+    if subcommand == ["remote"] and rest[:1] == ["show"]:
+        return [arg for arg in rest[1:] if not arg.startswith("-")]
+    return []
+
+
+def _configured_remotes(directory: str) -> frozenset[str] | None:
+    """The remotes the repository enclosing ``directory`` configures, or None if not known.
+
+    Not known: no repository, a config that includes another file, or one that cannot be read.
+
+    The config file is read, never ``git``, which would run what that config names. A worktree's
+    ``.git`` file and ``commondir`` are followed to the shared config. A remote configured only
+    in the global or a worktree's own config is missed, which refuses rather than approves.
+    """
+    try:
+        here = Path(os.path.realpath(directory))
+        dotgit = next(
+            (p / ".git" for p in (here, *here.parents) if os.path.lexists(p / ".git")), None
+        )
+        if dotgit is None:
+            return None
+        gitdir = dotgit
+        if dotgit.is_file():
+            pointer = dotgit.read_text(encoding="utf-8").strip()
+            if not pointer.startswith("gitdir:"):
+                return None
+            gitdir = dotgit.parent / pointer[len("gitdir:") :].strip()
+        commondir = gitdir / "commondir"
+        if commondir.is_file():
+            gitdir = gitdir / commondir.read_text(encoding="utf-8").strip()
+        text = (gitdir / "config").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    names: set[str] = set()
+    for line in text.splitlines():
+        if GIT_CONFIG_INCLUDE_SECTION.match(line):
+            return None
+        match = GIT_CONFIG_REMOTE_SECTION.match(line)
+        if match:
+            names.add(match.group(1))
+    return frozenset(names)
+
+
+def _check_git_remote_names(args: list[str], scope: _ReadScope | None) -> None:
+    """Require each remote an ``ls-remote`` or ``remote show`` names to be configured.
+
+    Configured in the repository the command runs in, from every directory it may run in.
+
+    git reads a name it finds no remote for as a path, and reads the repository there. With
+    no scope there is no directory to read a config from, which is no verdict either way.
+    """
+    names = _git_remote_names(args)
+    if not names:
+        return
+    if scope is None:
+        raise NoOpinion("git given a remote name, and no directory to read its config from")
+    _, directories = _git_global_options(args)
+    if len(directories) > 1:
+        raise NoOpinion("git -C given more than once, each relative to the last")
+    for base in scope.bases:
+        directory = os.path.join(base, args[directories[0]]) if directories else base
+        configured = _configured_remotes(directory)
+        if configured is None:
+            raise NoOpinion(f"git remote names whose config cannot be read from {directory}")
+        unknown = [name for name in names if name not in configured]
+        if unknown:
+            raise NotReadOnly(f"git given a name no remote has, so read as a path: {unknown}")
 
 
 def _refuse_git_global(arg: str) -> None:
@@ -2582,6 +2724,10 @@ def _check_command(
             PROGRAM_VALIDATORS[program](args)
     elif program not in READ_ONLY:
         raise NoOpinion(f"unrecognized program: {program}")
+
+    # Before the early return below, which would otherwise approve a remote name unchecked.
+    if program == "git":
+        _check_git_remote_names(args, scope)
 
     # The read scope comes after the validator, so a write the validator found keeps its
     # verdict whatever a rule says: `sort -o out /etc/hostname` writes `out` wherever it reads.

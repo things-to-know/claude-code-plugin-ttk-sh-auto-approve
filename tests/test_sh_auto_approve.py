@@ -43,8 +43,8 @@ from a command that prompted in a real session.
      3  The suite checking itself
           SuiteIntegrity, CorpusIsSafeToExecute
      4  Baseline verdicts
-          ApprovesReadOnly, RefusesAnythingElse, RefusalIsMonotonicUnderComposition,
-          MatchesTheHostsOwnCaution
+          ApprovesReadOnly, ReadsTheRemotesARepositoryConfigures, RefusesAnythingElse,
+          RefusalIsMonotonicUnderComposition, MatchesTheHostsOwnCaution
      5  Commands observed prompting in real sessions
           ObservedCommandsStayApproved, AllowsALoopVariableBoundToLiterals,
           SplicesFlagsFromALiteralAssignment, AllowsACopyIntoTheScratchDirectory,
@@ -600,6 +600,33 @@ def scratch_at(directory: str | None):
             os.environ[hook.SCRATCH_ENV] = previous
 
 
+@contextlib.contextmanager
+def remotes_configured(config: str, *, worktree: bool = False):
+    """Point the module at a repository whose `.git/config` is `config`, built from files
+    alone, with no `git` run. With `worktree`, the project is a linked worktree, whose `.git`
+    file and `commondir` lead to that config."""
+    root = Path(tempfile.mkdtemp(prefix="readonly_hook_remotes_"))
+    try:
+        project = root / "main"
+        common = project / ".git"
+        common.mkdir(parents=True)
+        (common / "config").write_text(config)
+        if worktree:
+            linked = common / "worktrees" / "w"
+            linked.mkdir(parents=True)
+            (linked / "commondir").write_text("../..\n")
+            project = root / "w"
+            project.mkdir()
+            (project / ".git").write_text(f"gitdir: {linked}\n")
+        with (
+            unittest.mock.patch.object(hook, "REPO_ROOT", project),
+            unittest.mock.patch.object(hook, "_SESSION_CWD", None),
+        ):
+            yield project
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------------------
 # Execution sandbox
 # --------------------------------------------------------------------------------------
@@ -806,8 +833,9 @@ class Verdicts:
 # A class that installs a rule file asserts approvals that hold *with that file in
 # place*. The differential below runs with the classifier tier alone, so harvesting from
 # one of these collects a command the operator granted -- `Bash(touch *)` is in
-# `REPRESENTATIVE_RULES` -- and reports the grant working as a bypass.
-RULE_DEPENDENT = ("operator_rules",)
+# `REPRESENTATIVE_RULES` -- and reports the grant working as a bypass. A class that builds
+# a repository config asserts approvals that hold with that config only, the same way.
+RULE_DEPENDENT = ("operator_rules", "remotes_configured")
 
 
 def _literal_first_arguments(tree: ast.AST, method: str) -> list[str]:
@@ -1256,6 +1284,58 @@ class ApprovesReadOnly(Verdicts, unittest.TestCase):
         )
 
 
+class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
+    """`git non-read subcommand: ls-remote`, and `remote show`. Both contact a remote and write
+    nothing, and git reads a name it finds no remote for as a path to another repository. So
+    a name is read only when the repository's config, read as a file, configures it. Each
+    refusal sits beside its control, under the same config."""
+
+    ORIGIN = '[remote "origin"]\n\turl = https://example.com/x.git\n'
+
+    def test_a_configured_remote(self):
+        with remotes_configured(self.ORIGIN):
+            self.assert_allowed("git ls-remote --heads origin", "lists the remote's branches")
+            self.assert_allowed("git ls-remote origin refs/heads/main", "a ref pattern")
+            self.assert_allowed("git ls-remote --get-url origin", "prints the URL")
+            self.assert_allowed("git ls-remote --sort=-version:refname -t origin", "sorted tags")
+            self.assert_allowed("git ls-remote", "the default remote")
+            self.assert_allowed("git remote show origin", "contacts origin")
+            self.assert_allowed("git remote show -n origin", "reads the config only")
+
+    def test_a_name_no_remote_has_is_a_path(self):
+        with remotes_configured(self.ORIGIN):
+            self.assert_allowed("git ls-remote origin", "the control")
+            self.assert_refused("git ls-remote other", "reads ./other as a repository")
+            self.assert_refused("git remote show other", "the same")
+            self.assert_refused("git remote show origin other", "one of the 2 is a path")
+
+    def test_a_linked_worktree_reads_the_shared_config(self):
+        with remotes_configured(self.ORIGIN, worktree=True):
+            self.assert_allowed("git ls-remote origin", "configured in the common directory")
+            self.assert_refused("git ls-remote other", "configured nowhere")
+
+    def test_a_config_that_includes_another_file(self):
+        """An include could configure the name, or not: the module does not follow it."""
+        with remotes_configured(self.ORIGIN):
+            self.assert_allowed("git ls-remote origin", "the control")
+        with remotes_configured(self.ORIGIN + "[include]\n\tpath = more.config\n"):
+            self.assert_refused("git ls-remote origin", "the config is not read whole")
+
+    def test_what_is_not_a_remote_name(self):
+        """A URL or a path makes the host the caller's choice, `ext::` runs a command, and
+        `--upload-pack` names one to run."""
+        with remotes_configured(self.ORIGIN):
+            self.assert_allowed("git ls-remote origin", "the control")
+            self.assert_refused("git ls-remote https://example.com/x", "a URL")
+            self.assert_refused("git ls-remote other/repo", "a path")
+            self.assert_refused("git ls-remote 'ext::sh -c touch% x'", "runs a command")
+            self.assert_refused("git ls-remote --upload-pack='touch x' origin", "runs touch")
+            self.assert_refused("git ls-remote -u 'touch x' origin", "the short form")
+            self.assert_refused("git ls-remote --server-option=x origin", "sends text out")
+            self.assert_refused("git remote show https://example.com/x", "a URL")
+            self.assert_refused("git remote show --bogus origin", "an unknown flag")
+
+
 class RefusesAnythingElse(Verdicts, unittest.TestCase):
     """Silence, so the command prompts as it does today. The important half."""
 
@@ -1647,6 +1727,13 @@ class ObservedCommandsStayApproved(Verdicts, unittest.TestCase):
             "git rev-list --count main..HEAD; git rev-list --count HEAD..main; "
             "git ls-tree --name-only main -- docs/ | grep -c 'a'"
         )
+
+    def test_checking_whether_a_branch_holds_a_commit(self):
+        """`git non-read subcommand: merge-base`. It only reads: `--is-ancestor` answers in its
+        exit status, and no form writes a ref. `merge`, whose name it extends, stays refused."""
+        self.assert_allowed("git merge-base --is-ancestor abc1234 HEAD && echo ancestor")
+        self.assert_allowed("git merge-base --fork-point main HEAD")
+        self.assert_refused("git merge main", "merges into the checked-out branch")
 
     def test_listing_branches_and_remotes(self):
         """`git non-read subcommand: branch`, and the same for `remote`. Both write with a
@@ -2975,7 +3062,8 @@ class RefusesEgressThroughAnApprovedProgram(Verdicts, unittest.TestCase):
 
     def test_git_reaching_a_remote_without_writing_anything(self):
         """`ls-remote` writes no ref and still puts a URL of the caller's choosing on the
-        wire, with whatever credential helper the environment provides."""
+        wire, with whatever credential helper the environment provides. A configured remote is
+        read: the control is in `ReadsTheRemotesARepositoryConfigures`."""
         self.assert_refused("git ls-remote https://example.com/x", "contacts a remote")
 
 
@@ -3888,7 +3976,8 @@ class RefusesGitSubcommandsOutsideTheReadSet(Verdicts, unittest.TestCase):
         self.assert_refused("git --namespace=x log", "reads another ref namespace")
 
     def test_the_branch_and_remote_verbs_that_write(self):
-        """`branch` and `remote` are read in their listing forms only. A name outside list
+        """`branch` and `remote` are read in their listing forms only, and `remote` in
+        `get-url` and `show`, refused here for a URL. A name outside list
         mode creates a branch, `-l` was `--create-reflog` before git 2.19, and an
         abbreviation git accepts is refused along with the flag it abbreviates."""
         for subcommand in (
@@ -3916,7 +4005,7 @@ class RefusesGitSubcommandsOutsideTheReadSet(Verdicts, unittest.TestCase):
             "remote set-head origin -a",
             "remote prune origin",
             "remote update",
-            "remote show origin",
+            "remote show https://example.com/x",
             "remote get-url origin upstream",
             "remote get-url --bogus origin",
         ):
