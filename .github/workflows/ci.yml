@@ -58,12 +58,20 @@ jobs:
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: "0.12.21"
+      # As in `test`, so that the report counts what `DifferentialAgainstZsh` runs too
+      - name: Install zsh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zsh
+          zsh --version
       - name: Measure coverage
         env:
           # `make test-coverage` runs the tests on .venv's Python. A path makes uv build .venv on
           # the interpreter above: given a version, or `python3`, uv prefers a Python it installed
           # itself, when there is one
           UV_PYTHON: ${{ steps.python.outputs.python-path }}
+          # As in `test`: a missing zsh fails the zsh differential instead of skipping it
+          SH_AUTO_APPROVE_REQUIRE_ZSH: "1"
         run: make test-coverage
       # It highlights the lines missed in each file, so reading it needs no local run
       - name: Upload the HTML report
