@@ -23,6 +23,8 @@ insists on its own filename, symlink to this file rather than copying it.
 - `ci/validate-plugin.sh` wraps `claude plugin validate` (see "No `version`").
 - `tools/explain.py` prints the hook's verdict and reason for each command, for a given
   session (see [Develop](#develop))
+- `tools/synthetic_transcript.py` made `tests/fixtures/transcript.jsonl` out of a real
+  transcript, every value replaced; its docstring says what it keeps
 - `pyproject.toml` and `uv.lock` pin the dev tools (`coverage`, `ruff`), which `uv` installs
   into `.venv`; neither ships
 
@@ -144,7 +146,14 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   - The transcript records the shell's working directory as `cwd` on each entry. The project
     directory is the one in the session's scratchpad path, or in "Shell cwd was reset to ..."
   - Replay with `make explain` (i.e. `tools/explain.py`):
-    - `make explain PROJECT=<dir> CWD=<dir> < commands.txt`
+    - Every Bash call of the session, each from its entry's `cwd`, which each line shows before
+      the command: `make -s explain PROJECT=<dir> TRANSCRIPT=<transcript>`
+      - Count the calls by reason: append `| cut -f1,2 | sort | uniq -c | sort -rn`
+      - `uncertain`: the call came after another in its message, and the transcript doesn't
+        record whether Claude Code ran the two together or in turn; the reason gives the verdict
+        from each directory
+      - A subagent's calls are in a transcript of its own, under `<session-id>/subagents/`
+    - Chosen commands: `make explain PROJECT=<dir> CWD=<dir> < commands.txt`
     - Add `HOOK=<path>` to ask the installed copy instead of the working copy
 
 ## Linting
