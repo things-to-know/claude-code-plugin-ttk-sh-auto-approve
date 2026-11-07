@@ -23,8 +23,8 @@ insists on its own filename, symlink to this file rather than copying it.
 - `ci/validate-plugin.sh` wraps `claude plugin validate` (see "No `version`").
 - `tools/explain.py` prints the hook's verdict and reason for each command, for a given
   session (see [Develop](#develop))
-- `pyproject.toml` and `uv.lock` pin the dev tools (`ruff`), which `uv` installs into `.venv`;
-  neither ships
+- `pyproject.toml` and `uv.lock` pin the dev tools (`coverage`, `ruff`), which `uv` installs
+  into `.venv`; neither ships
 
 ## Rules for the approval hook
 
@@ -106,8 +106,8 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
     your `python3`
   - For exactly CI's checks: `make check LINTERS_FROM_IMAGES=1`,
     `SH_AUTO_APPROVE_REQUIRE_ZSH=1 make test-all-python-matrix` and `make validate`
-  - `make` runs `ruff` through `uv`, which has to be on `PATH`: from `.venv`, at the version
-    `uv.lock` pins
+  - `make` runs `ruff` and `coverage` through `uv`, which has to be on `PATH`: from `.venv`, at
+    the version `uv.lock` pins
     - `pyproject.toml` lists the dev tools; after changing it, `make compile-deps` relocks
   - `make validate` runs `claude plugin validate` through `ci/validate-plugin.sh` and needs
     `claude` on `PATH`; `make check` leaves it out.
@@ -118,6 +118,13 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
       `uv python install 3.12` if that version is missing
   - zsh: `make test` skips `DifferentialAgainstZsh` when `zsh` isn't on `PATH`. CI installs zsh
     and sets `SH_AUTO_APPROVE_REQUIRE_ZSH=1`, which turns that skip into a failure.
+  - `make test-coverage` runs the tests under Coverage.py and lists, for each hook, the lines and
+    branches no test runs, in the hooks the tests run as separate processes too
+    - It sets no minimum, so only a failing test fails it
+    - It writes the HTML report to `htmlcov/`; CI runs it on one Python version and uploads that
+      report as the `coverage-html` artifact
+    - A refusal no test runs is a missing test or a redundant check: the report shows where to
+      look, and a reader decides which
 - CI runs every check through its `make` target, never the tool directly, so that a local `make`
   checks what CI does
   - A new check gets a target first, and then a CI step that calls it
