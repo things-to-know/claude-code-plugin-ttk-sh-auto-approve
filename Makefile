@@ -67,9 +67,15 @@ TEST_ARGS ?=
 TEST_PYTHON_VERSIONS ?= 3.12 3.13 3.14
 
 # The session to explain a verdict for, and the copy of the hook to ask, e.g.
-# `make explain PROJECT=~/ws/app CWD=~/ws/app/sub < commands.txt`
+# `make explain PROJECT=$HOME/ws/app CWD=$HOME/ws/app/sub < commands.txt`.
+# `TRANSCRIPT` explains every Bash call of a session instead, each from its own directory, so it
+# replaces `CWD`:
+# `make -s explain PROJECT=$HOME/ws/app TRANSCRIPT=<session-id>.jsonl`
+# `$HOME`, not `~`: zsh leaves a `~` after `=` in an argument as it is
+# (unless `magic_equal_subst` is set)
 PROJECT ?= ${CURDIR}
 CWD ?= ${PROJECT}
+TRANSCRIPT ?=
 HOOK ?= plugin/scripts/sh_auto_approve.py
 
 PY_FILES = $(shell git ls-files '*.py')
@@ -235,8 +241,9 @@ lint-json: ## Check that every JSON file parses
 
 # `-B`: as for `test`, though `tools/explain.py` also sees to it for the hook it loads
 .PHONY: explain
-explain: ## Print the hook's verdict and reason for each command on stdin
-	${PYTHON} -I -B tools/explain.py --project "${PROJECT}" --cwd "${CWD}" --hook "${HOOK}"
+explain: ## Print the hook's verdict and reason for each command on stdin, or in TRANSCRIPT
+	${PYTHON} -I -B tools/explain.py --project "${PROJECT}" --hook "${HOOK}" \
+		$(if ${TRANSCRIPT},--transcript "${TRANSCRIPT}",--cwd "${CWD}")
 
 .PHONY: validate
 validate: ## Run `claude plugin validate` (needs `claude` on PATH)
