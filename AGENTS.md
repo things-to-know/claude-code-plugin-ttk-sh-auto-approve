@@ -104,8 +104,8 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   `make help` lists them.
   - `make check` lints and tests as CI does, but with the linters installed on your machine and
     your `python3`
-  - For exactly CI's checks: `make check LINTERS_FROM_IMAGES=1`, `make test-all-python-matrix`
-    and `make validate`
+  - For exactly CI's checks: `make check LINTERS_FROM_IMAGES=1`,
+    `SH_AUTO_APPROVE_REQUIRE_ZSH=1 make test-all-python-matrix` and `make validate`
   - `make` runs `ruff` through `uv`, which has to be on `PATH`: from `.venv`, at the version
     `uv.lock` pins
     - `pyproject.toml` lists the dev tools; after changing it, `make compile-deps` relocks
@@ -116,6 +116,8 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
     - `make test` runs your `python3`
     - For a failure CI shows on one version: `make test PYTHON="$(uv python find 3.12)"`, after
       `uv python install 3.12` if that version is missing
+  - zsh: `make test` skips `DifferentialAgainstZsh` when `zsh` isn't on `PATH`. CI installs zsh
+    and sets `SH_AUTO_APPROVE_REQUIRE_ZSH=1`, which turns that skip into a failure.
 - CI runs every check through its `make` target, never the tool directly, so that a local `make`
   checks what CI does
   - A new check gets a target first, and then a CI step that calls it

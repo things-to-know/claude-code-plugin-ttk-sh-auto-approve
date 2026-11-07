@@ -18,6 +18,8 @@ Environment variables
     SH_AUTO_APPROVE_STRICT      `0` turns open findings into expected failures
     SH_AUTO_APPROVE_FUZZ        how many mutants `DifferentialFuzz` generates (300)
     SH_AUTO_APPROVE_FUZZ_SEED   the seed it generates them from (20260914)
+    SH_AUTO_APPROVE_REQUIRE_ZSH `1` fails `DifferentialAgainstZsh` where zsh is not on
+                                `PATH`, instead of skipping it; CI sets it
 
 Red by default
 --------------
@@ -228,6 +230,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import hashlib
 import importlib.util
 import io
@@ -327,6 +330,29 @@ def approvals_budgeted(cls):
     return cls
 
 
+def fail_unless(condition, reason: str):
+    """`unittest.skipUnless`, except that the cases fail instead of skipping."""
+
+    def decorate(target):
+        if condition:
+            return target
+        if isinstance(target, type):
+
+            def setUp(self):  # every test in the class fails before its body runs
+                self.fail(reason)
+
+            target.setUp = setUp
+            return target
+
+        @functools.wraps(target)
+        def failing(self, *_args, **_kwargs):
+            self.fail(reason)
+
+        return failing
+
+    return decorate
+
+
 # --------------------------------------------------------------------------------------
 # Environment probes
 #
@@ -385,7 +411,14 @@ needs_bash = unittest.skipUnless(BASH, "needs bash on PATH")
 # Code documentation or the code that builds the wrapper; see the hook's module docstring.
 ZSH = shutil.which("zsh")
 CLAUDE_CODE_ZSH_OPTIONS = "setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL"
-needs_zsh = unittest.skipUnless(ZSH, "needs zsh on PATH")
+# Without zsh the zsh differential skips, and a skip doesn't show in a green check. CI installs
+# zsh and sets this, so a runner without it fails instead.
+REQUIRE_ZSH = os.environ.get("SH_AUTO_APPROVE_REQUIRE_ZSH", "") not in {"", "0"}
+needs_zsh = (
+    fail_unless(ZSH, "zsh is not on PATH, and SH_AUTO_APPROVE_REQUIRE_ZSH requires it")
+    if REQUIRE_ZSH
+    else unittest.skipUnless(ZSH, "needs zsh on PATH")
+)
 needs_bash_44 = unittest.skipUnless(
     BASH and BASH_VERSINFO >= (4, 4),
     f"needs bash >= 4.4 for ${{var@P}}; found {BASH_VERSINFO}",

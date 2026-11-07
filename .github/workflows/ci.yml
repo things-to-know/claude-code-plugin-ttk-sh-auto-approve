@@ -26,7 +26,18 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
+      # For `DifferentialAgainstZsh`: the runner doesn't ship zsh. The version goes in the log, so
+      # the one the differential ran against is on record.
+      - name: Install zsh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zsh
+          zsh --version
       - name: Run tests
+        env:
+          # A missing zsh fails the zsh differential instead of skipping it, which a green check
+          # wouldn't show
+          SH_AUTO_APPROVE_REQUIRE_ZSH: "1"
         run: make test
 
   lint:
