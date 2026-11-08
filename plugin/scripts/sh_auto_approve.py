@@ -264,6 +264,9 @@ INTERPRETS_ESCAPES = ("echo", "printf")
 # is this session's alone, so no other session's scratchpad is in reach. Its files last as long
 # as the session's transcript. No setting names one instead: a directory named for every session
 # would be one they all share, where one session could rewrite a script another is about to run.
+# A path is in it only while it stays there once each link in it is resolved: a link in the
+# scratchpad may lead anywhere, such as one a `git worktree add` checks out
+# (`_resolves_into_scratch`).
 
 # One path component that is not `..`, spelled only in characters the shell passes through
 # untouched. Without the lookahead the trailing `(?:/COMPONENT)+` happily matches
@@ -4130,10 +4133,16 @@ def _in_scope_unguarded(absolute: str, scope: _ReadScope) -> bool:
     # the command's own text. A directory below a value this module didn't read is none to place
     # a path in: `UNREAD_VALUE`, #72.
     scratch = _scratch_root()
-    if scratch is not None and _is_under(normal, scratch) and UNREAD_VALUE not in normal:
+    if (
+        scratch is not None
+        and _is_under(normal, scratch)
+        and UNREAD_VALUE not in normal
+        and _resolves_into_scratch(absolute)
+    ):
         return True
     # Resolved as given, not as `normpath` reads it: the kernel resolves a link before the `..`
     # after it, so `l/../x` is the `x` beside where `l` leads, and `realpath` does the same.
+    # The scratchpad's check above is given the path as it is for the same reason.
     resolved = os.path.realpath(absolute)
     return any(_is_under(normal, root) and _is_under(resolved, root) for root in scope.roots)
 
@@ -4552,12 +4561,34 @@ def _scratch_root() -> str | None:
 
 
 def _scratch_redirect() -> re.Pattern[str] | None:
-    """The redirection shape that writes into this session's scratch directory."""
+    """The redirection shape that writes into this session's scratch directory.
+
+    The group ``target`` is the path written.
+    """
     directory = _scratch_directory()
     if directory is None:
         return None
     path = directory + SCRATCH_COMPONENT + "+"
-    return re.compile(r"(?<![^\s;|&(])&?>>?\s*(?:" + path + r")(?=[\s;|&)]|$)")
+    return re.compile(r"(?<![^\s;|&(])&?>>?\s*(?P<target>" + path + r")(?=[\s;|&)]|$)")
+
+
+def _resolves_into_scratch(path: str) -> bool:
+    """Whether ``path`` is under this session's scratch directory once each link is resolved.
+
+    ``path`` is under it by its text, and a link in the scratch directory leads wherever it
+    points: ``<scratch>/home-link/`` may be the home directory. The scratch directory is
+    resolved too, since its own path may go through a link, as ``/tmp`` does on macOS.
+    ``realpath`` resolves the part of the path that exists, so a file a redirection is about to
+    create is placed by the links in the directories above it. ``path`` is to be given as the
+    program gets it, not normalized: a link resolves before the ``..`` after it.
+    """
+    root = _scratch_root()
+    if root is None:
+        return False
+    try:
+        return _is_under(os.path.realpath(path), os.path.realpath(root))
+    except (OSError, ValueError):
+        return False  # a path that cannot be resolved is not one to vouch for
 
 
 def _readable_input_target(target: str, parts: list[tuple[str, str]], roots: list[str]) -> bool:
@@ -4659,7 +4690,10 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     stripped = SAFE_REDIRECTS.sub(" ", reduced)
     scratch_redirect = _scratch_redirect()
     if scratch_redirect is not None:
-        stripped = scratch_redirect.sub(" ", stripped)
+        stripped = scratch_redirect.sub(
+            lambda match: " " if _resolves_into_scratch(match["target"]) else match.group(0),
+            stripped,
+        )
     stripped = FILE_INPUT_REDIRECT.sub(
         lambda match: (
             " " if _readable_input_target(match.group(1), parts, roots) else match.group(0)

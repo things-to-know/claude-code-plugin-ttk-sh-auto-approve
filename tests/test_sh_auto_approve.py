@@ -60,7 +60,7 @@ from a command that prompted in a real session.
      8  Redirection, sockets, and egress
           RefusesDescriptorAndSocketRedirection, RefusesRedirectionAttachedToACompound,
           RefusesReadsOutsideTheWorkingDirectories, RefusesACredentialStoreAWildcardOrABaseReaches,
-          RefusesEgressThroughAnApprovedProgram
+          RefusesAScratchPathThroughALinkOut, RefusesEgressThroughAnApprovedProgram
      9  Program identity, environment, and session state
           RefusesControlOfTheEnvironmentAndTheProgram, StripsTheWrapperTheHostStrips,
           RefusesBuiltinsThatRunAProgram, RefusesSessionScopedEnvironmentHandover,
@@ -3890,6 +3890,104 @@ class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase
             ):
                 with self.subTest(command=command):
                     self.assert_refused_outright(command)
+
+
+class RefusesAScratchPathThroughALinkOut(Verdicts, unittest.TestCase):
+    """The scratch directory was matched by its text alone, so a link inside it led a read or a
+    write wherever it pointed: with `out -> /etc` there, `cat <scratch>/out/hostname` and
+    `wc -l AGENTS.md > <scratch>/out/x` were approved, and `cat /etc/hostname` was not.
+
+    A link gets there through a command the operator approves, such as a `git worktree add` or a
+    `tar x` of a tree that holds one. Now a path in the scratch directory, read or written, has
+    to stay there once each link is resolved, as a path under any other read root does.
+
+    The verdict depends on the links on disk, so each case makes real ones, in a scratch
+    directory of its own: `out` leads to a directory outside it, `in` to `inner` inside it, and
+    `inner` is the plain path. Each refusal sits beside a control approved under the same setup.
+    """
+
+    # Each `{}` is a directory in the scratch directory
+    READS_AND_WRITES = (
+        "cat {}/f",
+        "grep -rn x {}/",
+        "wc -l < {}/f",
+        "wc -l AGENTS.md > {}/f",
+        "wc -l AGENTS.md >> {}/f",
+    )
+
+    @contextlib.contextmanager
+    def _scratch(self, *, through_a_link: bool = False):
+        """The scratch directory, and its links, beside a directory outside it. With
+        `through_a_link`, the scratch directory is named by a link to it, as a scratch
+        directory under `/tmp` is on macOS, where `/tmp` leads to `/private/tmp`."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_links_") as directory:
+            top = Path(os.path.realpath(directory))
+            scratch, outside = top / "scratch", top / "outside"
+            (scratch / "inner").mkdir(parents=True)
+            outside.mkdir()
+            (outside / "f").write_text("x\n")
+            (scratch / "out").symlink_to(outside)
+            (scratch / "in").symlink_to("inner")
+            (scratch / "out-file").symlink_to(outside / "f")
+            (scratch / "in-file").symlink_to(scratch / "inner" / "f")
+            (scratch / "dangling").symlink_to(outside / "new")
+            named = scratch
+            if through_a_link:
+                named = top / "scratch-link"
+                named.symlink_to(scratch)
+            with with_scratchpad_dir(str(named)):
+                yield named
+
+    def test_a_link_to_a_directory(self):
+        with self._scratch() as scratch:
+            for spelling in self.READS_AND_WRITES:
+                with self.subTest(spelling=spelling):
+                    self.assert_refused(spelling.format(f"{scratch}/out"), "leads outside it")
+                    self.assert_allowed(spelling.format(f"{scratch}/in"), "leads inside it")
+                    self.assert_allowed(spelling.format(f"{scratch}/inner"), "a plain path")
+
+    def test_a_link_to_a_file(self):
+        """The last component is a link too: a redirection writes the file it leads to, and a
+        dangling link creates that file."""
+        with self._scratch() as scratch:
+            for refused, approved in (
+                (f"cat {scratch}/out-file", f"cat {scratch}/in-file"),
+                (f"wc -l < {scratch}/out-file", f"wc -l < {scratch}/in-file"),
+                (f"wc -l AGENTS.md > {scratch}/out-file", f"wc -l AGENTS.md > {scratch}/in-file"),
+                (f"wc -l AGENTS.md > {scratch}/dangling", f"wc -l AGENTS.md > {scratch}/new"),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_refused(refused, "leads outside the scratch directory")
+                    self.assert_allowed(approved, "stays inside it")
+
+    def test_a_dot_dot_after_a_link(self):
+        """The kernel resolves `out` before the `..` after it, so `<scratch>/out/..` is the
+        directory holding `outside`, not the scratchpad: `normpath` would drop `out/..` first.
+        Under bash 5.2.37 and zsh 5.9, `cat <scratch>/out/../secret` printed a file beside
+        `out`'s target. The control goes through `in`, whose `..` is the scratchpad either way."""
+        with self._scratch() as scratch:
+            for refused, approved in (
+                (f"cat {scratch}/out/../outside/f", f"cat {scratch}/in/../inner/f"),
+                (f"grep -rn x {scratch}/out/..", f"grep -rn x {scratch}/in/.."),
+                (f"wc -l < {scratch}/out/../outside/f", f"wc -l < {scratch}/in/../inner/f"),
+                (
+                    f"git diff --no-index {scratch}/out/../outside/f AGENTS.md",
+                    f"git diff --no-index {scratch}/in/../inner/f AGENTS.md",
+                ),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_refused(refused, "leads outside the scratch directory")
+                    self.assert_allowed(approved, "stays inside it")
+
+    def test_a_scratch_directory_named_through_a_link(self):
+        """The scratch directory is resolved as well as the path, so naming it through a link
+        changes no verdict."""
+        with self._scratch(through_a_link=True) as scratch:
+            for spelling in self.READS_AND_WRITES:
+                with self.subTest(spelling=spelling):
+                    self.assert_refused(spelling.format(f"{scratch}/out"), "leads outside it")
+                    self.assert_allowed(spelling.format(f"{scratch}/in"), "leads inside it")
+                    self.assert_allowed(spelling.format(f"{scratch}/inner"), "a plain path")
 
 
 @approvals_budgeted
