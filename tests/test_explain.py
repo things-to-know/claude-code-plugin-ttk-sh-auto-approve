@@ -2,7 +2,6 @@
 
 import itertools
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -22,10 +21,6 @@ CALL_NUMBERS = itertools.count()
 SCRATCH = "/tmp/claude-1000/-home-user-project/00000000-0000-4000-8000-000000000000/scratchpad"
 OTHER_SCRATCH = SCRATCH.replace("-000000000000/", "-000000000001/")
 
-# Without the variable that names the scratchpad exactly, so that the hook takes it from
-# `--scratchpad-dir` whatever the environment the tests run in sets
-ENV = {name: value for name, value in os.environ.items() if name != "SH_AUTO_APPROVE_SCRATCH"}
-
 
 def explain(*args: str, stdin: str = "") -> list[list[str]]:
     """Each output line, split into decision, reason and command."""
@@ -36,7 +31,6 @@ def explain(*args: str, stdin: str = "") -> list[list[str]]:
         text=True,
         timeout=60,
         check=True,
-        env=ENV,
     )
     return [line.split("\t") for line in result.stdout.splitlines()]
 
@@ -49,7 +43,6 @@ def explain_fails(*args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=60,
         check=False,
-        env=ENV,
     )
 
 

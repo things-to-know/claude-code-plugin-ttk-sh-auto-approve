@@ -256,8 +256,8 @@ INTERPRETS_ESCAPES = ("echo", "printf")
 # the hook payload as `scratchpad_dir`, from Claude Code 2.1.257 on. Writes that land inside it
 # are contained: the directory sits under the system temp directory, outside the project, and
 # is this session's alone, so no other session's scratchpad is in reach. Its files last as long
-# as the session's transcript. `SH_AUTO_APPROVE_SCRATCH` replaces it with an exact directory.
-SCRATCH_ENV = "SH_AUTO_APPROVE_SCRATCH"
+# as the session's transcript. No setting names one instead: a directory named for every session
+# would be one they all share, where one session could rewrite a script another is about to run.
 
 # One path component that is not `..`, spelled only in characters the shell passes through
 # untouched. Without the lookahead the trailing `(?:/COMPONENT)+` happily matches
@@ -3545,18 +3545,14 @@ def _file_operands(program: str, args: list[str]) -> list[tuple[int, int]]:
 def _scratch_directory() -> str | None:
     """This session's scratch directory, as a pattern; `None` when there is none.
 
-    `SH_AUTO_APPROVE_SCRATCH` names it, or else the payload's `scratchpad_dir`, exactly: another
-    session's scratchpad is no more in reach than any other directory, since a session that
-    could write into one could rewrite a script that session is about to run. Without a
-    `scratchpad_dir`, or with one `SCRATCH_DIRECTORY` does not match, there is none.
+    The payload's `scratchpad_dir`, exactly: another session's scratchpad is no more in reach
+    than any other directory, since a session that could write into one could rewrite a script
+    that session is about to run. Without a `scratchpad_dir`, or with one `SCRATCH_DIRECTORY`
+    does not match, there is none.
 
-    Built per call rather than at import, from the environment and `_SCRATCHPAD_DIR`, which
-    `main` sets per call. `re.compile` caches, so the patterns built from it cost nothing
-    after the first.
+    Built per call rather than at import, from `_SCRATCHPAD_DIR`, which `main` sets per call.
+    `re.compile` caches, so the patterns built from it cost nothing after the first.
     """
-    override = os.environ.get(SCRATCH_ENV, "").rstrip("/")
-    if override:
-        return re.escape(override)
     if _SCRATCHPAD_DIR is None:
         return None
     directory = _SCRATCHPAD_DIR.rstrip("/")

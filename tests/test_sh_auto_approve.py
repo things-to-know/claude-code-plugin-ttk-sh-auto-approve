@@ -594,23 +594,6 @@ def representative_rules():
     return operator_rules(**REPRESENTATIVE_RULES)
 
 
-@contextlib.contextmanager
-def scratch_at(directory: str | None):
-    """Point the scratch rule at an exact directory, or back at the default shape."""
-    previous = os.environ.get(hook.SCRATCH_ENV)
-    if directory is None:
-        os.environ.pop(hook.SCRATCH_ENV, None)
-    else:
-        os.environ[hook.SCRATCH_ENV] = directory
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(hook.SCRATCH_ENV, None)
-        else:
-            os.environ[hook.SCRATCH_ENV] = previous
-
-
 def git_directory_at(path: Path, config: str | None = None) -> Path:
     """Make `path` a directory git takes for a git directory: a `HEAD`, `objects` and `refs`,
     and the config `config` when one is given. Built from files alone, with no `git` run."""
@@ -1955,15 +1938,13 @@ class ObservedCommandsStayApproved(Verdicts, unittest.TestCase):
         """A `>` was refused wherever it pointed. The scratch directory is this session's
         alone, outside the project, and where Claude Code tells the model to put working
         files, so a write landing inside it is contained."""
-        with scratch_at(None):
-            self.assert_allowed(
-                f"awk 'NR>=740 && NR<=903' \"{LOG}\" | sort -u > {SCRATCH}/core-expected.txt"
-            )
+        self.assert_allowed(
+            f"awk 'NR>=740 && NR<=903' \"{LOG}\" | sort -u > {SCRATCH}/core-expected.txt"
+        )
 
     def test_reading_a_file_through_an_input_redirect(self):
         """`wc -l < file` is a read spelled with punctuation, and was refused as one."""
-        with scratch_at(None):
-            self.assert_allowed(f"wc -l < {SCRATCH}/core-expected.txt")
+        self.assert_allowed(f"wc -l < {SCRATCH}/core-expected.txt")
         self.assert_allowed("wc -l < AGENTS.md")
 
     def test_the_repository_scripts_through_the_operator_rules(self):
@@ -2261,11 +2242,10 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
 
     def test_a_write_outside_the_scratch_directory(self):
         """The rule is the path, not the punctuation."""
-        with scratch_at(None):
-            self.assert_refused("wc -l AGENTS.md > PWNED")
-            self.assert_refused("wc -l AGENTS.md > /tmp/out.txt")
-            self.assert_refused(f"wc -l AGENTS.md > {SCRATCH}/../../escape.txt")
-            self.assert_refused("wc -l AGENTS.md > /tmp/claude-1000/x/y/scratchpad/out")
+        self.assert_refused("wc -l AGENTS.md > PWNED")
+        self.assert_refused("wc -l AGENTS.md > /tmp/out.txt")
+        self.assert_refused(f"wc -l AGENTS.md > {SCRATCH}/../../escape.txt")
+        self.assert_refused("wc -l AGENTS.md > /tmp/claude-1000/x/y/scratchpad/out")
 
     def test_another_scratch_directory(self):
         """The scratchpad is the payload's `scratchpad_dir`, exactly: in another session's
@@ -2278,28 +2258,26 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
             "another uid": SCRATCH.replace("/claude-1000/", "/claude-1001/"),
             "another project": SCRATCH.replace("-home-dir1-dir2", "-home-dir1-dir3"),
         }
-        with scratch_at(None):
-            for command in (
-                "echo 'import os' > {}/harness.py",
-                "wc -l AGENTS.md >> {}/out.txt",
-                "cat {}/notes.txt",
-                "wc -l < {}/notes.txt",
-                "grep -rn token {}",
-            ):
-                self.assert_allowed(command.format(SCRATCH), "it is this session's")
-                for case, other in others.items():
-                    with self.subTest(command=command, case=case):
-                        self.assert_refused(command.format(other), "it is not this session's")
+        for command in (
+            "echo 'import os' > {}/harness.py",
+            "wc -l AGENTS.md >> {}/out.txt",
+            "cat {}/notes.txt",
+            "wc -l < {}/notes.txt",
+            "grep -rn token {}",
+        ):
+            self.assert_allowed(command.format(SCRATCH), "it is this session's")
+            for case, other in others.items():
+                with self.subTest(command=command, case=case):
+                    self.assert_refused(command.format(other), "it is not this session's")
 
     def test_no_scratch_directory_without_scratchpad_dir(self):
         """A payload without a `scratchpad_dir` names no scratchpad, so none is in reach, as in
         a session that has none. The control: the same commands, with this session's."""
-        with scratch_at(None):
-            for command in (f"wc -l AGENTS.md > {SCRATCH}/out.txt", f"cat {SCRATCH}/notes.txt"):
-                with self.subTest(command=command):
-                    self.assert_allowed(command, "it is this session's scratchpad")
-                    with with_scratchpad_dir(None):
-                        self.assert_refused(command, "the payload names no scratchpad")
+        for command in (f"wc -l AGENTS.md > {SCRATCH}/out.txt", f"cat {SCRATCH}/notes.txt"):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "it is this session's scratchpad")
+                with with_scratchpad_dir(None):
+                    self.assert_refused(command, "the payload names no scratchpad")
 
     def test_a_scratchpad_dir_the_shell_reads_as_another_path(self):
         """The directory is matched as text, so it has to be text the shell reads as that
@@ -2308,43 +2286,28 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
         stands, `..` leaves the scratchpad, the space and the newline end the redirection
         target early, and the shell fills in `$x`. The control is the same write with this
         session's `scratchpad_dir`."""
-        with scratch_at(None):
-            for directory in (
-                "",
-                "/",
-                "relative/scratchpad",
-                f"{SCRATCH}/../..",
-                "/tmp/a b/scratchpad",
-                "/tmp/a\nb/scratchpad",
-                "/tmp/$x/scratchpad",
-            ):
-                command = f"wc -l AGENTS.md > {directory.rstrip('/')}/out.txt"
-                with self.subTest(directory=directory):
-                    self.assert_allowed(f"wc -l AGENTS.md > {SCRATCH}/out.txt", "this session's")
-                    with with_scratchpad_dir(directory):
-                        self.assert_refused(command, "the shell reads another path")
-
-    def test_an_exact_scratch_directory_replaces_scratchpad_dir(self):
-        """`SH_AUTO_APPROVE_SCRATCH` names the scratch directory exactly, whatever the payload's
-        `scratchpad_dir`: the field then plays no part, and the scratchpad it names is out of
-        reach."""
-        exact = "/tmp/sh-auto-approve-scratch"
-        with scratch_at(exact):
-            for directory in (SCRATCH, None):
-                with self.subTest(scratchpad_dir=directory), with_scratchpad_dir(directory):
-                    self.assert_allowed(f"wc -l AGENTS.md > {exact}/out.txt", "it is named")
-                    self.assert_allowed(f"cat {exact}/notes.txt", "it is named")
-                    self.assert_refused(f"wc -l AGENTS.md > {SCRATCH}/out.txt", "it is not")
-                    self.assert_refused(f"cat {SCRATCH}/notes.txt", "it is not")
+        for directory in (
+            "",
+            "/",
+            "relative/scratchpad",
+            f"{SCRATCH}/../..",
+            "/tmp/a b/scratchpad",
+            "/tmp/a\nb/scratchpad",
+            "/tmp/$x/scratchpad",
+        ):
+            command = f"wc -l AGENTS.md > {directory.rstrip('/')}/out.txt"
+            with self.subTest(directory=directory):
+                self.assert_allowed(f"wc -l AGENTS.md > {SCRATCH}/out.txt", "this session's")
+                with with_scratchpad_dir(directory):
+                    self.assert_refused(command, "the shell reads another path")
 
     def test_a_scratch_path_the_module_cannot_resolve(self):
         """The observed session builds the path into a variable and writes through it.
         `$S` is a word this module never read, so `> "$S/out"` is a write to an unknown
         path and stays refused -- the literal spelling is the one that passes."""
-        with scratch_at(None):
-            self.assert_refused(f'S={SCRATCH} && wc -l AGENTS.md > "$S/out.txt"')
-            self.assert_refused('wc -l AGENTS.md > "${SCRATCH}/out.txt"')
-            self.assert_refused(f"wc -l AGENTS.md > $(echo {SCRATCH})/out.txt")
+        self.assert_refused(f'S={SCRATCH} && wc -l AGENTS.md > "$S/out.txt"')
+        self.assert_refused('wc -l AGENTS.md > "${SCRATCH}/out.txt"')
+        self.assert_refused(f"wc -l AGENTS.md > $(echo {SCRATCH})/out.txt")
 
     def test_an_input_redirect_cannot_open_a_socket(self):
         """Allowing `< file` is only safe because the shell's own network pseudo-device is
@@ -2387,30 +2350,28 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
     def test_a_scratch_path_spelled_so_the_shell_decides_it(self):
         """Every component has to be literal text: a quoted `..` is a placeholder by the
         time the pattern sees it, `$d` is filled in later, and `..*` is globbed."""
-        with scratch_at(None):
-            self.assert_refused(f'wc -l AGENTS.md > {SCRATCH}/"../../../escape.txt"')
-            self.assert_refused(f"wc -l AGENTS.md > {SCRATCH}/$d")
-            self.assert_refused(f"wc -l AGENTS.md > {SCRATCH}/..*")
-            self.assert_refused(f"wc -l AGENTS.md > {SCRATCH}/./../escape.txt")
-            self.assert_refused(
-                "wc -l AGENTS.md > /tmp/claude-1000/../"
-                "00000000-0000-4000-8000-000000000000/scratchpad/out"
-            )
+        self.assert_refused(f'wc -l AGENTS.md > {SCRATCH}/"../../../escape.txt"')
+        self.assert_refused(f"wc -l AGENTS.md > {SCRATCH}/$d")
+        self.assert_refused(f"wc -l AGENTS.md > {SCRATCH}/..*")
+        self.assert_refused(f"wc -l AGENTS.md > {SCRATCH}/./../escape.txt")
+        self.assert_refused(
+            "wc -l AGENTS.md > /tmp/claude-1000/../"
+            "00000000-0000-4000-8000-000000000000/scratchpad/out"
+        )
 
     def test_the_redirection_spellings_that_stay_refused(self):
         """Nothing here is a read or a contained write, and the scratch rule must not have
         widened the lexer's idea of what a redirection is."""
-        with scratch_at(None):
-            for command in (
-                f"wc -l AGENTS.md >| {SCRATCH}/out.txt",
-                f"cat <> {SCRATCH}/out.txt",
-                f"exec 3> {SCRATCH}/out.txt",
-                f"cat 2< {SCRATCH}/out.txt",
-                "cat <<EOF",
-                "cat <<< hi",
-            ):
-                with self.subTest(command=command):
-                    self.assert_refused(command)
+        for command in (
+            f"wc -l AGENTS.md >| {SCRATCH}/out.txt",
+            f"cat <> {SCRATCH}/out.txt",
+            f"exec 3> {SCRATCH}/out.txt",
+            f"cat 2< {SCRATCH}/out.txt",
+            "cat <<EOF",
+            "cat <<< hi",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command)
 
 
 # ======================================================================================
@@ -6092,11 +6053,14 @@ class HookProtocol(HookProcess, unittest.TestCase):
     def test_the_scratch_directory_is_the_payloads_scratchpad_dir(self):
         """`main` reads the scratchpad from the payload's `scratchpad_dir`: a write into it is
         approved, and the same write is not when the field names another session's, or is
-        missing or not a string, though the payload's `session_id` is the one in the path."""
-        env = {name: value for name, value in os.environ.items() if name != hook.SCRATCH_ENV}
-        command = f"wc -l AGENTS.md > {SCRATCH}/out.txt"
+        missing or not a string, though the payload's `session_id` is the one in the path.
 
-        def payload(**scratchpad) -> dict:
+        Nothing else names a scratchpad. `SH_AUTO_APPROVE_SCRATCH`, which named one directory
+        for every session, is set for every case here and names none."""
+        shared = "/tmp/sh-auto-approve-shared-scratch"
+        env = dict(os.environ, SH_AUTO_APPROVE_SCRATCH=shared)
+
+        def payload(command: str = f"wc -l AGENTS.md > {SCRATCH}/out.txt", **scratchpad) -> dict:
             return {
                 "session_id": SESSION_ID,
                 "cwd": str(hook.REPO_ROOT),
@@ -6107,13 +6071,16 @@ class HookProtocol(HookProcess, unittest.TestCase):
 
         allowed = self.allow_payload(payload(scratchpad_dir=SCRATCH), env=env)
         self.assertEqual(ALLOW_PAYLOAD, allowed)
-        for case, scratchpad in {
-            "another session's": {"scratchpad_dir": OTHER_SCRATCH},
-            "no scratchpad_dir": {},
-            "a scratchpad_dir that is not a string": {"scratchpad_dir": 0},
+        for case, request in {
+            "another session's": payload(scratchpad_dir=OTHER_SCRATCH),
+            "no scratchpad_dir": payload(),
+            "a scratchpad_dir that is not a string": payload(scratchpad_dir=0),
+            "the directory SH_AUTO_APPROVE_SCRATCH names": payload(
+                f"wc -l AGENTS.md > {shared}/harness.py", scratchpad_dir=SCRATCH
+            ),
         }.items():
             with self.subTest(case):
-                self.assertEqual("", self.run_payload(payload(**scratchpad), env=env))
+                self.assertEqual("", self.run_payload(request, env=env))
 
     def test_stays_silent_outside_the_supported_python_and_platforms(self):
         """In process, since no subprocess can be an older interpreter: the requirement is
