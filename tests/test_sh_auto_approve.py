@@ -3695,6 +3695,21 @@ class RefusesAllowlistedProgramsThatWrite(Verdicts, unittest.TestCase):
         self.assert_refused("echo x | uniq - /tmp/evil", "writes /tmp/evil from the pipe")
         self.assert_refused("printf 'x' | xxd -r - /tmp/evil", "writes /tmp/evil")
 
+    def test_a_wildcard_can_be_two_operands(self):
+        """One word to the operand count, and as many as it matches when the program runs.
+
+        Beside `AGENTS.md` and `README.md`, `uniq [AR]*.md` is `uniq AGENTS.md README.md`, which
+        overwrites `README.md`, and no file of a chosen name has to be there first (#43).
+        """
+        for program in ("uniq", "xxd"):
+            with self.subTest(program=program):
+                self.assert_allowed(f"{program} AGENTS.md", "the control: one operand")
+                self.assert_allowed(f"{program} '[AR]*.md'", "the control: quoted, one file")
+                self.assert_allowed(f"sort AGENTS.md | {program}", "the control: reads the pipe")
+                self.assert_refused_outright(f"{program} [AR]*.md", "overwrites README.md")
+                self.assert_refused_outright(f"{program} *", "overwrites the second of two")
+                self.assert_refused_outright(f"{program} -- AGENTS.m?", "after the terminator")
+
     def test_writing_flags_the_table_omits(self):
         """`WRITING_FLAGS` matches `flag`, `flag=`, and attached two-character shorts.
 

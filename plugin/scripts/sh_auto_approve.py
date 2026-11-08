@@ -2495,15 +2495,28 @@ def _check_sort(args: list[str], live_globs: list[bool]) -> None:
             raise NotReadOnly(f"sort output flag: {arg}")
 
 
-def _check_uniq(args: list[str]) -> None:
-    """Validate uniq: reject secondary output file operand."""
+def _check_uniq(args: list[str], live_globs: list[bool]) -> None:
+    """Validate uniq: reject secondary output file operand.
+
+    The operands are counted as typed, so an unquoted wildcard is refused too: it is one word
+    here and as many as it matches when uniq runs. `uniq [AR]*.md` beside `AGENTS.md` and
+    `README.md` is `uniq AGENTS.md README.md`, which overwrites `README.md`.
+    """
+    if any(live_globs):
+        raise NotReadOnly("unquoted glob operand in uniq")
     operands = [a for a in args if not a.startswith("-") or a == "-"]
     if len(operands) > 1:
         raise NotReadOnly("uniq with output file operand")
 
 
-def _check_xxd(args: list[str]) -> None:
-    """Validate xxd: disallow reverse/write mode and secondary output file operand."""
+def _check_xxd(args: list[str], live_globs: list[bool]) -> None:
+    """Validate xxd: disallow reverse/write mode and secondary output file operand.
+
+    An unquoted wildcard is refused for the reason `_check_uniq` gives: it can become two
+    operands, the second one written.
+    """
+    if any(live_globs):
+        raise NotReadOnly("unquoted glob operand in xxd")
     if any(a == "-r" or a.startswith("-r") or _bundled_short(a, "r") for a in args):
         raise NotReadOnly("xxd reverse mode")
     operands = [a for a in args if not a.startswith("-") or a == "-"]
@@ -2713,7 +2726,7 @@ MAX_WRAPPER_DEPTH = 4
 # Explicit dispatch table mapping programs to their dedicated validator functions
 # Validators that need to know which words carry a wildcard the shell will expand, and
 # so take the parallel `live_globs` list as a second argument.
-GLOB_AWARE = frozenset({"find", "sed", "sort"})
+GLOB_AWARE = frozenset({"find", "sed", "sort", "uniq", "xxd"})
 
 PROGRAM_VALIDATORS = {
     "aws": _check_aws,
