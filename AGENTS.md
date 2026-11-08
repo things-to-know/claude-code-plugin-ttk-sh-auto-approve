@@ -154,9 +154,11 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
         from each directory
       - A subagent's calls are in a transcript of its own, under `<session-id>/subagents/`
     - Chosen commands: `make explain PROJECT=<dir> CWD=<dir> < commands.txt`
-    - Add `SCRATCHPAD_DIR=<dir>`, the session's scratchpad, for a command that reaches it: the
-      hook reads it from its payload, no transcript entry records it, and without it the hook
-      approves no such command
+    - Add `SCRATCHPAD_DIR=<dir>`, the session's scratchpad, for a command that reaches it
+      - The hook reads it from its payload's `scratchpad_dir`
+      - No transcript entry records it, so it goes with `TRANSCRIPT` too
+      - Without it, the hook approves no command that reaches a scratchpad
+      - A value the hook takes no scratchpad from, such as a relative path, gets a warning
       - It is `<temp>/claude-<uid>/<project>/<session-id>/scratchpad`, with `<temp>` per platform
         as in the "Session scratchpad directory" section of Claude Code's docs
     - Add `HOOK=<path>` to ask the installed copy instead of the working copy

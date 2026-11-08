@@ -35,8 +35,8 @@ def explain(*args: str, stdin: str = "") -> list[list[str]]:
     return [line.split("\t") for line in result.stdout.splitlines()]
 
 
-def explain_fails(*args: str) -> subprocess.CompletedProcess[str]:
-    """The run itself, for a call that is meant to fail."""
+def run_explain(*args: str) -> subprocess.CompletedProcess[str]:
+    """The run itself, for its exit status and stderr."""
     return subprocess.run(
         [sys.executable, "-I", str(EXPLAIN), "--project", str(ROOT), "--no-rules", *args],
         capture_output=True,
@@ -181,6 +181,29 @@ class Explains(unittest.TestCase):
         self.assertEqual(own[0], "allow")
         for line in (other, none):
             self.assertEqual(line[:2], ["refused", "disallowed punctuation or redirection: >"])
+
+    def test_a_scratchpad_dir_the_hook_takes_none_from_is_warned_about(self):
+        """The hook takes no scratchpad from a `scratchpad_dir` that is relative, not normalized,
+        or spelled in a character the shell reads otherwise, so a typo in `--scratchpad-dir`
+        would read as the hook's own refusal. Each gets the verdict of a session without a
+        scratchpad, as a payload of that shape does, exit status 0, and a warning naming it.
+        The control, the session's own, gets no warning."""
+        control = run_explain("--scratchpad-dir", SCRATCH, f"wc -l AGENTS.md > {SCRATCH}/out.txt")
+        self.assertEqual((control.returncode, control.stderr), (0, ""))
+        self.assertTrue(control.stdout.startswith("allow\t"), control.stdout)
+        for directory in (
+            "scratchpad",
+            SCRATCH.replace("/scratchpad", "/x/../scratchpad"),
+            "/tmp/a b/scratchpad",
+        ):
+            with self.subTest(directory=directory):
+                result = run_explain(
+                    "--scratchpad-dir", directory, f"wc -l AGENTS.md > {directory}/out.txt"
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertTrue(result.stdout.startswith("refused\t"), result.stdout)
+                self.assertIn("warning: the hook takes no scratchpad from", result.stderr)
+                self.assertIn(repr(directory), result.stderr)
 
     def test_writes_no_bytecode_next_to_the_hook(self):
         """The hook it asks may be the installed copy, or the working copy, which a local
@@ -480,7 +503,7 @@ class ExplainsATranscript(unittest.TestCase):
             }.items():
                 with self.subTest(case):
                     path = write_transcript(directory, bash_call("ls"), bash_call("ls", cwd=cwd))
-                    failed = explain_fails("--transcript", path)
+                    failed = run_explain("--transcript", path)
                     self.assertEqual(failed.returncode, 2)
                     self.assertEqual(failed.stdout, "")
                     self.assertIn("line 2", error_line(failed))
@@ -491,7 +514,7 @@ class ExplainsATranscript(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="readonly_hook_transcript_") as directory:
             path = write_transcript(directory, bash_call("ls"))
             (control,) = explain("--transcript", path)
-            result = explain_fails("--transcript", path, "--cwd", directory)
+            result = run_explain("--transcript", path, "--cwd", directory)
         self.assertEqual(control[3], "ls")
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
@@ -501,7 +524,7 @@ class ExplainsATranscript(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="readonly_hook_transcript_") as directory:
             path = write_transcript(directory, bash_call("ls"))
             (control,) = explain("--transcript", path)
-            result = explain_fails("--transcript", path, "wc -l AGENTS.md")
+            result = run_explain("--transcript", path, "wc -l AGENTS.md")
         self.assertEqual(control[3], "ls")
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
@@ -520,7 +543,7 @@ class ExplainsATranscript(unittest.TestCase):
             }
             for case, path in unreadable.items():
                 with self.subTest(case):
-                    result = explain_fails("--transcript", str(path))
+                    result = run_explain("--transcript", str(path))
                     self.assertEqual(result.returncode, 2)
                     self.assertEqual(result.stdout, "")
                     self.assertIn(path.name, error_line(result))

@@ -23,7 +23,9 @@ A verdict depends on where the session stands, so the context is passed in, neve
   transcript entry. It defaults to ``--project``
 - ``--scratchpad-dir``: the session's scratchpad directory, the ``scratchpad_dir`` of the hook's
   payload. No transcript entry records it, so it goes with ``--transcript`` too. Without it, the
-  session has no scratchpad, and the hook approves no command that reaches one
+  session has no scratchpad, and the hook approves no command that reaches one. A value the hook
+  takes no scratchpad from, as it takes none from a payload's of that shape, gets the same
+  verdicts, and a warning on stderr
 - ``--settings``: the settings files to read the allow and deny rules and
   ``additionalDirectories`` from, instead of the project's own; ``--no-rules`` reads none
 - ``--hook``: the hook to ask, e.g. the installed copy under ``~/.claude/plugins/cache/``,
@@ -333,6 +335,17 @@ def main(argv: list[str] | None = None) -> int:
     hook._SESSION_CWD = cwd
     hook._SCRATCHPAD_DIR = args.scratchpad_dir
     hook.REPO_ROOT = root
+
+    # Otherwise a typo in the option reads as the hook's own refusal. Asked of the hook itself,
+    # which may be a copy that takes no `scratchpad_dir` at all.
+    scratch_directory = getattr(hook, "_scratch_directory", None)
+    if args.scratchpad_dir is not None and scratch_directory and scratch_directory() is None:
+        print(
+            f"{parser.prog}: warning: the hook takes no scratchpad from --scratchpad-dir "
+            f"{args.scratchpad_dir!r}, only from an absolute, normalized path the shell reads "
+            "as it is: the verdicts are a session's without one",
+            file=sys.stderr,
+        )
 
     if args.transcript is not None:
         try:
