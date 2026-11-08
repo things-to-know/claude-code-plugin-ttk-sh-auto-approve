@@ -1172,7 +1172,11 @@ def _literal_assignments(
             expanded_value = _expand(value_token, parts)
             if (
                 _carries_substitution(value_token, parts)
-                or _carries_live_glob(value_token)
+                # The value as expanded, not the token: bash globs the words of an unquoted
+                # `$q` where it is used, however the assignment quoted them, so `q='*'; find .
+                # $q` hands find every name in the directory. zsh does not, but `${=q}` and
+                # `$q` are read the same here.
+                or _has_wildcard(expanded_value)
                 or _carries_brace_expansion(value_token)
                 or _has_bare_variable(value_token, parts)
                 # Defense in depth: word-splitting does not re-run the parser, so a `;` in
@@ -1321,6 +1325,11 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
         ):
             return None
         return [f"{directory}/{PATH_COMPONENT}" if directory else PATH_COMPONENT]
+    # Quoted, the word is a literal here, but bash globs it again where an unquoted `$f` uses
+    # it: `for f in '.?'; do grep -r x $f; done` reads `..` in a bash older than 5.2. Placed as
+    # the literal it spells, such a value would be measured below the directory it climbs from.
+    if _has_wildcard(expanded) and _glob_may_climb(expanded):
+        return None
     return [expanded]
 
 

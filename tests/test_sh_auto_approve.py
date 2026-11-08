@@ -2166,6 +2166,17 @@ class SplicesFlagsFromALiteralAssignment(Verdicts, unittest.TestCase):
             "the value carries a second, unread variable",
         )
 
+    def test_a_value_bash_globs_where_it_is_used(self):
+        """Bash globs the words of an unquoted `$q` at the use site, however the assignment
+        quoted them: with a file named `-delete` in the directory, `q='*'; find . $q` is
+        `find . -delete`."""
+        self.assert_allowed("q=x; find . $q", "the control: a literal word")
+        for value in ("'*'", "\\*", '"?delete"', "'[-]delete'"):
+            with self.subTest(value=value):
+                self.assert_refused(f"q={value}; find . $q", "globbed at the use site")
+        self.assert_allowed("_o='-r'; sort ${=_o} AGENTS.md", "the control: a literal flag")
+        self.assert_refused("_o='[-]o'; sort ${=_o} AGENTS.md", "`-o`, given a file of that name")
+
     def test_a_value_with_a_shell_metacharacter_is_not_resolved(self):
         """Word-splitting leaves these inert, so bash would not run the `rm` -- but a value
         shaped like a command is refused rather than spliced."""
@@ -3253,6 +3264,9 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         up = "/".join([".."] * 12)
         self.assert_allowed("cat docs/*/a.md", "the control: the glob stays below docs")
         self.assert_allowed('for f in docs/*/a.md; do cat "$f"; done', "the control, in a loop")
+        self.assert_allowed(
+            "for f in 'docs/*/a.md'; do cat $f; done", "the control: quoted, globbed at $f"
+        )
         self.assert_allowed("cat .env*", "the control: a dot-name that can't be `..`")
         for command in (
             f"cat */{up}/etc/os-release",
@@ -3262,6 +3276,11 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             "cat .[!a]",
             "grep -r x .[[:punct:]]",
             f'for f in */{up}/etc/os-release; do cat "$f"; done',
+            # Quoted in the list, and globbed where the unquoted `$f` uses it
+            "for f in '" + "/".join([".?"] * 12) + "/etc/os-release'; do cat $f; done",
+            "for f in '.?'; do grep -r x $f; done",
+            "for f in '.*'; do grep -r x $f; done",
+            "for f in '*/..'; do grep -r x $f; done",
         ):
             with self.subTest(command=command):
                 self.assert_refused(command)
