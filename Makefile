@@ -186,14 +186,17 @@ test-coverage: ## Run the tests under coverage, and list each hook's lines and b
 # `test` once per version, on the interpreter uv finds for it, which uv installs first if missing
 # - The loop runs the tests itself rather than through `${MAKE} test`: make runs a recipe line
 #   that names `MAKE` even under `-n`, so `make -n` would have run the whole loop, installs included
+# - It prints each command before running it, as the shell split it: `argv` holds the words, so
+#   `TEST_ARGS` is expanded once, and `%q` quotes each word back
 # - `-B`: as for `test`
 .PHONY: test-all-python-matrix
 test-all-python-matrix: ## Run the tests on each Python version in CI's matrix, from uv
 	@for version in ${TEST_PYTHON_VERSIONS}; do \
 		${UV} python install --quiet "$${version}"; \
 		python="$$(${UV} python find "$${version}")"; \
-		echo "$${python} -B ${UNITTEST}"; \
-		"$${python}" -B ${UNITTEST}; \
+		argv=("$${python}" -B ${UNITTEST}); \
+		printf '%q' "$${argv[0]}"; printf ' %q' "$${argv[@]:1}"; echo; \
+		"$${argv[@]}"; \
 	done
 
 # Coverage writes `.coverage`, a `.coverage.*` file per process until `combine` merges them, and
