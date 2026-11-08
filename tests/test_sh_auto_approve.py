@@ -78,6 +78,7 @@ from a command that prompted in a real session.
           RefusesVendorFlagsAndSubcommands, ApprovesOrdinaryOptionForms,
           RefusesGitConfigDrivenExecution, RefusesGitSubcommandsOutsideTheReadSet,
           RefusesUnlistedGitGlobalOptions, GitGlobalOptionsUnderOperatorRules,
+          RefusesAGitStashThatPushes,
           RefusesAwsCallsThatWriteOrExecute, RefusesAwsCallsThatPrintASecret,
           ApprovesGcloudHelpForABlockedVerb, RefusesGcloudCallsThatWriteLocallyOrExecute,
           RefusesGhApiCallsThatWriteOrLeak, ApprovesReadOnlyGhSubcommands,
@@ -124,9 +125,10 @@ Five properties this file holds to
    `TMPDIR` are redirected into it, and the payloads are limited to `touch PWNED`, a
    write to `PWNED`, an edit or deletion of the scratch tree's own `AGENTS.md`, and a
    planted executable inside the same tree. The `git` corpus alone adds a `clean`, a
-   `branch -D` and a `push`, run only in the repository and its bare `origin` that
-   `RefusesUnlistedGitGlobalOptions._repository` builds inside the tree: run from a real
-   checkout, the `push` would reach that checkout's remote. `CorpusIsSafeToExecute`
+   `branch -D`, a `push` and a `stash`, run only in the repositories, and a bare `origin`,
+   that `RefusesUnlistedGitGlobalOptions._repository` and `RefusesAGitStashThatPushes._repository`
+   build inside the tree: run from a real checkout, the `push` would reach that checkout's
+   remote, and the `stash` would take its uncommitted work. `CorpusIsSafeToExecute`
    enforces the confinement mechanically -- read it before adding a case, and do not add
    one it rejects.
 
@@ -1183,6 +1185,7 @@ class CorpusIsSafeToExecute(unittest.TestCase):
         # reach a real remote, which no rule of `is_corpus_safe` stops
         yield from ((c, "git") for c, _, _ in RefusesUnlistedGitGlobalOptions.EXECUTED)
         yield from ((c, "git") for c, _ in RefusesUnlistedGitGlobalOptions.APPROVED_AND_EXECUTED)
+        yield from ((c, "git") for c in RefusesAGitStashThatPushes.EXECUTED)
 
     def test_no_command_reaches_outside_the_scratch_tree(self):
         for command, origin in self.all_corpora():
@@ -5159,6 +5162,89 @@ class GitGlobalOptionsUnderOperatorRules(Verdicts, unittest.TestCase):
                 with self.subTest(command=command):
                     self.assert_refused_outright(command, "the option may be git's own")
             self.assert_allowed("git --frobnicate log -1", "the control: nothing refused after it")
+
+
+class RefusesAGitStashThatPushes(Verdicts, unittest.TestCase):
+    """git takes the first word after `stash` alone as its subcommand. Any other word there, an
+    option included, runs `git stash push` with every word, and `-m` and `--message` take the
+    next word as their value (`cmd_stash` and `push_stash` in `builtin/stash.c`, git 2.48.1).
+
+    The hook read the first word not starting with `-` as the subcommand instead, so it approved
+    `git stash -m list` as `git stash list`, and git stashed every change to a tracked file, with
+    `list` as the message. Now `list` or `show` must come right after `stash`; the options after
+    them go to `git log` and `git diff`, where the scan at the top of `_check_git` reads them.
+
+    Each refusal sits beside a control approved under the same setup.
+    `test_git_stashes_the_working_tree` runs the refusals with the installed git, in a repository
+    of their own, so that each stands for a real stash.
+    """
+
+    # For `test_git_stashes_the_working_tree`. Left out: `-p show`, which asks before each hunk,
+    # and `-q list`, which git refuses: `'push' can't be assumed due to unexpected token`
+    EXECUTED = (
+        "git stash -m list",
+        "git stash --message list",
+        "git stash -um show",
+        "git stash -- list",
+    )
+
+    assert_refused_outright = RefusesUnlistedGitGlobalOptions.assert_refused_outright
+    _git_env = staticmethod(RefusesUnlistedGitGlobalOptions._git_env)
+    _run = RefusesUnlistedGitGlobalOptions._run
+
+    def test_a_word_before_the_subcommand(self):
+        for refused, control in (
+            ("git stash -m list", "git stash list"),
+            ("git stash --message list", "git stash list --oneline"),
+            ("git stash -um show", "git stash show"),
+            ("git stash -- list", "git stash list -n 1"),
+            ("git stash -p show", "git stash show -p"),
+            ("git stash -q list", "git stash show --stat"),
+        ):
+            with self.subTest(refused=refused):
+                self.assert_refused_outright(refused, "runs git stash push")
+                self.assert_allowed(control, "lists the stashes, or shows one")
+
+    @contextlib.contextmanager
+    def _repository(self):
+        """A scratch tree holding a repository, `work`, whose tracked files `list` and
+        `tracked.txt` each carry an edit, beside an untracked file."""
+        with scratch_tree() as root:
+            env = self._git_env(root)
+            work = Path(root, "work")
+            work.mkdir()
+            for name in ("list", "tracked.txt"):
+                (work / name).write_text("committed\n")
+            for argv in (
+                [GIT, "init", "-q", str(work)],
+                [GIT, "-C", str(work), "add", "."],
+                [GIT, "-C", str(work), "commit", "-q", "-m", "init"],
+            ):
+                subprocess.run(argv, env=env, capture_output=True, check=True, timeout=10)
+            for name in ("list", "tracked.txt"):
+                (work / name).write_text("committed\nedited\n")
+            (work / "untracked.txt").write_text("x\n")
+            yield root
+
+    def _stashes(self, root: str) -> int:
+        """How many stash entries the repository holds, read with `git` itself."""
+        argv = [GIT, "-C", str(Path(root, "work")), "stash", "list"]
+        result = subprocess.run(
+            argv, env=self._git_env(root), capture_output=True, text=True, check=True, timeout=10
+        )
+        return len(result.stdout.splitlines())
+
+    @needs_bash
+    @needs_git
+    def test_git_stashes_the_working_tree(self):
+        for command in self.EXECUTED:
+            with self.subTest(command=command):
+                self.assert_refused(command, "stashes the working tree")
+                with self._repository() as root:
+                    before = self._stashes(root)
+                    result = self._run(root, command)
+                    after = self._stashes(root)
+                self.assertEqual(before + 1, after, f"git stashed nothing:\n{result.stderr}")
 
 
 @approvals_budgeted

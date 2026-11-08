@@ -1974,10 +1974,13 @@ def _check_git(args: list[str]) -> None:
     subcommand = "version" if args[index] in GIT_VERSION_FLAGS else args[index]
     sub_args = args[index + 1 :]
 
+    # git takes the first word after `stash` alone as its subcommand. Any other word there, an
+    # option included, runs `git stash push` with every word: `git stash -m list` stashes the
+    # working tree, with `list` as its message. The options after `list` and `show` go to
+    # `git log` and `git diff`, and the scan above reads them.
     if subcommand == "stash":
-        operands = [a for a in sub_args if not a.startswith("-")]
-        if not operands or operands[0] not in {"list", "show"}:
-            raise NotReadOnly("git stash modification")
+        if sub_args[:1] not in (["list"], ["show"]):
+            raise NotReadOnly("git stash other than list or show")
         return
 
     if subcommand == "tag":
