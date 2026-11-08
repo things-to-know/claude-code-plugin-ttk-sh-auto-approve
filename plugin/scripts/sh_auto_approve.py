@@ -1949,7 +1949,10 @@ def _check_awk(args: list[str]) -> None:
 def _check_git(args: list[str]) -> None:
     """Validate ``git`` subcommands, ensuring read-only behavior and safe options.
 
-    A wildcard the shell expands is refused before this runs, in `_check_command`.
+    A wildcard the shell expands is refused before this runs, in `_check_command`. A quoted one
+    is git's own pattern, a pathspec or a ref or grep pattern, which every subcommand read here
+    only matches: `git ls-files '*.py'` lists, and a pathspec above the repository is an error
+    git raises itself.
     """
     # Flags that write a file or run a program, wherever they are: after the subcommand they are
     # its own (`git diff --output=x`), and before it `--exec-path=<dir>` is git's. The global
@@ -1965,10 +1968,6 @@ def _check_git(args: list[str]) -> None:
     index, _ = _git_global_options(args)
     subcommand = "version" if args[index] in GIT_VERSION_FLAGS else args[index]
     sub_args = args[index + 1 :]
-
-    # Check for glob expansion in git arguments
-    if any("*" in a or "?" in a for a in sub_args):
-        raise NotReadOnly("git with glob operand")
 
     if subcommand == "stash":
         operands = [a for a in sub_args if not a.startswith("-")]

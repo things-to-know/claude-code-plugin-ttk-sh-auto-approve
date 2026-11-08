@@ -68,6 +68,13 @@ insists on its own filename, symlink to this file rather than copying it.
   - For a path-based widening, the refusals include a recursive read, such as `grep -r`, of the
     directory holding each credential store: Layer B refuses a word that names a store, not one
     that names its parent
+  - One exception, git's quoted pathspecs, until #48 gives them refusals:
+    - A quoted `'../*'` reaches no further than a literal `..`, which the hook approves too, as it
+      measures none of git's paths
+    - git stops both above the repository's root, which is wider than the project when the
+      project sits inside a larger repository
+    - `test_git_refuses_a_pathspec_above_its_repository` pins git's stop, for a repository whose
+      root is the project
 - **Stdlib only, isolated interpreter.** `-I` ignores `PYTHONPATH` and user
   site-packages, and keeps the script's own directory off `sys.path`. If the
   hook is split into modules, add its directory explicitly:

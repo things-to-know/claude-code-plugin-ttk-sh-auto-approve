@@ -2435,11 +2435,11 @@ class SplicesFlagsFromALiteralAssignment(Verdicts, unittest.TestCase):
 
 
 class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
-    """Where each of the four new capabilities stops.
+    """Where each widening stops.
 
-    Every case here is the paired refusal for an approval in the class above. A widening
-    with no edge recorded is the shape of `A-05`: a program admitted for what it usually
-    does, with the flag that makes it do something else never written down.
+    Every case here is the paired refusal for an approval, in the class above or beside it in
+    the same test. A widening with no edge recorded is the shape of `A-05`: a program admitted
+    for what it usually does, with the flag that makes it do something else never written down.
     """
 
     def test_jq_cannot_take_its_program_from_a_file(self):
@@ -2489,6 +2489,71 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
         self.assert_refused("sed -n '1p' *.md")
         self.assert_allowed("sed -n '1p' '[ab].md'", "the control: quoted, one file")
         self.assert_refused("sed -n '1p' [ab].md", "a bracket expression is a wildcard too")
+
+    def test_a_quoted_wildcard_is_gits_own_pattern(self):
+        """Quoted, the wildcard reaches git, which matches it against the index, the refs or
+        the lines it searches, and only lists; a pathspec above the repository is an error git
+        raises itself. Unquoted, it is whatever the directory held. A subcommand that writes
+        stays refused whatever pattern it is given."""
+        for allowed, refused in (
+            ("git ls-files '*.py'", "git ls-files *.py"),
+            ("git log -- '[ab].md'", "git log -- [ab].md"),
+            ("git grep -n 'a.*b'", "git grep -n a.*b"),
+            ("git grep -n 'a?b'", "git grep -n a?b"),
+            ("git branch --list 'feat/*'", "git branch --list feat/*"),
+        ):
+            with self.subTest(command=allowed):
+                self.assert_allowed(allowed, "git matches the pattern itself")
+                self.assert_refused(refused, "the shell matched it first")
+        self.assert_refused("git branch 'x*'", "a name outside list mode creates a branch")
+        self.assert_refused("git tag 'v*'", "an operand creates a tag")
+        self.assert_refused("git stash drop '*'", "drops a stash")
+
+    @unittest.skipUnless(GIT, "needs git on PATH")
+    def test_git_refuses_a_pathspec_above_its_repository(self):
+        """Where the widening above stops, for now, is git's: the hook approves `git grep -e one
+        -- '../*'`, as it approves a literal `..`, and git refuses both above the repository's
+        root. Run here, so that a git that stopped refusing fails this test.
+
+        The repository's root is the project here. In a project inside a larger repository, git
+        reads the rest of it, which #48 is for, and whose refusals will replace this test."""
+        with scratch_tree() as root:
+            # `LC_ALL=C`: git translates its "outside repository" message
+            env = sandbox_env(root) | {"GIT_CONFIG_NOSYSTEM": "1", "LC_ALL": "C"}
+            env |= {
+                f"GIT_{role}_{field}": value
+                for role in ("AUTHOR", "COMMITTER")
+                for field, value in (("NAME", "t"), ("EMAIL", "t@example.com"))
+            }
+            work = Path(root, "work")
+            for argv in (
+                [GIT, "init", "-q", str(work)],
+                [GIT, "-C", str(work), "commit", "-q", "--allow-empty", "-m", "init"],
+            ):
+                subprocess.run(argv, env=env, capture_output=True, check=True, timeout=10)
+            for command, argv in (
+                ("git grep -e one -- '../*'", ["grep", "-e", "one", "--", "../*"]),
+                ("git log --oneline -- '../*'", ["log", "--oneline", "--", "../*"]),
+                ("git ls-files -- '../*'", ["ls-files", "--", "../*"]),
+                (
+                    "git grep --no-index -e one -- '../*'",
+                    ["grep", "--no-index", "-e", "one", "--", "../*"],
+                ),
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "a quoted pathspec is git's to match")
+                    run = subprocess.run(
+                        [GIT, *argv],
+                        cwd=work,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=10,
+                    )
+                    self.assertNotIn("one", run.stdout, "git read AGENTS.md, above the repository")
+                    self.assertNotEqual(0, run.returncode, run.stderr)
+                    self.assertIn("outside", run.stderr)
 
     def test_the_output_form_of_process_substitution(self):
         """`<(...)` runs a command. `>(...)` runs one and hands it a stream to write."""
