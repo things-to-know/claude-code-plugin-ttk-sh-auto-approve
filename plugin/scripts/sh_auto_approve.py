@@ -676,8 +676,9 @@ GIT_VALUE_GLOBAL_OPTS = ("--attr-source", "--shallow-file", "--super-prefix")
 #   `git clean -fdx`. `GIT_VALUE_GLOBAL_OPTS` lists the ones known, and git can add another
 # - Left out:
 #   - `--bare`, which makes the current directory the repository: `--git-dir=.`
-#   - `--help`, `-h`, `--version` and `-v`, which end the options, and git runs `help` or
-#     `version` in their place: `git --help log` is `git help log`, which starts a man viewer
+#   - `--help` and `-h`, which end the options, and git runs `help` in their place:
+#     `git --help log` is `git help log`, which starts a man viewer
+#   - `--version` and `-v`, which end the options too: see `GIT_VERSION_FLAGS`
 GIT_GLOBAL_FLAGS = frozenset(
     {"-p", "--paginate", "-P", "--no-pager"}
     | {"--no-replace-objects", "--no-lazy-fetch", "--no-optional-locks", "--no-advice"}
@@ -685,11 +686,15 @@ GIT_GLOBAL_FLAGS = frozenset(
     | {"--noglob-pathspecs", "--icase-pathspecs"}
 )
 
+# Global options that end git's options, where git runs `git version` in their place and hands
+# it the words after them: `git --version clean -fdx` fails with `unknown switch 'f'`
+GIT_VERSION_FLAGS = frozenset({"--version", "-v"})
+
 # Exact options that are also a prefix of one in `GIT_EXECUTION_OPTS`, which git reads as
 # themselves: `git grep --text` and `git diff --text` treat binary files as text.
 GIT_EXACT_SAFE_OPTS = frozenset({"--text"})
 
-# Git subcommands that read repository state
+# Git subcommands that read repository state, and `version`, which prints git's own
 GIT_READ_SUBCOMMANDS = {
     "blame",
     "cat-file",
@@ -707,6 +712,7 @@ GIT_READ_SUBCOMMANDS = {
     "show-ref",
     "status",
     "tag",
+    "version",
     "worktree",
 }
 
@@ -1599,7 +1605,7 @@ def _check_git(args: list[str]) -> None:
             raise NotReadOnly(f"git mutating or execution flag: {arg}")
 
     index, _ = _git_global_options(args)
-    subcommand = args[index]
+    subcommand = "version" if args[index] in GIT_VERSION_FLAGS else args[index]
     sub_args = args[index + 1 :]
 
     # Check for glob expansion in git arguments
@@ -1713,8 +1719,9 @@ def _refuse_git_global(arg: str) -> None:
 def _git_global_options(args: list[str]) -> tuple[int, list[int]]:
     """The index into ``args`` of ``git``'s subcommand, and of each ``-C`` directory before it.
 
-    Walks past ``-C <dir>`` and ``GIT_GLOBAL_FLAGS`` only: whether an option takes the next word
-    as its value is what decides which word git runs. ``_refuse_git_global`` refuses the options
+    Walks past ``-C <dir>`` and ``GIT_GLOBAL_FLAGS`` only, and stops at ``GIT_VERSION_FLAGS``,
+    which stand for the subcommand: whether an option takes the next word as its value is what
+    decides which word git runs. ``_refuse_git_global`` refuses the options
     known to set config, move the repository or take a value. Any other option before the
     subcommand, the next one git adds included, is one this module cannot read, and the
     operator's rules decide. After the subcommand ``-C`` is another flag: copy detection in
@@ -1729,6 +1736,8 @@ def _git_global_options(args: list[str]) -> tuple[int, list[int]]:
             index += 2
         elif arg in GIT_GLOBAL_FLAGS:
             index += 1
+        elif arg in GIT_VERSION_FLAGS:
+            break
         else:
             _refuse_git_global(arg)
             # Whether this option takes the next word as its value decides where git's own

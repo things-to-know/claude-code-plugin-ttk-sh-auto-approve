@@ -1106,6 +1106,7 @@ class CorpusIsSafeToExecute(unittest.TestCase):
         yield from ((c, "executed") for c in EXECUTED_ATTACKS)
         yield from ((c, "differential") for c in DifferentialAgainstZsh.ATTACKS)
         yield from ((c, "git") for c, _, _ in RefusesUnlistedGitGlobalOptions.EXECUTED)
+        yield from ((c, "git") for c, _ in RefusesUnlistedGitGlobalOptions.APPROVED_AND_EXECUTED)
 
     def test_no_command_reaches_outside_the_scratch_tree(self):
         for command, origin in self.all_corpora():
@@ -3951,6 +3952,13 @@ class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
         ("git --shallow-file log push origin HEAD:refs/heads/pwned", (2, 0), "pushed branch"),
     )
 
+    # For `test_git_runs_version_with_the_words_after_it`: approved commands, and the fact each
+    # would change if git ran the words after the option as a subcommand
+    APPROVED_AND_EXECUTED = (
+        ("git --version clean -fdx", "untracked file"),
+        ("git -v branch -D victim", "branch victim"),
+    )
+
     def assert_no_opinion(self, command: str, why: str = "") -> None:
         with self.assertRaises(hook.NoOpinion, msg=why or command):
             hook._classify(command)
@@ -4005,6 +4013,20 @@ class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
         self.assert_refused_outright("git --bare log -1", "reads the config in the current dir")
         self.assert_no_opinion("git --help log", "runs git help log")
         self.assert_allowed("git log -1", "the control")
+
+    def test_the_version_options(self):
+        """`--version` and `-v` end git's options, and git runs `git version` in their place.
+        `--help` and `-h` end them too, for `git help`, which starts a man viewer, and stay left
+        to the operator's rules."""
+        for approved, not_approved in (
+            ("git --version", "git --help"),
+            ("git -v", "git -h"),
+            ("git version --build-options", "git help log"),
+            ("git --no-pager --version", "git --no-pager --help log"),
+        ):
+            with self.subTest(approved=approved):
+                self.assert_allowed(approved, "prints git's version")
+                self.assert_refused(not_approved, "starts a man viewer")
 
     def test_a_global_spelling_after_the_subcommand(self):
         """git reads its global options before the subcommand only. After it, `-c` counts
@@ -4104,20 +4126,40 @@ class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
                 self.assert_refused(command, "runs the subcommand after the value")
                 with self._repository() as root:
                     before = self._facts(root)
-                    result = subprocess.run(
-                        [BASH, "-c", command],
-                        cwd=Path(root, "work"),
-                        env=self._git_env(root),
-                        stdin=subprocess.DEVNULL,
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                        check=False,
-                    )
+                    result = self._run(root, command)
                     after = self._facts(root)
                 self.assertNotEqual(
                     before[fact], after[fact], f"git left the {fact} as it was:\n{result.stderr}"
                 )
+
+    @needs_bash
+    @needs_git
+    def test_git_runs_version_with_the_words_after_it(self):
+        """Each command is approved, and must change nothing: git 2.48.1 fails both with
+        `unknown switch`, from `git version`."""
+        for command, fact in self.APPROVED_AND_EXECUTED:
+            with self.subTest(command=command):
+                self.assert_allowed(command, "git runs version, with the words after it")
+                with self._repository() as root:
+                    before = self._facts(root)
+                    result = self._run(root, command)
+                    after = self._facts(root)
+                self.assertEqual(
+                    before[fact], after[fact], f"git changed the {fact}:\n{result.stderr}"
+                )
+
+    def _run(self, root: str, command: str) -> subprocess.CompletedProcess:
+        """Run ``command`` with bash in the scratch repository, as an agent would."""
+        return subprocess.run(
+            [BASH, "-c", command],
+            cwd=Path(root, "work"),
+            env=self._git_env(root),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
 
 
 class GitGlobalOptionsUnderOperatorRules(Verdicts, unittest.TestCase):
