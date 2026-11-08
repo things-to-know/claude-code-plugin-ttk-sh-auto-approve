@@ -39,6 +39,12 @@ A command is approved when every simple command in it clears one of two tiers:
         ``.claude/settings.json`` and ``.claude/settings.local.json`` already allow that
         exact command text.
 
+Tier 1 accepts two writes that the command does not choose, both by a ``git ls-remote`` or
+``git remote show`` that reaches its remote: git hands the credential back to the credential
+helper, which may store it again, and ssh may record a host key it has not seen. See
+``_check_git_ls_remote``. To learn which URL such a command reaches, the module runs
+``git ls-remote --get-url``, which contacts nothing; see ``_check_git_remote_reach``.
+
 Tier 1 is a superset of the host's own built-in read-only set, because a pipeline is only
 useful if ``cut``, ``printf``, ``sort`` and ``tr`` are reachable inside it. It reads the
 ``gh api`` GETs and the ``gh pr|run|issue|repo`` reads (``GH_READ_SPECS``) flag by flag, and
@@ -705,6 +711,7 @@ GIT_READ_SUBCOMMANDS = {
     "log",
     "ls-files",
     "ls-tree",
+    "merge-base",
     "rev-list",
     "rev-parse",
     "shortlog",
@@ -731,6 +738,42 @@ GIT_BRANCH_VALUE_FLAGS = frozenset({"--sort", "--format", "--points-at"})
 GIT_BRANCH_LIST_MODE = frozenset(
     {"--list", "--points-at", "--contains", "--no-contains", "--merged", "--no-merged"}
 )
+
+# `git ls-remote` flags that only shape what is printed. `--sort` is read too, attached only,
+# as `--sort=<key>`. Left out on purpose:
+# - `--upload-pack` (`-u`), which names a program to run
+# - `--server-option` (`-o`), which sends text of the caller's choosing to the server
+GIT_LS_REMOTE_FLAGS = frozenset(
+    {
+        "--heads",
+        "--branches",
+        "--tags",
+        "--refs",
+        "--quiet",
+        "--exit-code",
+        "--get-url",
+        "--symref",
+    }
+)
+GIT_LS_REMOTE_SHORTS = frozenset("hbtq")
+
+# A remote as the repository's config names it, never a URL or a path: no `:`, which a scheme,
+# `ext::` and `host:path` all need, and no `/`.
+GIT_REMOTE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+
+# A URL git reaches over the network with a transport of its own: `http(s)`, `ssh` and `git`
+# with a host, and the scp-like `[user@]host:path`, which has no `/` before its first `:` and no
+# `//` after it, since git reads `<word>://` as a scheme. Not a path or `file://`, which open a
+# repository on this machine, and not `<helper>::<address>` or another scheme, which run a
+# `git-remote-<name>` program from `PATH`.
+GIT_NETWORK_URL = re.compile(
+    r"(?:https?|ssh|git|git\+ssh|ssh\+git)://(?!-)[^/]+(?:/.*)?"
+    r"|(?!-)[^:/]+:(?!:|//).*"
+)
+
+# The longest the hook waits for git to say where a remote leads: `git ls-remote --get-url`
+# reads config and contacts nothing, so it takes milliseconds unless a file it opens blocks
+GIT_RESOLVE_TIMEOUT = 5.0
 
 
 class NotReadOnly(Exception):  # noqa: N818 - a verdict, not an error
@@ -1644,6 +1687,10 @@ def _check_git(args: list[str]) -> None:
         _check_git_remote(sub_args)
         return
 
+    if subcommand == "ls-remote":
+        _check_git_ls_remote(sub_args)
+        return
+
     if subcommand not in GIT_READ_SUBCOMMANDS:
         raise NotReadOnly(f"git non-read subcommand: {subcommand}")
 
@@ -1680,11 +1727,16 @@ def _check_git_branch(args: list[str]) -> None:
 
 
 def _check_git_remote(args: list[str]) -> None:
-    """Validate ``git remote``: the listing, and ``get-url``.
+    """Validate ``git remote``: the listing, ``get-url``, and ``show``.
 
-    ``show`` is left out because it contacts the remote unless given ``-n``, and every other
-    verb rewrites the configuration or fetches. A URL with a token in it is printed no more
-    than ``cat .git/config`` prints it.
+    Every other verb rewrites the configuration or fetches. A URL with a token in it is printed
+    no more than ``cat .git/config`` prints it.
+
+    ``show`` contacts each remote it names unless given ``-n``, as ``git ls-remote`` does, whose
+    docstring says what that writes. It is read for names that ``GIT_REMOTE_NAME`` matches only:
+    git takes a word that names no configured remote as a URL, so a URL in the command would be
+    a host of the caller's choosing. Where each name leads is checked where the command's
+    directories are known: ``_check_git_remote_reach``.
     """
     if args in ([], ["-v"], ["--verbose"]):
         return
@@ -1693,7 +1745,161 @@ def _check_git_remote(args: list[str]) -> None:
         names = [arg for arg in args[1:] if not arg.startswith("-")]
         if set(flags) <= {"--push", "--all"} and len(names) == 1:
             return
-    raise NotReadOnly(f"git remote other than a listing or get-url: {' '.join(args)}")
+    if args[:1] == ["show"]:
+        names = _git_operands(args[1:])
+        flags = set(args[1:]) - set(names)
+        if flags <= {"-n"} and all(GIT_REMOTE_NAME.fullmatch(name) for name in names):
+            return
+    raise NotReadOnly(f"git remote other than a listing, get-url or show: {' '.join(args)}")
+
+
+def _check_git_ls_remote(args: list[str]) -> None:
+    """Validate ``git ls-remote``: a configured remote's refs, printed and never stored.
+
+    It contacts the remote, with whatever credential helper the environment provides, as
+    ``git remote show`` does. So the repository operand, the first one, must be a remote name
+    that ``GIT_REMOTE_NAME`` matches, or absent, which reads the default remote. A URL, a path
+    or ``ext::`` would make the host, or the command, the caller's choice. The operands after it
+    are ref patterns, which only filter the output. Where the name, or the default, leads is
+    checked where the command's directories are known: ``_check_git_remote_reach``.
+
+    Contacting a remote can write, though nothing the command chooses, and both are accepted:
+    - On success git hands the credential it used back to the credential helper, which may
+      store it again: ``credential-store`` rewrites ``~/.git-credentials``, and the macOS
+      keychain and Git Credential Manager store theirs
+    - Under ``StrictHostKeyChecking accept-new``, ssh adds the key of a host it has not seen
+      to ``~/.ssh/known_hosts``
+    """
+    for arg in args:
+        if not arg.startswith("-") or arg == "-":
+            continue
+        name, equals, _ = arg.partition("=")
+        if arg in GIT_LS_REMOTE_FLAGS or (name == "--sort" and equals):
+            continue
+        if not arg.startswith("--") and set(arg[1:]) <= GIT_LS_REMOTE_SHORTS:
+            continue
+        raise NotReadOnly(f"git ls-remote flag that only a listing does not need: {arg}")
+    operands = _git_operands(args)
+    if operands and not GIT_REMOTE_NAME.fullmatch(operands[0]):
+        raise NotReadOnly(f"git ls-remote of other than a configured remote: {operands[0]}")
+
+
+def _git_operands(args: list[str]) -> list[str]:
+    """The words of ``args`` that are not flags, a lone ``-`` among them."""
+    return [arg for arg in args if not arg.startswith("-") or arg == "-"]
+
+
+def _git_remote_names(args: list[str]) -> list[str] | None:
+    """The remotes a ``git`` command contacts, given ``args`` from its subcommand on.
+
+    None for a command that contacts no remote: any other subcommand, an ``ls-remote
+    --get-url``, a ``remote show -n``, and a ``remote show`` given no name, which lists. An
+    ``ls-remote`` given no name contacts the default remote, which is ``[]`` here.
+
+    ``ls-remote`` reads its options up to its first operand only, and ``remote show`` reads them
+    wherever they are. So in ``git ls-remote origin --get-url`` the ``--get-url`` is a ref
+    pattern, and the remote is contacted.
+    """
+    subcommand, rest = args[:1], args[1:]
+    if subcommand == ["ls-remote"]:
+        operands = _git_operands(rest)
+        options = rest[: rest.index(operands[0])] if operands else rest
+        return None if "--get-url" in options else operands[:1]
+    if subcommand == ["remote"] and rest[:1] == ["show"]:
+        names = _git_operands(rest[1:])
+        return None if "-n" in rest[1:] or not names else names
+    return None
+
+
+def _check_git_remote_reach(
+    args: list[str], directory: str | None, scope: _ReadScope | None
+) -> None:
+    """Require each remote a ``git`` command contacts to be reached over the network.
+
+    ``args`` run from the subcommand on, and ``directory`` is the one ``-C`` names, if any; the
+    read scope has already cleared it. git reads a name it has no URL for as a path, a URL in
+    the config may be a path too, and either opens a repository on this machine with ``git
+    upload-pack``, whose config this module never read. ``url.<base>.insteadOf``, the current
+    branch's remote, ``safe.directory`` and the ``GIT_`` variables all decide which it is.
+
+    So git is asked, from every directory the command may run in: ``git ls-remote --get-url``
+    prints the URL the command would reach, every one of those applied, and contacts nothing.
+    A remote with ``remote.<name>.vcs`` is fetched by a ``git-remote-<vcs>`` program, which no
+    URL shows, so any one configured is no opinion as well.
+
+    Each failure is no opinion, which an operator's rule can still grant. With no scope there is
+    no directory to ask from.
+    """
+    names = _git_remote_names(args)
+    if names is None:
+        return
+    if scope is None:
+        raise NoOpinion("git given a remote, and no directory to resolve it from")
+    for base in scope.bases:
+        cwd = os.path.join(base, directory) if directory is not None else base
+        for name in names or [None]:
+            url = _git_remote_url(cwd, name, scope)
+            if url is None:
+                remote = name or "the default remote"
+                raise NoOpinion(f"git cannot tell where {remote} leads from {cwd}")
+            # `.`, from `branch.<name>.remote = .`, is the repository the command runs in
+            if url != "." and not GIT_NETWORK_URL.fullmatch(url):
+                raise NoOpinion(f"git reaches {url}, not a network URL")
+        helpers = _run_git(scope, cwd, "config", "--get-regexp", r"^remote\..*\.vcs$")
+        if helpers is None or helpers[0] not in (0, 1):
+            raise NoOpinion(f"git cannot tell which remotes a program fetches, from {cwd}")
+        if helpers[0] == 0:
+            raise NoOpinion("git remote fetched by a git-remote-<vcs> program")
+
+
+def _git_remote_url(directory: str, name: str | None, scope: _ReadScope) -> str | None:
+    """The URL ``git ls-remote [<name>]`` reaches from ``directory``, or None if git cannot say.
+
+    For a name no remote has, git prints the name, which is the path it would read.
+    """
+    result = _run_git(scope, directory, "ls-remote", "--get-url", *([name] if name else []))
+    if result is None or result[0] != 0:
+        return None
+    lines = result[1].splitlines()
+    return lines[0] if len(lines) == 1 else None
+
+
+def _run_git(scope: _ReadScope, directory: str, *args: str) -> tuple[int, str] | None:
+    """The exit status and output of ``git <args>`` run in ``directory``, once per command.
+
+    Only for subcommands that read config and contact nothing. It is the ``git`` on ``PATH``,
+    in this process's environment, which is the one the command gets, short of what the shell's
+    startup file changes. git still does whatever that config has it do on every call, such as
+    writing a ``trace2`` target. None where git cannot run, does not finish within
+    ``GIT_RESOLVE_TIMEOUT`` (a FIFO it opens blocks it), or prints other than UTF-8.
+    """
+    key = (directory, *args)
+    if key not in scope.git_runs:
+        scope.git_runs[key] = _run_git_uncached(directory, args)
+    return scope.git_runs[key]
+
+
+def _run_git_uncached(directory: str, args: tuple[str, ...]) -> tuple[int, str] | None:
+    # Imported here, not at the top: `subprocess` costs about 10 ms to import, which every Bash
+    # call would pay, and only a command that contacts a remote needs it
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    git = shutil.which("git")
+    if git is None or not os.path.isabs(git):
+        return None
+    try:
+        result = subprocess.run(  # noqa: S603 - git's own path, and arguments this module wrote
+            [git, "--no-pager", *args],
+            cwd=directory,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=GIT_RESOLVE_TIMEOUT,
+            check=False,
+        )
+        return result.returncode, result.stdout.decode("utf-8")
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+        return None
 
 
 def _refuse_git_global(arg: str) -> None:
@@ -2583,6 +2789,22 @@ def _check_command(
     elif program not in READ_ONLY:
         raise NoOpinion(f"unrecognized program: {program}")
 
+    # `-C` points git at the repository there, and so at that repository's config, which
+    # can name a program git runs: `core.fsmonitor` on `status`, `gpg.program` on a `log`
+    # that shows signatures. That is `--git-dir` under another name, so a directory
+    # outside the read roots is not this module's to approve. Read before the early return
+    # below, and before `_check_git_remote_reach`, which runs git in that directory.
+    if program == "git":
+        index, directories = _git_global_options(args)
+        if len(directories) > 1:
+            raise NoOpinion("git -C given more than once, each relative to the last")
+        for position in directories if scope is not None else []:
+            problem = _read_scope_problem(arg_tokens[position], args[position], parts, scope)
+            if problem is not None:
+                raise NoOpinion(f"git -C points at {problem}")
+        directory = args[directories[0]] if directories else None
+        _check_git_remote_reach(args[index:], directory, scope)
+
     # The read scope comes after the validator, so a write the validator found keeps its
     # verdict whatever a rule says: `sort -o out /etc/hostname` writes `out` wherever it reads.
     if scope is None:
@@ -2603,19 +2825,6 @@ def _check_command(
             problem = _read_scope_problem(token, text, parts, scope)
             if problem is not None:
                 raise NoOpinion(f"{program} reads {problem}")
-
-    # `-C` points git at the repository there, and so at that repository's config, which
-    # can name a program git runs: `core.fsmonitor` on `status`, `gpg.program` on a `log`
-    # that shows signatures. That is `--git-dir` under another name, so a directory
-    # outside the read roots is not this module's to approve.
-    if program == "git":
-        _, directories = _git_global_options(args)
-        if len(directories) > 1:
-            raise NoOpinion("git -C given more than once, each relative to the last")
-        for index in directories:
-            problem = _read_scope_problem(arg_tokens[index], args[index], parts, scope)
-            if problem is not None:
-                raise NoOpinion(f"git -C points at {problem}")
 
 
 class _GlobRule:
@@ -2900,7 +3109,7 @@ def _refuse_credential_paths(reduced: str, parts: list[tuple[str, str]]) -> None
 class _ReadScope:
     """Where a reader may read from, and what is known about the command's variables."""
 
-    __slots__ = ("bases", "loop_values", "roots", "spells_escape", "splice_vars")
+    __slots__ = ("bases", "git_runs", "loop_values", "roots", "spells_escape", "splice_vars")
 
     def __init__(
         self,
@@ -2918,6 +3127,9 @@ class _ReadScope:
         # Whether any word of the command spells a terminal escape, which makes every value
         # `echo` or `printf` expands one that may carry it; see `TERMINAL_CONTROL_BYTE`.
         self.spells_escape = spells_escape
+        # What git said when asked, once per command however many git calls it makes; see
+        # `_run_git`
+        self.git_runs: dict[tuple[str, ...], tuple[int, str] | None] = {}
 
 
 def _in_scope(absolute: str, scope: _ReadScope) -> bool:
