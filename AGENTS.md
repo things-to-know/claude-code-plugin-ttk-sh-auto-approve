@@ -48,12 +48,16 @@ insists on its own filename, symlink to this file rather than copying it.
   of handing it to the user. A crash or timeout also falls back to the normal
   permission prompt, but shows the user a hook error.
 - **`gh`**
-  - The hook reads `gh api` GETs and the read-only `pr`, `run`, `issue` and `repo` subcommands
-    itself (`GH_READ_SPECS`); any other subcommand, or a flag the table doesn't list,
-    is left to the operator's rules.
-  - A `--jq` that reads the environment is refused, which no rule overturns.
-    Operators can drop native `Bash(gh ... view|list *)` allow rules: a native rule still approves
-    `--jq '$ENV.GH_TOKEN'`, and only a native deny rule stops that.
+  - The hook reads `gh api` GETs itself
+  - It reads these subcommands itself, flag by flag (`GH_READ_SPECS`): `pr view|list|diff|checks`,
+    `run list|view`, `issue view|list`, `repo view` and `search issues|prs`
+  - It leaves any other subcommand, and a flag the table doesn't list, to the operator's rules
+    - Read-only ones too, such as `gh pr status`, `gh repo list` and `gh search code`
+  - A `--jq` that reads the environment, or that the shell rewrites, is refused, which no rule
+    overturns
+  - Operators can drop native `Bash(gh ... view|list *)` allow rules for the subcommands the hook
+    reads
+    - A native rule still approves `--jq '$ENV.GH_TOKEN'`, and only a native deny rule stops that
 - **Widening**: a change that approves more records where it stops, as
   `TheWideningsHaveAnEdge` does for the loop and splice widenings
   - Each new approval comes with its paired refusals

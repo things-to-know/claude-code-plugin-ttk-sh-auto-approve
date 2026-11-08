@@ -47,8 +47,10 @@ helper, which may store it again, and ssh may record a host key it has not seen.
 
 Tier 1 is a superset of the host's own built-in read-only set, because a pipeline is only
 useful if ``cut``, ``printf``, ``sort`` and ``tr`` are reachable inside it. It reads the
-``gh api`` GETs and the ``gh pr|run|issue|repo`` reads (``GH_READ_SPECS``) flag by flag, and
-refuses a ``--jq`` that reads the environment on every ``gh`` subcommand.
+``gh api`` GETs, and flag by flag the ``gh`` subcommands ``GH_READ_SPECS`` lists:
+``pr view|list|diff|checks``, ``run list|view``, ``issue view|list``, ``repo view`` and
+``search issues|prs``. It refuses a ``--jq`` that reads the environment on every ``gh``
+subcommand.
 
 Tier 2 grants nothing new: each of those commands is one Claude Code would run with no
 prompt if it stood on its own, and the host already requires every sub-command of a
@@ -113,6 +115,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 from stat import S_ISREG
+from typing import NoReturn
 
 # Maximum command length inspected before defaulting to user prompt (matches host caution)
 HOST_COMMAND_LENGTH_CAP = 10_000
@@ -2081,10 +2084,9 @@ GH_API_HEADERS = re.compile(r"^\s*(?:accept|x-github-api-version)\s*:", re.IGNOR
 def _check_gh(args: list[str]) -> None:
     """Validate ``gh api``: a GET to a GitHub endpoint, reading nothing it was not asked to.
 
-    The read-only ``pr``, ``run``, ``issue`` and ``repo`` subcommands are read by
-    ``_check_gh_read`` and every other one is left to the operator's rules, both in
-    ``_check_command``. ``gh api`` is a generic HTTP client holding the operator's token,
-    so it is read the way ``curl`` would have to be:
+    The subcommands ``GH_READ_SPECS`` lists are read by ``_check_gh_read`` and every other one
+    is left to the operator's rules, both in ``_check_command``. ``gh api`` is a generic HTTP
+    client holding the operator's token, so it is read the way ``curl`` would have to be:
 
     * the method is ``GET``, because ``-X``/``--method`` sets anything, and a request body
       (``-f``, ``-F``, ``--field``, ``--raw-field``, ``--input``) switches the default to POST
@@ -2163,13 +2165,32 @@ def _check_gh(args: list[str]) -> None:
 
 
 # The `gh` subcommands read by `_check_gh_read`, keyed by (group, verb). Each entry is the bare
-# flags, the flags that take a value, and how many positional arguments the verb takes. The
+# flags, the flags that take a value, and how many positional arguments the verb takes. Every
+# bare flag is a pflag bool, which gh also takes as `--flag=true` or `--flag=false`: gh 2.103
+# rejects `--flag=bogus` for each one with a `strconv.ParseBool` error. The
 # lists are `gh <group> <verb> --help` as of gh 2.102, minus what opens a browser (`-w/--web`),
 # blocks (`--watch`, `-i/--interval`, `--fail-fast`), formats with a template (`-t/--template`)
 # or prints terminal escapes (`--allow-escape-sequences`). A flag that is not listed gives
 # `NoOpinion`, so the operator's own rules can still grant it. `-w` is `--workflow` in
 # `run list` and `--web` everywhere else, which is why the tables are per verb.
 _GH_JSON_FLAGS = frozenset({"--json", "-q", "--jq", "-R", "--repo"})
+# `gh search issues|prs` take their query as any number of words, which only filter what the
+# API returns: `GH_SEARCH_QUERY` in place of an operand count says so, and lets a `--` end
+# the flags, so that a word may start with `-`, as `-label:bug` does. Their lists are
+# `gh search issues|prs --help` as of gh 2.103, minus `-w/--web` and `-t/--template`.
+GH_SEARCH_QUERY = -1
+_GH_SEARCH_BARE = frozenset({"--archived", "--locked", "--no-assignee", "--no-label"}) | {
+    "--no-milestone",
+    "--no-project",
+}
+_GH_SEARCH_VALUED = (
+    _GH_JSON_FLAGS
+    | {"--app", "--assignee", "--author", "--closed", "--commenter", "--comments"}
+    | {"--created", "--interactions", "--involves", "--label", "--language", "-L"}
+    | {"--limit", "--match", "--mentions", "--milestone", "--order", "--owner"}
+    | {"--project", "--reactions", "--sort", "--state", "--team-mentions", "--updated"}
+    | {"--visibility"}
+)
 GH_READ_SPECS: dict[tuple[str, str], tuple[frozenset[str], frozenset[str], int]] = {
     ("pr", "view"): (frozenset({"-c", "--comments"}), _GH_JSON_FLAGS, 1),
     ("pr", "list"): (
@@ -2206,6 +2227,18 @@ GH_READ_SPECS: dict[tuple[str, str], tuple[frozenset[str], frozenset[str], int]]
         0,
     ),
     ("repo", "view"): (frozenset(), frozenset({"-b", "--branch", "--json", "-q", "--jq"}), 1),
+    ("search", "issues"): (
+        _GH_SEARCH_BARE | {"--include-prs"},
+        _GH_SEARCH_VALUED | {"--search-type"},
+        GH_SEARCH_QUERY,
+    ),
+    ("search", "prs"): (
+        _GH_SEARCH_BARE | {"--draft", "--merged"},
+        _GH_SEARCH_VALUED
+        | {"-B", "--base", "--checks", "-H", "--head", "--merged-at", "--review"}
+        | {"--review-requested", "--reviewed-by"},
+        GH_SEARCH_QUERY,
+    ),
 }
 
 # `[HOST/]OWNER/REPO` is how gh names a repository; only the two-part form stays on the host the
@@ -2215,105 +2248,178 @@ GH_REPO_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 GH_REFERENCE = re.compile(r"^[A-Za-z0-9_./@#:+-]+$")
 
 
-def _check_gh_jq(args: list[str]) -> None:
-    """Refuse a ``--jq``/``-q`` filter that reads the environment, whatever the subcommand.
+def _check_gh_filter(text: str, *, rewritten: bool) -> None:
+    """Refuse a gh ``--jq`` filter that reads the environment, or that the shell rewrites.
 
     gh's own jq has ``env`` and ``$ENV``, so ``gh issue view 1 --jq '$ENV.GH_TOKEN'`` prints
     the token. The filter goes through ``_check_jq``, which raises ``NotReadOnly``: unlike
     ``NoOpinion`` that is not a verdict an operator's allow rule can overturn, so the hook does
-    not approve it through a rule either. Every spelling is read -- ``--jq F``, ``--jq=F``,
-    ``-q F``, ``-qF`` and a cluster such as ``-dq F`` -- on any subcommand, listed or not.
+    not approve it through a rule either. A filter the shell rewrites, ``--jq "$f"`` or an
+    unquoted wildcard, is not the text this module read, and is refused the same way, as
+    ``jq "$f"`` is.
+    """
+    if rewritten:
+        raise NotReadOnly(f"gh --jq filter the shell rewrites: {text}")
+    _check_jq([text])
+
+
+def _check_gh_jq(args: list[str], rewritten: list[bool]) -> None:
+    """Refuse a ``--jq``/``-q`` filter as ``_check_gh_filter`` does, reading every word as a flag.
+
+    Every spelling is read -- ``--jq F``, ``--jq=F``, ``-q F``, ``-qF`` and a cluster such as
+    ``-dq F``. A filter the shell rewrites is refused only where the word is surely the
+    filter, which a cluster's is not: another letter in it may take the word as its value.
+
+    This scan knows neither where the flags end nor which short options take a value, so it
+    reads a query word such as ``-label:sql-env``, or the value in ``-Hfeat/sql-env``, as a
+    cluster ending in ``-q``. ``_check_gh_read`` therefore reads the filter itself, in its flag
+    walk, and runs this scan only where no walk reads the words: on a subcommand
+    ``GH_READ_SPECS`` doesn't list, and from the word a walk gave up at to the end.
     """
     for index, arg in enumerate(args):
+        following = index + 1
         if arg.startswith("--jq="):
-            _check_jq([arg[len("--jq=") :]])
-        elif arg == "--jq":
-            _check_jq(args[index + 1 : index + 2])
+            _check_gh_filter(arg[len("--jq=") :], rewritten=rewritten[index])
+        elif arg == "--jq" and following < len(args):
+            _check_gh_filter(args[following], rewritten=rewritten[following])
         elif arg.startswith("-") and not arg.startswith("--") and "q" in arg[1:]:
+            own = arg[1] == "q"  # `-qF` or `-q F`, not a cluster
             tail = arg[arg.index("q") + 1 :]
-            _check_jq([tail] if tail else args[index + 1 : index + 2])
+            if tail:
+                _check_gh_filter(tail, rewritten=own and rewritten[index])
+            elif following < len(args):
+                _check_gh_filter(args[following], rewritten=own and rewritten[following])
 
 
-def _check_gh_read(args: list[str], live_globs: list[bool]) -> None:
-    """Validate a read-only ``gh pr|run|issue|repo`` subcommand, flag by flag.
+def _carries_tilde_or_equals(token: str) -> bool:
+    """Whether bash or zsh rewrites this word through a tilde, or zsh through ``=cmd``.
 
-    ``args`` start at the group. A subcommand that is not in ``GH_READ_SPECS``, a flag that is
-    not listed for it, or anything the shell still has to build -- an unquoted wildcard, an
-    expansion, a substitution -- is ``NoOpinion``: the module cannot vouch for it, and the
-    operator's rules decide, as they did before this existed. What is refused outright is the
-    ``--jq`` that reads the environment, in ``_check_gh_jq``. The hook approves only what it
-    can read in full:
+    Both shells expand ``~``, ``~+`` and ``~user`` at the start of a word, and bash expands one
+    after the ``=`` of a word shaped like an assignment, so ``x=~`` reaches the program as
+    ``x=$HOME``. zsh replaces a word that starts with ``=`` with the path of the command it
+    names, ``=ls`` with ``/usr/bin/ls``. Any unquoted ``~`` counts, so that no spelling has to
+    be listed. Only the reduced token is read, so a quoted ``'~+'`` or ``'=ls'`` is the literal
+    it spells.
+    """
+    return "~" in PLACEHOLDER.sub("", token) or token.startswith("=")
 
-    * the flags are the verb's own, each once spelled ``--flag V``, ``--flag=V`` or ``-fV``;
-      a cluster of short options and a bare ``--`` are not guessed at
+
+def _check_gh_read(args: list[str], rewritten: list[bool]) -> None:
+    """Validate a ``gh`` subcommand that ``GH_READ_SPECS`` lists, flag by flag.
+
+    ``args`` start at the group, and ``rewritten`` says, word by word, whether the shell
+    rewrites it before gh runs. A subcommand that is not in ``GH_READ_SPECS``, a flag that is
+    not listed for it, or anything the shell still has to build -- an unquoted wildcard or
+    tilde, zsh's ``=cmd``, an expansion, a substitution -- is ``NoOpinion``: the module cannot
+    vouch for it, and the operator's rules decide, as they did before this existed. What is
+    refused outright is a ``--jq`` that reads the environment, or that the shell rewrites: the
+    walk below reads the filter, and ``_check_gh_jq`` scans the words no walk reads. The hook
+    approves only what it can read in full:
+
+    * the flags are the verb's own, each once spelled ``--flag V``, ``--flag=V`` or ``-fV``,
+      and a bare one also ``--flag=true`` or ``--flag=false``; a cluster of short options, and
+      a bare ``--`` outside a search query, are not guessed at
     * ``-R`` and a repository operand are ``OWNER/REPO``, and a pull request, issue or run is
       a plain reference; a ``HOST/OWNER/REPO`` or a URL would send the token to another host
+    * a search query is any number of words, after a ``--`` too
     * ``--help`` prints help and sends nothing
     """
     spec = GH_READ_SPECS.get(tuple(args[:2]))
     if spec is None:
+        _check_gh_jq(args, rewritten)
         raise NoOpinion(f"gh {' '.join(args[:2])} is left to the operator's rules")
     bare, valued, max_positionals = spec
-    if any(live_globs):
-        raise NoOpinion("gh with an unquoted wildcard")
     rest = args[2:]
+    rest_rewritten = rewritten[2:]
     positionals: list[str] = []
+    query_start = len(rest)  # where the words after a search's `--` begin
     index = 0
     while index < len(rest):
+        start = index
         arg = rest[index]
         index += 1
-        name, equals, attached = arg.partition("=") if arg.startswith("--") else (arg, "", "")
         if not arg.startswith("-"):
+            if rest_rewritten[start]:
+                # The shell may make it a flag, so the words after it are not read either
+                _gh_give_up(
+                    rest, rest_rewritten, start, f"gh given a word the shell rewrites: {arg}"
+                )
             positionals.append(arg)
             continue
+        if arg == "--" and max_positionals == GH_SEARCH_QUERY:
+            query_start = index
+            positionals.extend(rest[index:])  # the rest of the query, `-` or not
+            break
         if arg == "--help":
             continue
         if arg.startswith("--"):
-            flag = name
-            if flag in bare and not equals:
+            flag, equals, value = arg.partition("=")
+            if flag in bare and (not equals or value in ("true", "false")):
                 continue
-            if flag not in valued:
-                raise NoOpinion(f"gh {args[0]} {args[1]} flag not known to be read-only: {arg}")
-            if equals:
-                value = attached
-            elif index < len(rest):
-                value = rest[index]
-                index += 1
-            else:
-                raise NoOpinion(f"gh {flag} without a value")
+            value_at = start if equals else None
         else:
-            flag = arg[:2]
+            flag, value = arg[:2], arg[2:]
             if arg in bare:
                 continue
-            if flag not in valued:
-                raise NoOpinion(f"gh {args[0]} {args[1]} flag not known to be read-only: {arg}")
-            if len(arg) > 2:
-                value = arg[2:]
-                if value.startswith("="):
-                    raise NoOpinion(f"gh short option with an attached '=': {arg}")
-            elif index < len(rest):
-                value = rest[index]
-                index += 1
-            else:
+            if value.startswith("="):
+                _gh_give_up(
+                    rest, rest_rewritten, start, f"gh short option with an attached '=': {arg}"
+                )
+            value_at = start if value else None
+        if flag not in valued:
+            _gh_give_up(
+                rest,
+                rest_rewritten,
+                start,
+                f"gh {args[0]} {args[1]} flag not known to be read-only: {arg}",
+            )
+        if value_at is None:
+            if index == len(rest):
                 raise NoOpinion(f"gh {flag} without a value")
+            value, value_at = rest[index], index
+            index += 1
         if flag in ("-q", "--jq"):
-            continue  # a filter, already read by `_check_gh_jq`; `$` is jq syntax there
-        _check_gh_word(value)
+            # `$` is jq syntax here, not the shell's, unless the shell rewrites the word
+            _check_gh_filter(value, rewritten=rest_rewritten[value_at])
+            continue
+        if rest_rewritten[value_at]:
+            _gh_give_up(rest, rest_rewritten, start, f"gh given a word the shell rewrites: {value}")
+        if _gh_word_is_built(value):
+            _gh_give_up(
+                rest,
+                rest_rewritten,
+                start,
+                f"gh given a word that is expanded or substituted: {value}",
+            )
         if flag in ("-R", "--repo") and not GH_REPO_NAME.match(value):
             raise NoOpinion(f"gh repository not in OWNER/REPO form: {value}")
-    if len(positionals) > max_positionals:
+    if any(rest_rewritten[query_start:]):
+        raise NoOpinion("gh search query with a word the shell rewrites")
+    if max_positionals != GH_SEARCH_QUERY and len(positionals) > max_positionals:
         raise NoOpinion(f"gh {args[0]} {args[1]} with more operands than it takes")
     for operand in positionals:
-        _check_gh_word(operand)
+        if _gh_word_is_built(operand):
+            raise NoOpinion(f"gh given a word that is expanded or substituted: {operand}")
+        if max_positionals == GH_SEARCH_QUERY:
+            continue  # a word of the query, which only filters what the API returns
         pattern = GH_REPO_NAME if args[:2] == ["repo", "view"] else GH_REFERENCE
         if "://" in operand or not pattern.match(operand):
             raise NoOpinion(f"gh operand that is not a plain reference: {operand}")
 
 
-def _check_gh_word(word: str) -> None:
-    """A word the shell is still building is not one this module read."""
-    if "$" in word or SUBSTITUTION_MARKER in word or PLACEHOLDER_MARK in word:
-        raise NoOpinion(f"gh given a word that is expanded or substituted: {word}")
+def _gh_give_up(words: list[str], rewritten: list[bool], start: int, reason: str) -> NoReturn:
+    """Leave the subcommand to the rules, once ``_check_gh_jq`` has read the words from ``start``.
+
+    The flag walk read the words before ``start``. Any word from it on may be a ``--jq`` the
+    walk never reached, which the hook refuses whatever the operator's rules say.
+    """
+    _check_gh_jq(words[start:], rewritten[start:])
+    raise NoOpinion(reason)
+
+
+def _gh_word_is_built(word: str) -> bool:
+    """Whether the shell is still building this word, which then is not one this module read."""
+    return "$" in word or SUBSTITUTION_MARKER in word or PLACEHOLDER_MARK in word
 
 
 def _check_find(args: list[str], live_globs: list[bool]) -> None:
@@ -2720,18 +2826,24 @@ def _check_command(
     # Merge note: this sits below the brace check on purpose. "The word checks below" are
     # the flag-position checks; a brace is refused for every operator-rule program, `gh`
     # included, because it is a word the shell has not finished building.
-    # `gh api` is read by its own validator, below. The read-only `pr`, `run`, `issue` and `repo`
-    # subcommands are read here, and every other subcommand stays the operator's rules' to
-    # grant, as before `gh` had a validator, so the word checks below must not refuse what
-    # those rules would. That is why this returns: `EXPANSION_UNSAFE` would refuse `gh pr view
-    # "$n"` outright, where `_check_gh_read` gives it no opinion and a rule can still grant it.
+    # `gh api` is read by its own validator, below. The subcommands `GH_READ_SPECS` lists are
+    # read here, and every other one stays the operator's rules' to grant, as before `gh` had
+    # a validator, so the word checks below must not refuse what those rules would. That is
+    # why this returns: `EXPANSION_UNSAFE` would refuse `gh pr view "$n"` outright, where
+    # `_check_gh_read` gives it no opinion and a rule can still grant it.
     if program == "gh" and args[:1] != ["api"]:
-        # The `--jq` check comes first and on every subcommand: `gh issue view 1 --jq
+        # `_check_gh_read` reads the `--jq` filter on every subcommand: `gh issue view 1 --jq
         # '$ENV.GH_TOKEN'` prints the token, so the hook approves it neither by reading it nor
         # through a rule. A native `Bash(gh issue view *)` rule still lets Claude Code run it
         # without asking; only a native deny rule stops that.
-        _check_gh_jq(args)
-        _check_gh_read(args, live_globs)
+        rewritten = [
+            glob
+            or _carries_tilde_or_equals(token)
+            or _has_bare_variable(token, parts)
+            or _carries_substitution(token, parts)
+            for glob, token in zip(live_globs, arg_tokens, strict=True)
+        ]
+        _check_gh_read(args, rewritten)
         return
 
     # A wrapper's own arguments are not the command; what it runs is checked in its place.
