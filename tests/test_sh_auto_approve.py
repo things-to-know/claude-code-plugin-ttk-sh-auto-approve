@@ -1837,12 +1837,13 @@ class MatchesTheHostsOwnCaution(Verdicts, unittest.TestCase):
             ("sort []-]o x.txt", "sort '[]-]o' x.txt"),
             ("find . [-]delete", "find . '[-]delete'"),
             ("find . [[:punct:]]delete", "find . -name '[[:punct:]]delete'"),
+            ("sed -e p [-]i x.txt", "sed -e p '[-]i' x.txt"),
             ("git log [-]-output=Makefile", "git log '[-]p'"),
             ('for f in [-]o; do sort "$f" x.txt; done', 'for f in o; do sort "$f" x.txt; done'),
         ):
             with self.subTest(command=refused):
                 self.assert_allowed(control, "the control")
-                self.assert_refused(refused, "a file named -o, -delete or --output=x")
+                self.assert_refused(refused, "a file named -o, -delete, -i or --output=x")
 
     def test_a_bracket_the_shell_leaves_alone(self):
         """A `[` with no `]` after it is no pattern: bash passes it as spelled and zsh refuses
@@ -1850,6 +1851,22 @@ class MatchesTheHostsOwnCaution(Verdicts, unittest.TestCase):
         self.assert_allowed("sort x.txt [-o", "unclosed")
         self.assert_allowed("sort x.txt \\[-]o", "the `[` is escaped")
         self.assert_refused("sort x.txt [-]o", "the same word, closed")
+
+    def test_a_glob_as_the_git_directory(self):
+        """`-C` takes the next word as its directory, and a glob there that matches two
+        entries is two words: beside `c/` and `clean`, `git -C c* status -fdx :/` is
+        `git -C c clean status -fdx :/`, and git runs `clean`. Quoted, it is the directory it
+        spells."""
+        for refused, control in (
+            ("git -C c* status -fdx :/", "git -C c status -fdx :/"),
+            ("git -C c* log -1", "git -C 'c*' log -1"),
+            ("git -C c? status", "git -C c status"),
+            ("git -C [ac]lean status -fdx :/", "git -C '[ac]lean' status"),
+            ("git -C doc* log -1", "git -C docs log -1"),
+        ):
+            with self.subTest(command=refused):
+                self.assert_allowed(control, "the control")
+                self.assert_refused(refused, "beside c/ and clean, git runs clean")
 
     def test_file_with_path_opening_flags(self):
         self.assert_refused("file -m /tmp/magic a.md", "opens /tmp/magic")
