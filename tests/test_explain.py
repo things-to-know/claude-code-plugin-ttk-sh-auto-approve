@@ -2,6 +2,7 @@
 
 import itertools
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -17,6 +18,14 @@ FIXTURE = ROOT / "tests" / "fixtures" / "transcript.jsonl"
 # Each made-up call gets an id of its own, as each real one has
 CALL_NUMBERS = itertools.count()
 
+# A session's scratchpad, and another session's
+SCRATCH = "/tmp/claude-1000/-home-user-project/00000000-0000-4000-8000-000000000000/scratchpad"
+OTHER_SCRATCH = SCRATCH.replace("-000000000000/", "-000000000001/")
+
+# Without the variable that names the scratchpad exactly, so that the hook takes it from
+# `--scratchpad-dir` whatever the environment the tests run in sets
+ENV = {name: value for name, value in os.environ.items() if name != "SH_AUTO_APPROVE_SCRATCH"}
+
 
 def explain(*args: str, stdin: str = "") -> list[list[str]]:
     """Each output line, split into decision, reason and command."""
@@ -27,6 +36,7 @@ def explain(*args: str, stdin: str = "") -> list[list[str]]:
         text=True,
         timeout=60,
         check=True,
+        env=ENV,
     )
     return [line.split("\t") for line in result.stdout.splitlines()]
 
@@ -39,6 +49,7 @@ def explain_fails(*args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=60,
         check=False,
+        env=ENV,
     )
 
 
@@ -115,6 +126,7 @@ PROJECT_DIR_ENV = "CLAUDE_PROJECT_DIR"
 SETTINGS_ENV = "SH_AUTO_APPROVE_SETTINGS"
 REPO_ROOT = None
 _SESSION_CWD = None
+_SCRATCHPAD_DIR = None
 
 
 class NotReadOnly(Exception):
@@ -165,6 +177,18 @@ class Explains(unittest.TestCase):
         self.assertEqual(outside[0], "no-opinion")
         self.assertIn("outside the working directories", outside[1])
 
+    def test_the_scratchpad_changes_the_verdict(self):
+        """A write into a scratchpad is approved when it is the session's, as
+        `--scratchpad-dir` names it, and refused when it is another session's, or when the
+        session has none."""
+        command = f"wc -l AGENTS.md > {SCRATCH}/out.txt"
+        (own,) = explain("--scratchpad-dir", SCRATCH, command)
+        (other,) = explain("--scratchpad-dir", OTHER_SCRATCH, command)
+        (none,) = explain(command)
+        self.assertEqual(own[0], "allow")
+        for line in (other, none):
+            self.assertEqual(line[:2], ["refused", "disallowed punctuation or redirection: >"])
+
     def test_writes_no_bytecode_next_to_the_hook(self):
         """The hook it asks may be the installed copy, or the working copy, which a local
         marketplace install copies along with its `__pycache__`."""
@@ -213,6 +237,17 @@ class ExplainsATranscript(unittest.TestCase):
         self.assertEqual([line[0] for line in lines], ["allow", "no-opinion", "allow", "allow"])
         self.assertIn("outside the working directories", lines[1][1])
         self.assertEqual([line[2] for line in lines], [".", elsewhere, ".", "tests"])
+
+    def test_the_scratchpad_of_a_transcript(self):
+        """No entry records the session's scratchpad, so `--scratchpad-dir` goes with
+        `--transcript` too: a write into it is approved with the option, and refused without."""
+        command = f"wc -l AGENTS.md > {SCRATCH}/out.txt"
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_transcript_") as directory:
+            path = write_transcript(directory, bash_call(command))
+            (own,) = explain("--transcript", path, "--scratchpad-dir", SCRATCH)
+            (none,) = explain("--transcript", path)
+        self.assertEqual(own[0], "allow")
+        self.assertEqual(none[0], "refused")
 
     def test_the_directory_as_the_hook_resolves_it(self):
         """The directory shows where the hook judged the call: a symbolic link to the project,

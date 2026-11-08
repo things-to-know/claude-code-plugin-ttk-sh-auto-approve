@@ -21,6 +21,9 @@ A verdict depends on where the session stands, so the context is passed in, neve
   reset to ..." in its transcript
 - ``--cwd``: the shell's working directory when the command ran, recorded as ``cwd`` on each
   transcript entry. It defaults to ``--project``
+- ``--scratchpad-dir``: the session's scratchpad directory, the ``scratchpad_dir`` of the hook's
+  payload. No transcript entry records it, so it goes with ``--transcript`` too. Without it, the
+  session has no scratchpad, and the hook approves no command that reaches one
 - ``--settings``: the settings files to read the allow and deny rules and
   ``additionalDirectories`` from, instead of the project's own; ``--no-rules`` reads none
 - ``--hook``: the hook to ask, e.g. the installed copy under ``~/.claude/plugins/cache/``,
@@ -296,6 +299,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("commands", nargs="*", help="commands to explain; stdin when none")
     parser.add_argument("--project", required=True, help="the session's CLAUDE_PROJECT_DIR")
     parser.add_argument("--cwd", help="the shell's working directory; default: --project")
+    parser.add_argument(
+        "--scratchpad-dir", help="the session's scratchpad directory; default: none"
+    )
     parser.add_argument("--hook", type=Path, default=WORKING_COPY, help="the hook to ask")
     parser.add_argument(
         "--transcript", type=Path, help="a session's transcript, to explain its every Bash call"
@@ -318,13 +324,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         os.environ.pop(hook.SETTINGS_ENV, None)
 
-    # What `main` in the hook does with the payload's `cwd`, minus the version and platform
-    # checks: explaining a verdict is useful on any machine.
+    # What `main` in the hook does with the payload's `cwd` and `scratchpad_dir`, minus the
+    # version and platform checks: explaining a verdict is useful on any machine.
     cwd = os.path.realpath(args.cwd or args.project)
     root = hook._project_root(cwd)
     if root is None:
         parser.error(f"no project root for {args.project}: the hook stays silent on everything")
     hook._SESSION_CWD = cwd
+    hook._SCRATCHPAD_DIR = args.scratchpad_dir
     hook.REPO_ROOT = root
 
     if args.transcript is not None:

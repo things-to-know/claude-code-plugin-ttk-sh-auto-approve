@@ -71,11 +71,14 @@ TEST_PYTHON_VERSIONS ?= 3.12 3.13 3.14
 # `TRANSCRIPT` explains every Bash call of a session instead, each from its own directory, so it
 # replaces `CWD`:
 # `make -s explain PROJECT=$HOME/ws/app TRANSCRIPT=<session-id>.jsonl`
+# `SCRATCHPAD_DIR` is the session's scratchpad, with or without `TRANSCRIPT`: without it, the hook
+# approves no command that reaches one.
 # `$HOME`, not `~`: zsh leaves a `~` after `=` in an argument as it is
 # (unless `magic_equal_subst` is set)
 PROJECT ?= ${CURDIR}
 CWD ?= ${PROJECT}
 TRANSCRIPT ?=
+SCRATCHPAD_DIR ?=
 HOOK ?= plugin/scripts/sh_auto_approve.py
 
 PY_FILES = $(shell git ls-files '*.py')
@@ -248,7 +251,8 @@ lint-json: ## Check that every JSON file parses
 explain: CWD_ARGS = $(if $(and ${TRANSCRIPT},$(filter file,$(origin CWD))),,--cwd "${CWD}")
 explain: ## Print the hook's verdict and reason for each command on stdin, or in TRANSCRIPT
 	${PYTHON} -I -B tools/explain.py --project "${PROJECT}" --hook "${HOOK}" \
-		$(if ${TRANSCRIPT},--transcript="${TRANSCRIPT}") ${CWD_ARGS}
+		$(if ${TRANSCRIPT},--transcript="${TRANSCRIPT}") ${CWD_ARGS} \
+		$(if ${SCRATCHPAD_DIR},--scratchpad-dir="${SCRATCHPAD_DIR}")
 
 .PHONY: validate
 validate: ## Run `claude plugin validate` (needs `claude` on PATH)
