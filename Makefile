@@ -73,12 +73,16 @@ TEST_PYTHON_VERSIONS ?= 3.12 3.13 3.14
 # `make -s explain PROJECT=$HOME/ws/app TRANSCRIPT=<session-id>.jsonl`
 # `SCRATCHPAD_DIR` is the session's scratchpad, with or without `TRANSCRIPT`: without it, the hook
 # approves no command that reaches one.
+# `SETTINGS` (settings files, separated by `:`) and `NO_RULES=1` (none) replace the project's
+# settings files, to audit an allow rule: see "Develop" in `AGENTS.md`.
 # `$HOME`, not `~`: zsh leaves a `~` after `=` in an argument as it is
 # (unless `magic_equal_subst` is set)
 PROJECT ?= ${CURDIR}
 CWD ?= ${PROJECT}
 TRANSCRIPT ?=
 SCRATCHPAD_DIR ?=
+SETTINGS ?=
+NO_RULES ?=
 HOOK ?= plugin/scripts/sh_auto_approve.py
 
 PY_FILES = $(shell git ls-files '*.py')
@@ -264,7 +268,8 @@ explain: CWD_ARGS = $(if $(and ${TRANSCRIPT},$(filter file,$(origin CWD))),,--cw
 explain: ## Print the hook's verdict and reason for each command on stdin, or in TRANSCRIPT
 	${PYTHON} -I -B tools/explain.py --project "${PROJECT}" --hook "${HOOK}" \
 		$(if ${TRANSCRIPT},--transcript="${TRANSCRIPT}") ${CWD_ARGS} \
-		$(if ${SCRATCHPAD_DIR},--scratchpad-dir="${SCRATCHPAD_DIR}")
+		$(if ${SCRATCHPAD_DIR},--scratchpad-dir="${SCRATCHPAD_DIR}") \
+		$(if ${SETTINGS},--settings="${SETTINGS}") $(if ${NO_RULES},--no-rules)
 
 .PHONY: validate
 validate: ## Run `claude plugin validate` (needs `claude` on PATH)

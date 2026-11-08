@@ -166,13 +166,23 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
       - It is `<temp>/claude-<uid>/<project>/<session-id>/scratchpad`, with `<temp>` per platform
         as in the "Session scratchpad directory" section of Claude Code's docs
     - Add `HOOK=<path>` to ask the installed copy instead of the working copy
-- Audit an allow rule with `tools/explain.py`, whose options `make explain` doesn't pass:
-  - `--no-rules`: whether the hook approves the rule's command on its own, which makes the rule
-    redundant
-  - `--settings <file>`: what else the rule approves
-    - Feed it the writing forms of the same program, such as `make lint-fix` for `Bash(make lint-*)`
-    - The hook approves a pipeline whose segments each match an allow rule, so a wildcard rule
-      reaches every command its pattern matches, wherever it stands
+- Audit an allow rule with `make explain`
+  - The hook reads allow and deny rules, and `additionalDirectories`, only from the project's
+    `.claude/settings.json` and `.claude/settings.local.json`; Claude Code alone applies a rule
+    from any other settings file
+  - `NO_RULES=1` and `SETTINGS=<file>` replace those 2 files, `additionalDirectories` included
+  - `NO_RULES=1`: whether the hook approves the rule's command without the rule
+    - If it does, the rule is redundant wherever the hook runs. It stays silent below
+      `MINIMUM_PYTHON`, outside Linux and macOS, and on any error, and there the rule decides
+    - For a command that reads an `additionalDirectories` entry, use `SETTINGS` instead, with a
+      file that holds only the entries
+  - `SETTINGS=<file>`: what else the rule approves
+    - First a command the rule matches and `NO_RULES=1` doesn't approve. It has to come back
+      `allow`: a file that doesn't exist reads as no rules, without a word
+    - Then the writing forms of the same program, such as `make lint-fix` for `Bash(make lint-*)`
+    - The hook approves a pipeline, or a list joined by `;`, `&&` or `||`, whose segments each
+      only read or match an allow rule, so a wildcard rule reaches every command its pattern
+      matches, wherever it stands
 
 ## Linting
 
