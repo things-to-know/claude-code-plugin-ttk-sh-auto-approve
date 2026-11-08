@@ -1021,6 +1021,23 @@ def _carries_substitution(token: str, parts: list[tuple[str, str]]) -> bool:
     return any(parts[int(index)][0] in RUNS_A_COMMAND for index in PLACEHOLDER.findall(token))
 
 
+def _has_wildcard(text: str) -> bool:
+    """Whether the shell would match this text against the directory, were it unquoted.
+
+    The wildcards are `*`, `?` and a bracket expression: a `[` that a later `]` closes, which
+    both shells match against the directory as they match the other two, so `[-]delete` is
+    `-delete` once a file of that name is there. A `[` with no `]` after it is none: bash leaves
+    the word as it is spelled, and zsh refuses to run the command ("bad pattern"). Any `]`
+    counts as the close, which errs toward a wildcard: bash reads `[]x` and `[!]` as unclosed,
+    while zsh globs both. Two `find` calls, not a regex: a search for `[`, anything, `]`
+    restarts at each `[` it fails from, which is quadratic in a word of unclosed ones.
+    """
+    if "*" in text or "?" in text:
+        return True
+    start = text.find("[")
+    return start >= 0 and text.find("]", start + 1) >= 0
+
+
 def _carries_live_glob(token: str) -> bool:
     """Whether the shell will expand a wildcard in this word.
 
@@ -1029,9 +1046,10 @@ def _carries_live_glob(token: str) -> bool:
     star through and `find` does the matching, in the second the shell has already
     replaced the word with whatever the directory held -- which is how an operand becomes
     a flag. Only the unquoted one is a hazard, and only the reduced token can tell them
-    apart, because quoting put the quoted one in the parts table.
+    apart, because quoting put the quoted one in the parts table. The wildcards are the ones
+    `_has_wildcard` lists.
     """
-    return any(char in "*?" for char in PLACEHOLDER.sub("", token))
+    return _has_wildcard(PLACEHOLDER.sub("", token))
 
 
 # A brace expansion the shell performs before the command runs: `{a,b}`, `{a,}`, `{1..3}`,
@@ -1714,8 +1732,13 @@ def _check_awk(args: list[str]) -> None:
             raise NotReadOnly("awk external access function")
 
 
-def _check_git(args: list[str]) -> None:
+def _check_git(args: list[str], live_globs: list[bool]) -> None:
     """Validate ``git`` subcommands, ensuring read-only behavior and safe options."""
+    # A wildcard the shell expands can supply a flag: `git log [-]-output=x` is `git log
+    # --output=x` once a file of that name is there. The check on `*` and `?` below reads the
+    # expanded words, so it misses a bracket expression and refuses a quoted `'*'` too.
+    if any(live_globs):
+        raise NotReadOnly("git with an unquoted glob")
     # Flags that write a file or run a program, wherever they are: after the subcommand they are
     # its own (`git diff --output=x`), and before it `--exec-path=<dir>` is git's. The global
     # options that set config or move the repository are refused by `_git_global_options`,
@@ -2786,7 +2809,7 @@ MAX_WRAPPER_DEPTH = 4
 # Explicit dispatch table mapping programs to their dedicated validator functions
 # Validators that need to know which words carry a wildcard the shell will expand, and
 # so take the parallel `live_globs` list as a second argument.
-GLOB_AWARE = frozenset({"find", "sed", "sort"})
+GLOB_AWARE = frozenset({"find", "git", "sed", "sort"})
 
 PROGRAM_VALIDATORS = {
     "aws": _check_aws,

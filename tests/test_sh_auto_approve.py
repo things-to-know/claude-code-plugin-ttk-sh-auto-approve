@@ -1829,6 +1829,28 @@ class MatchesTheHostsOwnCaution(Verdicts, unittest.TestCase):
         self.assert_refused("find . *", "a file named -delete makes this a write")
         self.assert_refused("git log *", "a glob can supply a git flag")
 
+    def test_a_bracket_expression_can_expand_into_a_flag(self):
+        """`[-]o` is `-o` once a file of that name is in the directory, in bash and zsh both.
+        Quoted, it is the file it spells."""
+        for refused, control in (
+            ("sort [-]o x.txt", "sort '[-]o' x.txt"),
+            ("sort []-]o x.txt", "sort '[]-]o' x.txt"),
+            ("find . [-]delete", "find . '[-]delete'"),
+            ("find . [[:punct:]]delete", "find . -name '[[:punct:]]delete'"),
+            ("git log [-]-output=Makefile", "git log '[-]p'"),
+            ('for f in [-]o; do sort "$f" x.txt; done', 'for f in o; do sort "$f" x.txt; done'),
+        ):
+            with self.subTest(command=refused):
+                self.assert_allowed(control, "the control")
+                self.assert_refused(refused, "a file named -o, -delete or --output=x")
+
+    def test_a_bracket_the_shell_leaves_alone(self):
+        """A `[` with no `]` after it is no pattern: bash passes it as spelled and zsh refuses
+        the command, so neither can turn it into a flag."""
+        self.assert_allowed("sort x.txt [-o", "unclosed")
+        self.assert_allowed("sort x.txt \\[-]o", "the `[` is escaped")
+        self.assert_refused("sort x.txt [-]o", "the same word, closed")
+
     def test_file_with_path_opening_flags(self):
         self.assert_refused("file -m /tmp/magic a.md", "opens /tmp/magic")
         self.assert_refused("file -f /tmp/list a.md", "opens /tmp/list")
@@ -2237,6 +2259,8 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
         self.assert_refused("find . -name *.md")
         self.assert_refused("sort *")
         self.assert_refused("sed -n '1p' *.md")
+        self.assert_allowed("sed -n '1p' '[ab].md'", "the control: quoted, one file")
+        self.assert_refused("sed -n '1p' [ab].md", "a bracket expression is a wildcard too")
 
     def test_the_output_form_of_process_substitution(self):
         """`<(...)` runs a command. `>(...)` runs one and hands it a stream to write."""
@@ -3235,6 +3259,8 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             f"cat docs/*/{up}/etc/os-release",
             "cat " + "/".join([".*"] * 12) + "/etc/os-release",
             "grep -r x .?",
+            "cat .[!a]",
+            "grep -r x .[[:punct:]]",
             f'for f in */{up}/etc/os-release; do cat "$f"; done',
         ):
             with self.subTest(command=command):
