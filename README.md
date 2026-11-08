@@ -22,6 +22,35 @@ A [Claude Code](https://code.claude.com/docs) plugin with 2 hooks:
 > would expand. What it can't see is your aliases: if one turns a read-only program such as `ls`
 > or `grep` into something that writes, the hook still approves it.
 
+## Secrets inside your project
+
+> [!WARNING]
+> The hook approves reads anywhere inside the project, its `additionalDirectories` and the
+> session's scratchpad, and a secret kept there is a file like any other: `cat .env` and
+> `grep -r PASSWORD .` are approved.
+>
+> The hook refuses a command that names a credential store under your home directory, such as
+> `~/.aws` or `~/.ssh`, but refusing only leaves the call to Claude Code. Claude Code runs a
+> built-in set of read-only commands, `cat` and `grep` among them, without a permission prompt in
+> every mode, except as `permissions.blockReadsOutsideWorkingDirectories` changes for paths
+> outside your working directories. So it runs `cat .env` unprompted with or without the hook.
+>
+> What stops these reads is Claude Code's own settings
+> ([permissions](https://code.claude.com/docs/en/permissions)):
+>
+> - A `Read()` deny rule, such as `Read(//**/.env)` in `~/.claude/settings.json`. Claude Code
+>   applies it even when a hook approves: to its own file tools, to the targets of redirections,
+>   and to the file commands it recognizes in Bash, such as `cat`, `head` and `tail`. It doesn't
+>   apply to a command that reads a file without naming it, such as `grep -r PASSWORD .`
+> - `Read(//**/.env)` matches only files named `.env`: `.env.local` and the like need a rule of
+>   their own, such as `Read(//**/.env.*)`
+> - `permissions.blockReadsOutsideWorkingDirectories`, for paths outside your working directories
+>
+> The hook reads `additionalDirectories` only from the project's `.claude/settings.json` and
+> `.claude/settings.local.json`. It drops an entry that is or contains your home directory, or
+> that is, contains or sits inside a credential store; each entry it keeps widens what it may
+> read.
+
 ## Install
 
 Through the things-to-know plugin catalog (not published yet).
@@ -31,6 +60,9 @@ To try it for one session from a clone of this repo:
 ```bash
 claude --plugin-dir ./plugin
 ```
+
+If you registered either hook yourself, in a `settings.json` or `settings.local.json`, remove
+that entry once the plugin is enabled: hooks aren't namespaced, so both copies would run.
 
 ## What runs on your machine
 

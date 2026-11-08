@@ -32,6 +32,10 @@ insists on its own filename, symlink to this file rather than copying it.
 
 - **Threat model:** the hook may run while Claude's context is poisoned. An
   approval for a command that isn't read-only is the failure to avoid.
+  - Known gap: a read-only command can still print a secret
+    - The hook approves reading a `.env` file inside the project, an `additionalDirectories`
+      entry or the session's scratchpad, `grep -r` included
+    - README § "Secrets inside your project" tells users what still stops it
 - **Shell**:
   - The `Bash` tool runs bash or zsh: the user's `$SHELL` when it is one of them, or the one
     `CLAUDE_CODE_SHELL` names. Every rule has to hold under both grammars.
@@ -162,6 +166,23 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
       - It is `<temp>/claude-<uid>/<project>/<session-id>/scratchpad`, with `<temp>` per platform
         as in the "Session scratchpad directory" section of Claude Code's docs
     - Add `HOOK=<path>` to ask the installed copy instead of the working copy
+- Audit an allow rule with `make explain`
+  - The hook reads allow and deny rules, and `additionalDirectories`, only from the project's
+    `.claude/settings.json` and `.claude/settings.local.json`; Claude Code alone applies a rule
+    from any other settings file
+  - `NO_RULES=1` and `SETTINGS=<file>` replace those 2 files, `additionalDirectories` included
+  - `NO_RULES=1`: whether the hook approves the rule's command without the rule
+    - If it does, the rule is redundant wherever the hook runs. It stays silent below
+      `MINIMUM_PYTHON`, outside Linux and macOS, and on any error, and there the rule decides
+    - For a command that reads an `additionalDirectories` entry, use `SETTINGS` instead, with a
+      file that holds only the entries
+  - `SETTINGS=<file>`: what else the rule approves
+    - First a command the rule matches and `NO_RULES=1` doesn't approve. It has to come back
+      `allow`: a file that doesn't exist reads as no rules, without a word
+    - Then the writing forms of the same program, such as `make lint-fix` for `Bash(make lint-*)`
+    - The hook approves a pipeline, or a list joined by `;`, `&&` or `||`, whose segments each
+      only read or match an allow rule, so a wildcard rule reaches every command its pattern
+      matches, wherever it stands
 
 ## Linting
 
@@ -208,16 +229,7 @@ other change: where a fix rewrote content that was correct, revert it and adjust
    `claude plugin marketplace update <catalog>` followed by
    `claude plugin update ttk-sh-auto-approve@<catalog>`.
 
-## Migrating the real hook
+## Public repository
 
-`plugin/scripts/sh_auto_approve.py` is the real hook. Its second tier reads the operator's allow
-and deny rules from `.claude/settings.json` and `.claude/settings.local.json` under
-`$CLAUDE_PROJECT_DIR`. What remains:
-
-1. This repo is public. Before committing, review the implementation and its
-   test fixtures for code you don't own and for infrastructure details
-   (hostnames, bucket names, account IDs, internal paths).
-2. Add the existing suites under `tests/`. Keep `tests/test_hook_contract.py` passing.
-3. In each repo that had the hook configured directly, remove that entry from
-   `.claude/settings*.json` once the plugin is enabled there. Hooks aren't
-   namespaced, so both copies would run.
+This repo is public. Before committing, review the change, its test fixtures included, for code
+you don't own and for infrastructure details: hostnames, bucket names, account IDs, internal paths.

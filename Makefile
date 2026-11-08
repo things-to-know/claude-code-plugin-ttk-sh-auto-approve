@@ -73,12 +73,16 @@ TEST_PYTHON_VERSIONS ?= 3.12 3.13 3.14
 # `make -s explain PROJECT=$HOME/ws/app TRANSCRIPT=<session-id>.jsonl`
 # `SCRATCHPAD_DIR` is the session's scratchpad, with or without `TRANSCRIPT`: without it, the hook
 # approves no command that reaches one.
+# `SETTINGS` (settings files, separated by `:`) and `NO_RULES=1` (none) replace the project's
+# settings files, to audit an allow rule: see "Develop" in `AGENTS.md`.
 # `$HOME`, not `~`: zsh leaves a `~` after `=` in an argument as it is
 # (unless `magic_equal_subst` is set)
 PROJECT ?= ${CURDIR}
 CWD ?= ${PROJECT}
 TRANSCRIPT ?=
 SCRATCHPAD_DIR ?=
+SETTINGS ?=
+NO_RULES ?=
 HOOK ?= plugin/scripts/sh_auto_approve.py
 
 PY_FILES = $(shell git ls-files '*.py')
@@ -160,11 +164,15 @@ lint-fix: lint-py-fix
 lint-fix: lint-md-fix
 lint-fix: ## Apply the fixes the linters can make on their own
 
+# The tests, as `python` and `coverage run` take them, for `test`, `test-coverage` and
+# `test-all-python-matrix`
+UNITTEST = -m unittest discover -s tests ${TEST_ARGS}
+
 # `-B` ("write no `.pyc` files"): it keeps the tests' imports of the hooks from writing bytecode
 # into `plugin/`, which a local marketplace install copies along with the scripts
 .PHONY: test
 test: ## Run the tests, e.g. `make test TEST_ARGS='-k Widening'`
-	${PYTHON} -B -m unittest discover -s tests ${TEST_ARGS}
+	${PYTHON} -B ${UNITTEST}
 
 # `test` under Coverage.py, which lists, for each hook, the lines and branches no test runs
 # - It sets no minimum, so only a failing test fails it
@@ -174,17 +182,25 @@ test: ## Run the tests, e.g. `make test TEST_ARGS='-k Widening'`
 .PHONY: test-coverage
 test-coverage: ## Run the tests under coverage, and list each hook's lines and branches no test runs
 	${COVERAGE} erase
-	${COVERAGE} run -m unittest discover -s tests ${TEST_ARGS}
+	${COVERAGE} run ${UNITTEST}
 	${COVERAGE} combine --quiet
 	${COVERAGE} report
 	${COVERAGE} html
 
 # `test` once per version, on the interpreter uv finds for it, which uv installs first if missing
+# - The loop runs the tests itself rather than through `${MAKE} test`: make runs a recipe line
+#   that names `MAKE` even under `-n`, so `make -n` would have run the whole loop, installs included
+# - It prints each command before running it, as the shell split it: `argv` holds the words, so
+#   `TEST_ARGS` is expanded once, and `%q` quotes each word back
+# - `-B`: as for `test`
 .PHONY: test-all-python-matrix
 test-all-python-matrix: ## Run the tests on each Python version in CI's matrix, from uv
 	@for version in ${TEST_PYTHON_VERSIONS}; do \
 		${UV} python install --quiet "$${version}"; \
-		${MAKE} --no-print-directory test PYTHON="$$(${UV} python find "$${version}")"; \
+		python="$$(${UV} python find "$${version}")"; \
+		argv=("$${python}" -B ${UNITTEST}); \
+		printf '%q' "$${argv[0]}"; printf ' %q' "$${argv[@]:1}"; echo; \
+		"$${argv[@]}"; \
 	done
 
 # Coverage writes `.coverage`, a `.coverage.*` file per process until `combine` merges them, and
@@ -252,7 +268,8 @@ explain: CWD_ARGS = $(if $(and ${TRANSCRIPT},$(filter file,$(origin CWD))),,--cw
 explain: ## Print the hook's verdict and reason for each command on stdin, or in TRANSCRIPT
 	${PYTHON} -I -B tools/explain.py --project "${PROJECT}" --hook "${HOOK}" \
 		$(if ${TRANSCRIPT},--transcript="${TRANSCRIPT}") ${CWD_ARGS} \
-		$(if ${SCRATCHPAD_DIR},--scratchpad-dir="${SCRATCHPAD_DIR}")
+		$(if ${SCRATCHPAD_DIR},--scratchpad-dir="${SCRATCHPAD_DIR}") \
+		$(if ${SETTINGS},--settings="${SETTINGS}") $(if ${NO_RULES},--no-rules)
 
 .PHONY: validate
 validate: ## Run `claude plugin validate` (needs `claude` on PATH)
