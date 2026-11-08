@@ -76,7 +76,7 @@ from a command that prompted in a real session.
     13  Vendor CLIs: git, aws, gcloud
           RefusesVendorFlagsAndSubcommands, ApprovesOrdinaryOptionForms,
           RefusesGitConfigDrivenExecution, RefusesGitSubcommandsOutsideTheReadSet,
-          RefusesUnlistedGitGlobalOptions,
+          RefusesUnlistedGitGlobalOptions, GitGlobalOptionsUnderOperatorRules,
           RefusesAwsCallsThatWriteOrExecute, RefusesAwsCallsThatPrintASecret,
           ApprovesGcloudHelpForABlockedVerb, RefusesGcloudCallsThatWriteLocallyOrExecute,
           RefusesGhApiCallsThatWriteOrLeak, ApprovesReadOnlyGhSubcommands,
@@ -3929,8 +3929,10 @@ class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
     took a value. `--attr-source <tree>` (git 2.41 and later), `--shallow-file <file>` and
     `--super-prefix <path>` (git 2.39 and earlier) take one too. So the value read as the
     subcommand, and git ran the word after it: `git --attr-source log clean -fdx` was approved
-    as `git log`. The walk now passes `-C` and `GIT_GLOBAL_FLAGS` only, and refuses any other
-    option before the subcommand, the next one git adds included.
+    as `git log`. The walk now passes `-C` and `GIT_GLOBAL_FLAGS` only. It refuses the options
+    known to take a value, set config or move the repository, whatever the operator's rules
+    say, and leaves any other option before the subcommand, the next one git adds included, to
+    those rules.
 
     Each refusal sits beside a control approved under the same setup.
     `test_git_runs_the_hidden_subcommand` runs the refused commands with the installed git, in
@@ -3949,8 +3951,18 @@ class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
         ("git --shallow-file log push origin HEAD:refs/heads/pwned", (2, 0), "pushed branch"),
     )
 
+    def assert_no_opinion(self, command: str, why: str = "") -> None:
+        with self.assertRaises(hook.NoOpinion, msg=why or command):
+            hook._classify(command)
+
+    def assert_refused_outright(self, command: str, why: str = "") -> None:
+        """Refused, and not as `NoOpinion`, so that no operator rule overturns it."""
+        with self.assertRaises(hook.NotReadOnly, msg=why or command) as raised:
+            hook._classify(command)
+        self.assertNotIsInstance(raised.exception, hook.NoOpinion, why or command)
+
     def test_an_option_that_takes_the_next_word(self):
-        """Each refusal was approved as `git log`.
+        """Each refusal was approved as `git log`, and is now refused outright.
 
         The `--super-prefix` one is read from `git.c` and `builtin/read-tree.c` at v2.39.5, not
         executed: git 2.40 dropped the option. Below 2.40 every builtin without
@@ -3966,7 +3978,7 @@ class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
             ("git --super-prefix log read-tree --empty", "git --literal-pathspecs log -1"),
         ):
             with self.subTest(refused=refused):
-                self.assert_refused(refused, "runs the subcommand after the value")
+                self.assert_refused_outright(refused, "runs the subcommand after the value")
                 self.assert_allowed(control, "the option before `log` takes no value")
 
     def test_a_directory_the_read_scope_never_saw(self):
@@ -3976,19 +3988,38 @@ class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
         self.assert_allowed("git --no-pager -C . status", "the walk reaches its -C, in scope")
 
     def test_an_option_the_list_lacks(self):
-        """Refused whatever it does: the attached `--attr-source=` takes no next word, and
-        `--frobnicate` stands for the next option git adds, which is what the list is for."""
-        self.assert_refused("git --attr-source=HEAD log -1", "gets an option the list lacks")
-        self.assert_refused("git --frobnicate log -1", "gets an option the list lacks")
+        """`--frobnicate` stands for the next option git adds, which this module cannot read: a
+        prompt, unless the operator's rules grant that exact shape, which
+        `GitGlobalOptionsUnderOperatorRules` asserts. The attached `--attr-source=` takes no
+        next word, and is refused outright all the same, as an option known to take a value."""
+        self.assert_no_opinion("git --frobnicate log -1", "an option the list lacks")
+        self.assert_refused_outright("git --attr-source=HEAD log -1", "takes a value")
         self.assert_allowed("git log -1", "the control")
 
     def test_the_options_that_stand_for_a_repository_or_a_command(self):
         """`--bare` makes the current directory the repository, which is the `--git-dir=.`
-        that `GIT_LOCATION_OPTS` refuses. `--help` ends the options, and git runs `help` in its
-        place: `git --help log` is `git help log`, which starts a man viewer."""
-        self.assert_refused("git --bare log -1", "reads the config in the current directory")
-        self.assert_refused("git --help log", "runs git help log")
+        that `GIT_LOCATION_OPTS` refuses, and is refused outright. `--help` ends the options,
+        and git runs `help` in its place: `git --help log` is `git help log`, which starts a
+        man viewer. Whether that only prints the page is not settled, so it is left to the
+        operator's rules."""
+        self.assert_refused_outright("git --bare log -1", "reads the config in the current dir")
+        self.assert_no_opinion("git --help log", "runs git help log")
         self.assert_allowed("git log -1", "the control")
+
+    def test_a_global_spelling_after_the_subcommand(self):
+        """git reads its global options before the subcommand only. After it, `-c` counts
+        matches in `grep` and shows a combined diff in `log`, and `rev-parse --git-dir` prints
+        where the repository is. Each was refused while the module looked for `-c` and
+        `--git-dir` in every word; before the subcommand they stay refused outright."""
+        for refused, approved in (
+            ("git -c core.pager=touch grep -e x", "git grep -c -e x"),
+            ("git -c core.pager=touch log -1", "git log -c -1"),
+            ("git --git-dir=elsewhere rev-parse HEAD", "git rev-parse --git-dir"),
+            ("git -C . -c core.pager=touch log -1", "git -C . log -c -1"),
+        ):
+            with self.subTest(refused=refused):
+                self.assert_refused_outright(refused, "sets the pager or moves the repository")
+                self.assert_allowed(approved, "the subcommand's own flag")
 
     def test_options_with_no_subcommand_after_them(self):
         """Refused as having no subcommand. For a `-C` that ends the command, that refusal is
@@ -4087,6 +4118,44 @@ class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
                 self.assertNotEqual(
                     before[fact], after[fact], f"git left the {fact} as it was:\n{result.stderr}"
                 )
+
+
+class GitGlobalOptionsUnderOperatorRules(Verdicts, unittest.TestCase):
+    """The cases of `RefusesUnlistedGitGlobalOptions` that install a rule file.
+
+    Kept apart because the harvester skips any class that does (`RULE_DEPENDENT`), and the
+    approvals of that class are worth executing. An unlisted global option is `NoOpinion`, so an
+    operator's rule for its exact shape approves it; an option the walk refuses stays refused,
+    whatever the rules say.
+    """
+
+    assert_no_opinion = RefusesUnlistedGitGlobalOptions.assert_no_opinion
+    assert_refused_outright = RefusesUnlistedGitGlobalOptions.assert_refused_outright
+
+    def test_an_option_the_list_lacks(self):
+        """`--frobnicate` stands for the next option git adds: a rule for that exact shape
+        approves it. The attached `--attr-source=` stays refused under a rule that matches it,
+        as an option known to take a value."""
+        self.assert_no_opinion("git --frobnicate log -1", "the control: no rule")
+        with operator_rules(allow=["Bash(git --frobnicate log *)"]):
+            self.assert_allowed("git --frobnicate log -1", "the operator granted this shape")
+        with operator_rules(allow=["Bash(git --attr-source*)"]):
+            self.assert_refused_outright("git --attr-source=HEAD log -1", "takes a value")
+
+    def test_a_refused_option_after_one_the_list_lacks(self):
+        """Whether the unlisted option takes the next word decides where git's options end, so
+        an option the walk refuses, anywhere after it, is refused outright too. That costs a
+        prompt where the refused spelling was a subcommand's own flag, as in `grep -c`."""
+        with operator_rules(allow=["Bash(git *)"]):
+            for command in (
+                "git --frobnicate -c core.pager=touch log",
+                "git --frobnicate x --git-dir=elsewhere log",
+                "git --frobnicate log --attr-source log clean -fdx",
+                "git --frobnicate grep -c x",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "the option may be git's own")
+            self.assert_allowed("git --frobnicate log -1", "the control: nothing refused after it")
 
 
 @approvals_budgeted
