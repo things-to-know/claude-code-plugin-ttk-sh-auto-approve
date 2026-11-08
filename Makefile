@@ -160,14 +160,15 @@ lint-fix: lint-py-fix
 lint-fix: lint-md-fix
 lint-fix: ## Apply the fixes the linters can make on their own
 
-# The interpreter's arguments for `test` and `test-all-python-matrix`
-# - `-B` ("write no `.pyc` files"): it keeps the tests' imports of the hooks from writing bytecode
-#   into `plugin/`, which a local marketplace install copies along with the scripts
-UNITTEST = -B -m unittest discover -s tests ${TEST_ARGS}
+# The tests, as `python` and `coverage run` take them, for `test`, `test-coverage` and
+# `test-all-python-matrix`
+UNITTEST = -m unittest discover -s tests ${TEST_ARGS}
 
+# `-B` ("write no `.pyc` files"): it keeps the tests' imports of the hooks from writing bytecode
+# into `plugin/`, which a local marketplace install copies along with the scripts
 .PHONY: test
 test: ## Run the tests, e.g. `make test TEST_ARGS='-k Widening'`
-	${PYTHON} ${UNITTEST}
+	${PYTHON} -B ${UNITTEST}
 
 # `test` under Coverage.py, which lists, for each hook, the lines and branches no test runs
 # - It sets no minimum, so only a failing test fails it
@@ -177,7 +178,7 @@ test: ## Run the tests, e.g. `make test TEST_ARGS='-k Widening'`
 .PHONY: test-coverage
 test-coverage: ## Run the tests under coverage, and list each hook's lines and branches no test runs
 	${COVERAGE} erase
-	${COVERAGE} run -m unittest discover -s tests ${TEST_ARGS}
+	${COVERAGE} run ${UNITTEST}
 	${COVERAGE} combine --quiet
 	${COVERAGE} report
 	${COVERAGE} html
@@ -185,13 +186,14 @@ test-coverage: ## Run the tests under coverage, and list each hook's lines and b
 # `test` once per version, on the interpreter uv finds for it, which uv installs first if missing
 # - The loop runs the tests itself rather than through `${MAKE} test`: make runs a recipe line
 #   that names `MAKE` even under `-n`, so `make -n` would have run the whole loop, installs included
+# - `-B`: as for `test`
 .PHONY: test-all-python-matrix
 test-all-python-matrix: ## Run the tests on each Python version in CI's matrix, from uv
 	@for version in ${TEST_PYTHON_VERSIONS}; do \
 		${UV} python install --quiet "$${version}"; \
 		python="$$(${UV} python find "$${version}")"; \
-		echo "$${python} ${UNITTEST}"; \
-		"$${python}" ${UNITTEST}; \
+		echo "$${python} -B ${UNITTEST}"; \
+		"$${python}" -B ${UNITTEST}; \
 	done
 
 # Coverage writes `.coverage`, a `.coverage.*` file per process until `combine` merges them, and
