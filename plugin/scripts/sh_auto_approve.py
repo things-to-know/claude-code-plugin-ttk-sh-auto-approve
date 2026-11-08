@@ -2165,7 +2165,9 @@ def _check_gh(args: list[str]) -> None:
 
 
 # The `gh` subcommands read by `_check_gh_read`, keyed by (group, verb). Each entry is the bare
-# flags, the flags that take a value, and how many positional arguments the verb takes. The
+# flags, the flags that take a value, and how many positional arguments the verb takes. Every
+# bare flag is a pflag bool, which gh also takes as `--flag=true` or `--flag=false`: gh 2.103
+# rejects `--flag=bogus` for each one with a `strconv.ParseBool` error. The
 # lists are `gh <group> <verb> --help` as of gh 2.102, minus what opens a browser (`-w/--web`),
 # blocks (`--watch`, `-i/--interval`, `--fail-fast`), formats with a template (`-t/--template`)
 # or prints terminal escapes (`--allow-escape-sequences`). A flag that is not listed gives
@@ -2314,8 +2316,9 @@ def _check_gh_read(args: list[str], rewritten: list[bool]) -> None:
     walk below reads the filter, and ``_check_gh_jq`` scans the words no walk reads. The hook
     approves only what it can read in full:
 
-    * the flags are the verb's own, each once spelled ``--flag V``, ``--flag=V`` or ``-fV``;
-      a cluster of short options, and a bare ``--`` outside a search query, are not guessed at
+    * the flags are the verb's own, each once spelled ``--flag V``, ``--flag=V`` or ``-fV``,
+      and a bare one also ``--flag=true`` or ``--flag=false``; a cluster of short options, and
+      a bare ``--`` outside a search query, are not guessed at
     * ``-R`` and a repository operand are ``OWNER/REPO``, and a pull request, issue or run is
       a plain reference; a ``HOST/OWNER/REPO`` or a URL would send the token to another host
     * a search query is any number of words, after a ``--`` too
@@ -2351,7 +2354,7 @@ def _check_gh_read(args: list[str], rewritten: list[bool]) -> None:
             continue
         if arg.startswith("--"):
             flag, equals, value = arg.partition("=")
-            if flag in bare and not equals:
+            if flag in bare and (not equals or value in ("true", "false")):
                 continue
             value_at = start if equals else None
         else:

@@ -4947,6 +4947,13 @@ class ApprovesReadOnlyGhSubcommands(Verdicts, unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_allowed(command)
 
+    def test_a_bare_flag_set_on_or_off(self):
+        """Every bare flag is a pflag bool, so `=true` and `=false` are values gh takes."""
+        self.assert_allowed("gh pr view 3 --comments=false")
+        self.assert_allowed("gh run view 1 --log-failed=true")
+        self.assert_allowed("gh search issues --archived=false crash", "gh's own example")
+        self.assert_allowed("gh search prs crash --draft=false --merged=true")
+
     def test_every_spelling_of_a_value(self):
         self.assert_allowed("gh pr list --limit=5 --state=all")
         self.assert_allowed("gh pr list -L5 -sall")
@@ -4979,7 +4986,8 @@ class RefusesGhFlagsThatOpenOrWait(Verdicts, unittest.TestCase):
         self.assert_no_opinion("gh pr view -dc 3", "a cluster is not guessed at")
         self.assert_no_opinion("gh pr view 3 --", "what follows is not a flag")
         self.assert_no_opinion("gh pr list --state", "a value flag with no value")
-        self.assert_no_opinion("gh pr view 3 --comments=false", "a bare flag with a value")
+        self.assert_no_opinion("gh pr view 3 --comments=maybe", "a bool with a value it rejects")
+        self.assert_no_opinion("gh pr view 3 --comments=1", "a value gh takes, not listed")
         self.assert_no_opinion("gh pr view 1 2", "more operands than the verb takes")
 
     def test_w_is_the_workflow_only_where_the_verb_says_so(self):
@@ -5096,7 +5104,7 @@ class ReadsGhSearchQueries(Verdicts, unittest.TestCase):
         self.assert_no_opinion("gh search code crash")
         self.assert_no_opinion("gh search repos crash")
         self.assert_no_opinion("gh search commits crash")
-        self.assert_no_opinion("gh search issues crash --locked=false", "a bare flag with a value")
+        self.assert_no_opinion("gh search issues crash --locked=maybe", "not `true` or `false`")
         self.assert_no_opinion("gh search issues crash --draft", "`--draft` is for `prs` only")
 
 
