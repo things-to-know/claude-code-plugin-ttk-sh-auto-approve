@@ -122,9 +122,12 @@ Five properties this file holds to
    corpus stays confined to relative paths inside a scratch directory whose `HOME` and
    `TMPDIR` are redirected into it, and the payloads are limited to `touch PWNED`, a
    write to `PWNED`, an edit or deletion of the scratch tree's own `AGENTS.md`, and a
-   planted executable inside the same tree. `CorpusIsSafeToExecute` enforces the
-   confinement mechanically -- read it before adding a case, and do not add one it
-   rejects.
+   planted executable inside the same tree. The `git` corpus alone adds a `clean`, a
+   `branch -D` and a `push`, run only in the repository and its bare `origin` that
+   `RefusesUnlistedGitGlobalOptions._repository` builds inside the tree: run from a real
+   checkout, the `push` would reach that checkout's remote. `CorpusIsSafeToExecute`
+   enforces the confinement mechanically -- read it before adding a case, and do not add
+   one it rejects.
 
 5. **Assert the property, not the verdict, where approval is not the point.** In the
    classes marked `@approvals_budgeted`, a case whose approval is not itself a risk does
@@ -432,7 +435,12 @@ def _git_version() -> tuple[int, int]:
     """The major and minor version of the `git` on `PATH`, or `(0, 0)` without one."""
     if not GIT:
         return (0, 0)
-    out = subprocess.run([GIT, "--version"], capture_output=True, text=True, check=False).stdout
+    try:
+        out = subprocess.run(
+            [GIT, "--version"], capture_output=True, text=True, timeout=10, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return (0, 0)
     match = re.search(r"(\d+)\.(\d+)", out)
     return (int(match[1]), int(match[2])) if match else (0, 0)
 
@@ -1105,6 +1113,8 @@ class CorpusIsSafeToExecute(unittest.TestCase):
         yield from ((c, "hygiene") for c in PUNCTUATION_BASH_REJECTS.values())
         yield from ((c, "executed") for c in EXECUTED_ATTACKS)
         yield from ((c, "differential") for c in DifferentialAgainstZsh.ATTACKS)
+        # Run only in the scratch repository `_repository` builds: elsewhere the `push` would
+        # reach a real remote, which no rule of `is_corpus_safe` stops
         yield from ((c, "git") for c, _, _ in RefusesUnlistedGitGlobalOptions.EXECUTED)
         yield from ((c, "git") for c, _ in RefusesUnlistedGitGlobalOptions.APPROVED_AND_EXECUTED)
 
@@ -3982,17 +3992,28 @@ class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
                 "git --attr-source log push origin HEAD:refs/heads/pwned",
                 "git --no-optional-locks log -1",
             ),
+            ("git --attr-source log branch -D victim", "git --no-replace-objects log -1"),
+            ("git --attr-source log -C /etc status", "git --no-pager -C . status"),
             ("git --shallow-file log branch -D victim", "git -p log -1"),
+            (
+                "git --shallow-file log push origin HEAD:refs/heads/pwned",
+                "git --no-lazy-fetch log -1",
+            ),
             ("git --super-prefix log read-tree --empty", "git --literal-pathspecs log -1"),
         ):
             with self.subTest(refused=refused):
                 self.assert_refused_outright(refused, "runs the subcommand after the value")
                 self.assert_allowed(control, "the option before `log` takes no value")
 
-    def test_a_directory_the_read_scope_never_saw(self):
-        """The read scope finds `-C` with the same walk, so it stopped at `log` as well, and
-        git changed to `/etc`, a directory outside the working directories."""
-        self.assert_refused("git --attr-source log -C /etc status", "reads the repository there")
+    def test_the_read_scope_walks_past_a_listed_option(self):
+        """The read scope finds `-C` with the walk `_check_git` uses, past the options it
+        lists. `_check_git` approves this command, so the read scope is what stops it: git
+        would load the config of the repository at `/etc`. Before the walk was shared, the
+        read scope's own stopped at the `log` in `git --attr-source log -C /etc status`, which
+        `test_an_option_that_takes_the_next_word` now refuses before the read scope runs."""
+        with self.assertRaises(hook.NoOpinion) as raised:
+            hook._classify("git --no-pager -C /etc status")
+        self.assertIn("git -C points at", str(raised.exception))
         self.assert_allowed("git --no-pager -C . status", "the walk reaches its -C, in scope")
 
     def test_an_option_the_list_lacks(self):
@@ -4053,8 +4074,9 @@ class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
 
     def test_every_listed_option_stays_approved(self):
         """Spelled out rather than read from `GIT_GLOBAL_FLAGS`, so that a change to the list
-        is a change here too."""
-        for flag in (
+        is a change here too: an option added there that takes a value would hide the
+        subcommand again, and fails the equality below unless this test changes with it."""
+        listed = (
             "-p",
             "--paginate",
             "-P",
@@ -4068,7 +4090,10 @@ class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
             "--glob-pathspecs",
             "--noglob-pathspecs",
             "--icase-pathspecs",
-        ):
+        )
+        self.assertEqual(hook.GIT_GLOBAL_FLAGS, frozenset(listed))
+        self.assertEqual(hook.GIT_VERSION_FLAGS, frozenset({"--version", "-v"}))
+        for flag in listed:
             with self.subTest(flag=flag):
                 self.assert_allowed(f"git {flag} log -1")
                 self.assert_allowed(f"git -C docs {flag} log -1")
