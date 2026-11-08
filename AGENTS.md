@@ -33,8 +33,8 @@ insists on its own filename, symlink to this file rather than copying it.
 - **Threat model:** the hook may run while Claude's context is poisoned. An
   approval for a command that isn't read-only is the failure to avoid.
   - Known gap: a read-only command can still print a secret
-    - The hook approves reading a `.env` file inside the project or an `additionalDirectories`
-      entry, `grep -r` included
+    - The hook approves reading a `.env` file inside the project, an `additionalDirectories`
+      entry or the session's scratchpad, `grep -r` included
     - README § "Secrets inside your project" tells users what still stops it
 - **Shell**:
   - The `Bash` tool runs bash or zsh: the user's `$SHELL` when it is one of them, or the one

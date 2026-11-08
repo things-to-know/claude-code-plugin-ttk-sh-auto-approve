@@ -25,15 +25,31 @@ A [Claude Code](https://code.claude.com/docs) plugin with 2 hooks:
 ## Secrets inside your project
 
 > [!WARNING]
-> The hook approves reads anywhere inside the project and its `additionalDirectories`, and a
-> secret kept there is a file like any other: `cat .env` and `grep -r PASSWORD .` are approved.
-> It refuses a command that names a credential store under your home directory, such as `~/.aws`
-> or `~/.ssh`, but not a project's own `.env` file.
+> The hook approves reads anywhere inside the project, its `additionalDirectories` and the
+> session's scratchpad, and a secret kept there is a file like any other: `cat .env` and
+> `grep -r PASSWORD .` are approved.
 >
-> A native deny rule such as `Read(//**/.env)` in `~/.claude/settings.json` still stops some of
-> these reads: Claude Code applies it even when a hook approves, to the programs its documentation
-> lists (`cat`, `head`, `tail`, `sed` and `tee`). `grep` is not among them. Every entry you add to
-> `additionalDirectories` widens what the hook may read.
+> The hook refuses a command that names a credential store under your home directory, such as
+> `~/.aws` or `~/.ssh`, but refusing only leaves the call to Claude Code. Claude Code runs a
+> built-in set of read-only commands, `cat` and `grep` among them, without a permission prompt in
+> every mode, except as `permissions.blockReadsOutsideWorkingDirectories` changes for paths
+> outside your working directories. So it runs `cat .env` unprompted with or without the hook.
+>
+> What stops these reads is Claude Code's own settings
+> ([permissions](https://code.claude.com/docs/en/permissions)):
+>
+> - A `Read()` deny rule, such as `Read(//**/.env)` in `~/.claude/settings.json`. Claude Code
+>   applies it even when a hook approves: to its own file tools, to the targets of redirections,
+>   and to the file commands it recognizes in Bash, such as `cat`, `head` and `tail`. It doesn't
+>   apply to a command that reads a file without naming it, such as `grep -r PASSWORD .`
+> - `Read(//**/.env)` matches only files named `.env`: `.env.local` and the like need a rule of
+>   their own, such as `Read(//**/.env.*)`
+> - `permissions.blockReadsOutsideWorkingDirectories`, for paths outside your working directories
+>
+> The hook reads `additionalDirectories` only from the project's `.claude/settings.json` and
+> `.claude/settings.local.json`. It drops an entry that is or contains your home directory, or
+> that is, contains or sits inside a credential store; each entry it keeps widens what it may
+> read.
 
 ## Install
 
@@ -45,8 +61,8 @@ To try it for one session from a clone of this repo:
 claude --plugin-dir ./plugin
 ```
 
-If you registered either hook yourself, in a `settings.json`, remove that entry once the plugin
-is enabled: hooks aren't namespaced, so both copies would run.
+If you registered either hook yourself, in a `settings.json` or `settings.local.json`, remove
+that entry once the plugin is enabled: hooks aren't namespaced, so both copies would run.
 
 ## What runs on your machine
 
