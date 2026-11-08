@@ -5640,6 +5640,24 @@ class RefusesGitReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
                     "git -C .. diff --no-index x project/y", "the x inside the read root"
                 )
 
+    def test_a_path_from_a_directory_spelled_from_home(self):
+        """A `-C` directory spelled with `~` is the home directory's, for the paths joined to it
+        too: `git -C ~/project ... ../x` reads the `x` in the home directory, not one in a
+        directory named `~` inside the project."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_home_") as directory:
+            home = Path(os.path.realpath(directory))
+            project = home / "project"
+            project.mkdir()
+            with (
+                unittest.mock.patch.dict(os.environ, {"HOME": str(home)}),
+                unittest.mock.patch.object(hook, "REPO_ROOT", project),
+                unittest.mock.patch.object(hook, "_SESSION_CWD", None),
+            ):
+                self.assert_no_opinion(
+                    "git -C ~/project diff --no-index ../x y", "the x in the home directory"
+                )
+                self.assert_allowed("git -C ~/project diff --no-index x y", "the x in the project")
+
     def test_a_directory_no_path_can_be_joined_to(self):
         """A glob or a substitution as the `-C` directory is refused before the paths are read,
         as a git word the shell finishes (`MatchesTheHostsOwnCaution`,
