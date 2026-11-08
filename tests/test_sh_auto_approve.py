@@ -5001,6 +5001,15 @@ class RefusesGhFlagsThatOpenOrWait(Verdicts, unittest.TestCase):
         self.assert_no_opinion("gh pr view *", "the shell fills in the operands")
         self.assert_no_opinion("gh pr list --head $b")
 
+    def test_a_value_the_shell_rewrites_is_not_read(self):
+        self.assert_allowed("gh pr list --head '~' --search '=ls'", "the control")
+        self.assert_no_opinion("gh pr list --head ~", "both shells make it $HOME")
+        self.assert_no_opinion("gh pr list --search ~+", "both shells make it $PWD")
+        self.assert_no_opinion("gh pr list --search =ls", "zsh makes it the path of ls")
+        self.assert_no_opinion(
+            "gh pr list --search=~+", "neither shell expands it, but any unquoted `~` counts"
+        )
+
     def test_a_rule_can_still_grant_what_was_left_alone(self):
         with operator_rules(allow=["Bash(gh pr view *)"]):
             self.assert_allowed("gh pr view 3 --web")
@@ -5062,6 +5071,16 @@ class ReadsGhSearchQueries(Verdicts, unittest.TestCase):
         self.assert_no_opinion("gh search issues crash*", "the shell fills in the words")
         self.assert_no_opinion('gh search issues -- "$q"', "after the terminator too")
 
+    def test_a_word_the_shell_rewrites_is_not_read(self):
+        """Both shells rewrite an unquoted `~`, and zsh a word that starts with `=`, so the
+        query sent is not the words the hook read: `~+` sends the working directory to GitHub."""
+        self.assert_allowed("gh search issues crash '~+' '~' 'x=~' '=ls'", "the control")
+        self.assert_no_opinion("gh search issues crash ~+", "both shells make it $PWD")
+        self.assert_no_opinion("gh search issues crash ~", "both shells make it $HOME")
+        self.assert_no_opinion("gh search issues crash x=~", "bash makes it x=$HOME")
+        self.assert_no_opinion("gh search issues =ls", "zsh makes it the path of ls")
+        self.assert_no_opinion("gh search issues -- crash ~+", "after the terminator too")
+
     def test_a_repository_filter_is_owner_slash_repo(self):
         """For `gh search`, `-R` filters the query, "in OWNER/REPO format" as its help says, so
         `host/o/r` is a form gh does not document there."""
@@ -5117,6 +5136,52 @@ class RefusesGhJqThatReadsTheEnvironment(Verdicts, unittest.TestCase):
     def test_a_field_named_env_is_not_the_environment(self):
         self.assert_allowed("gh pr list --json number --jq '.[] | .env_name'")
         self.assert_allowed("gh pr list --json number --jq '.[] | \"env\"'")
+
+    def test_a_word_with_a_q_in_it_is_read_as_what_it_is(self):
+        """The flag walk knows where the flags end and which short options take a value, so it
+        reads neither a query word after `--` nor an attached value as `-q`. Each was refused
+        outright, by a scan that read every word starting with one `-` as a cluster of flags."""
+        for command in (
+            "gh search issues -- -label:faq env",
+            "gh search issues -- -label:sql-env",
+            "gh search prs -Hfeat/sql-env",
+            "gh pr list -Hfeat/sql-env",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+        self.assert_refused_outright(
+            "gh search issues --label -- --jq env", "the `--` is the label, so `--jq` is a flag"
+        )
+
+    def test_a_filter_the_shell_builds_is_refused(self):
+        """`--jq "$f"` runs whatever `f` holds, which this module never read, and `jq "$f"` is
+        refused outright for that reason. Each was approved."""
+        self.assert_allowed("gh pr list --json number --jq '.[] | $x'", "the control")
+        for command in (
+            "f='$ENV.GH_TOKEN'; gh pr list --json number --jq \"$f\"",
+            'gh pr list --json number --jq "$f"',
+            'gh pr list --json number --jq="$f"',
+            'gh pr list --json number -q"$f"',
+            "gh pr list --json number --jq $(cat filter.jq)",
+            'gh release view v1 --jq "$f"',
+        ):
+            with self.subTest(command=command):
+                self.assert_refused_outright(command)
+        with operator_rules(allow=["Bash(gh release view *)"]):
+            self.assert_allowed("gh release view v1 --jq '.name'", "the control")
+            self.assert_refused('gh release view v1 --jq "$f"', "the rule says yes")
+
+    def test_a_q_that_is_a_value_does_not_take_the_next_word(self):
+        """`-Sq` is `--search q`, so `"$f"` is an operand: left to the rules, not refused."""
+        self.assert_no_opinion('gh pr list -Sq "$f"')
+
+    def test_where_the_walk_gives_up_the_scan_still_reads(self):
+        """`--web` stops the walk before it reaches the filter, and the scan reads the rest."""
+        self.assert_no_opinion("gh pr view 3 --web --jq '.title'", "the control")
+        self.assert_refused_outright("gh pr view 3 --web --jq '$ENV.GH_TOKEN'")
+        with operator_rules(allow=["Bash(gh pr view *)"]):
+            self.assert_allowed("gh pr view 3 --web --jq '.title'", "the control")
+            self.assert_refused("gh pr view 3 --web --jq '$ENV.GH_TOKEN'", "the rule says yes")
 
 
 # ======================================================================================

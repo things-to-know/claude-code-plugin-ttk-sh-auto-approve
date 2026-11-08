@@ -53,7 +53,8 @@ insists on its own filename, symlink to this file rather than copying it.
     `run list|view`, `issue view|list`, `repo view` and `search issues|prs`
   - It leaves any other subcommand, and a flag the table doesn't list, to the operator's rules
     - Read-only ones too, such as `gh pr status`, `gh repo list` and `gh search code`
-  - A `--jq` that reads the environment is refused, which no rule overturns
+  - A `--jq` that reads the environment, or that the shell rewrites, is refused, which no rule
+    overturns
   - Operators can drop native `Bash(gh ... view|list *)` allow rules for the subcommands the hook
     reads
     - A native rule still approves `--jq '$ENV.GH_TOKEN'`, and only a native deny rule stops that
