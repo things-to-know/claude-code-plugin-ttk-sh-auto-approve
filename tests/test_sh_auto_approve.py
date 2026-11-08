@@ -3221,6 +3221,25 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         self.assert_refused('for f in .*; do cat "$f"; done', "may match ..")
         self.assert_refused('for f in ../*; do cat "$f"; done', "starts outside")
 
+    def test_a_glob_that_climbs_past_its_directory(self):
+        """A globbed path is measured from the directory in front of its wildcard, which holds
+        only while nothing after the wildcard climbs: `*/..` lands above whatever `*` matched,
+        and `.*` or `.?` matches `..` itself in a bash older than 5.2. `.env*` can't: its `e` is
+        no `.`."""
+        up = "/".join([".."] * 12)
+        self.assert_allowed("cat docs/*/a.md", "the control: the glob stays below docs")
+        self.assert_allowed('for f in docs/*/a.md; do cat "$f"; done', "the control, in a loop")
+        self.assert_allowed("cat .env*", "the control: a dot-name that can't be `..`")
+        for command in (
+            f"cat */{up}/etc/os-release",
+            f"cat docs/*/{up}/etc/os-release",
+            "cat " + "/".join([".*"] * 12) + "/etc/os-release",
+            "grep -r x .?",
+            f'for f in */{up}/etc/os-release; do cat "$f"; done',
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command)
+
     def test_a_nul_byte_is_refused_rather_than_crashing(self):
         """Bash ends a string at a NUL, so the hook and bash would read different commands."""
         self.assert_refused("cat AGENTS.md\x00 ~/.aws/credentials", "bash truncates here")

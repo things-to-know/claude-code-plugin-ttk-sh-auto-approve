@@ -1206,6 +1206,75 @@ PATH_COMPONENT = "\x02entry\x02"
 LISTING_BODY = re.compile(r"^\s*ls(?:\s+-1)?(?:\s+[A-Za-z0-9_./-]+)*\s*$")
 
 
+def _glob_may_climb(path: str) -> bool:
+    """Whether a path the shell globs can land above the directory in front of its wildcard.
+
+    The read scope places a globbed path in that directory, which holds only while nothing
+    from the wildcard on climbs out of it. A `..` after the wildcard, as in `*/../../x`, climbs
+    from whatever the wildcard matched. A component that starts with `.` and carries a
+    wildcard, as `.*` and `.?` do, matches `..` itself in a bash older than 5.2, or in one
+    with `globskipdots` off.
+    """
+    special = PATH_SPECIAL.search(path)
+    if special is None:
+        return False
+    start = path.rfind("/", 0, special.start()) + 1
+    return any(
+        component == ".." or _may_match_dot_dot(component) for component in path[start:].split("/")
+    )
+
+
+def _may_match_dot_dot(component: str) -> bool:
+    """Whether a glob component can match `..`: a `.`, then a rest that can be `.` alone.
+
+    `.*`, `.?` and `.[!a]` can; `.env*` can't, as its `e` is no `.`. A bracket expression counts
+    as one that matches `.`, and a value the shell supplies, `$`, `{` or a backtick, as one that
+    may be `.`, both of which err toward a climb.
+    """
+    if not component.startswith("."):
+        return False
+    rest = component[1:]
+    if any(char in rest for char in "${`"):
+        return True
+    positions = {0}  # how much of the one-character "." the pattern has consumed
+    index = 0
+    while index < len(rest) and positions:
+        char = rest[index]
+        close = _bracket_end(rest, index) if char == "[" else -1
+        if char == "*":
+            positions = {0, 1} if 0 in positions else positions
+        elif char == "?" or close >= 0:
+            positions = {1} if 0 in positions else set()
+            index = close if close >= 0 else index
+        else:
+            positions = {1} if char == "." and 0 in positions else set()
+        index += 1
+    return 1 in positions
+
+
+def _bracket_end(text: str, start: int) -> int:
+    """The index of the `]` that closes the bracket expression at `start`, or -1.
+
+    A `]` first in the set, after any `!` or `^`, is a member, and `[:punct:]`, `[=a=]` and
+    `[.a.]` inside it are one member each, whose own `]` closes nothing.
+    """
+    index = start + 1
+    if text[index : index + 1] in ("!", "^"):
+        index += 1
+    if text[index : index + 1] == "]":
+        index += 1
+    while index < len(text):
+        if text[index] == "[" and text[index + 1 : index + 2] in (":", "=", "."):
+            end = text.find(text[index + 1] + "]", index + 2)
+            if end >= 0:
+                index = end + 2
+                continue
+        if text[index] == "]":
+            return index
+        index += 1
+    return -1
+
+
 def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | None:
     """What one `for`-list word contributes to the variable, for the read scope.
 
@@ -1226,8 +1295,12 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
         return None
     if _carries_live_glob(token):
         head = PATH_SPECIAL.split(expanded, 1)[0]
-        directory, _, stem = head.rpartition("/")
-        if stem.startswith(".") or expanded.startswith(("/", "~")) or ".." in directory.split("/"):
+        directory = head.rpartition("/")[0]
+        if (
+            _glob_may_climb(expanded)
+            or expanded.startswith(("/", "~"))
+            or ".." in directory.split("/")
+        ):
             return None
         return [f"{directory}/{PATH_COMPONENT}" if directory else PATH_COMPONENT]
     return [expanded]
@@ -3323,6 +3396,8 @@ def _read_scope_problem(
     for spelled in candidates:
         candidate = _expand_home(spelled, tilde=False)
         if _carries_live_glob(token):
+            if _glob_may_climb(candidate):
+                return f"a glob that may climb out of its directory: {candidate}"
             # The directory the glob runs in: everything up to the last `/` before it.
             head = PATH_SPECIAL.split(candidate, 1)[0]
             candidate = head.rsplit("/", 1)[0] if "/" in head else "."
