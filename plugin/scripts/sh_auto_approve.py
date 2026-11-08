@@ -294,8 +294,9 @@ SCRATCH_DIRECTORY = re.compile(SCRATCH_COMPONENT + "+")
 # Layer A is the boundary, for the readers this module knows: a file operand must resolve
 # inside the project, an `additionalDirectories` entry of the project's settings files
 # (`_read_roots`), or this session's scratch directory. The same roots bound where `git -C`
-# may point. Anything else, and anything the module cannot resolve, is not this module's to
-# approve and falls through to the operator's own rules.
+# may point, and the files a git read subcommand opens (`_git_file_operands`). Anything else,
+# and anything the module cannot resolve, is not this module's to approve and falls through
+# to the operator's own rules.
 # --------------------------------------------------------------------------------------
 
 # Relative to the home directory. Each is a directory or file whose contents are a secret or
@@ -734,6 +735,65 @@ GIT_READ_SUBCOMMANDS = {
     "version",
     "worktree",
 }
+
+# The options of git's read subcommands that open the file they are given, and what each
+# prints of it: `blame --contents` the file, `blame -S` each line, as bad graft data, `blame
+# --ignore-revs-file` its first line, as an invalid object name, and `grep -f` the first line
+# that is not a valid pattern. `ls-files -X` prints none of it, and neither does `-O`, the order
+# file of the subcommands that write a diff, which a FIFO hangs. For each subcommand:
+# - `long`: the long options, whose value is attached after `=` or is the next word. git takes
+#   an unambiguous prefix of one as that option (`blame --cont`)
+# - `exact`: long options that are a prefix of one in `long`, which git reads as themselves:
+#   `ls-files --exclude <pattern>`
+# - `short`: the letter of the short option, whose value is the rest of the word
+#   (`blame -wS<file>`) or the next word
+# - `values`: the letters before which a `short` in the same word is a value, not an option:
+#   each takes the rest of the word as its own value (`grep -e<pattern>`)
+# - `names`: long options whose value is a file name, which git joins to each directory it
+#   reads, from the top of the working tree: `ls-files --exclude-per-directory=.gitignore`
+# `diff` opens every operand too, which `_git_file_operands` reads.
+# `ls-files --exclude-per-directory=../../x` reads `x` two levels above each directory, so a
+# `names` value must be a plain file name: `GIT_FILE_NAME`.
+# The order file has no long option, and git takes it only attached to its letter.
+# `_check_git` refuses a word that starts with `-O`, as `grep`'s runs a program, so here it is
+# read bundled after another letter: `git log -pO<file>`. `-G`, `-I` and `-S` take the rest of
+# the word, so an `O` after them is part of their value; git stops on most other letters
+# before it reads the file, which costs this table no more than a prompt.
+# Checked against git 2.48.1 (`builtin/blame.c`, `builtin/grep.c`, `builtin/ls-files.c`), and
+# the order file by running each subcommand with a FIFO as the file.
+GIT_ORDER_FILE = {"short": "O", "values": "GIS"}
+GIT_FILE_OPTIONS = {
+    "blame": {
+        "long": frozenset({"--contents", "--ignore-revs-file"}),
+        "exact": frozenset({"--ignore-rev"}),
+        "short": "S",
+        "values": "LMC",
+    },
+    "grep": {"short": "f", "values": "eABCmO"},
+    "ls-files": {
+        "long": frozenset({"--exclude-from"}),
+        "exact": frozenset({"--exclude"}),
+        "short": "X",
+        "values": "x",
+        "names": frozenset({"--exclude-per-directory"}),
+    },
+    "diff": GIT_ORDER_FILE,
+    "log": GIT_ORDER_FILE,
+    "show": GIT_ORDER_FILE,
+    "stash": GIT_ORDER_FILE,
+}
+
+# A file name with no directory in it, in characters the shell passes through untouched. `.`
+# and `..` match, and name a directory, which git cannot read as a file.
+GIT_FILE_NAME = re.compile(r"[A-Za-z0-9._-]+")
+
+# `diff`'s short options that take the rest of their word as their value. `-S` and `-G` take the
+# next word when nothing is left: the string or the regex git searches the changes for, which
+# it never opens. An `S` or a `G` after one of these is that one's value, so the next word is an
+# operand again: `-IS <path>`. Checked against git 2.48.1, with a file outside the repository
+# as the next word, after each letter.
+GIT_DIFF_VALUE_LETTERS = frozenset({"-G", "-I", "-O", "-S"})
+GIT_DIFF_SEARCHES = frozenset({"-G", "-S"})
 
 # `git branch` lists unless it is handed a name, which creates a branch, or a flag that
 # deletes, moves, copies, or sets an upstream. So only the listing flags are read, and
@@ -2298,6 +2358,66 @@ def _git_option_is(arg: str, option: str) -> bool:
     )
 
 
+def _git_file_operands(args: list[str], index: int) -> list[tuple[int, int]]:
+    """Where in ``args`` the words are that git's subcommand, at ``index``, opens as files.
+
+    Each entry is as ``_file_operands`` gives it: an index into ``args``, and where the path
+    starts in that word, 0 when the word is all path.
+
+    ``diff`` opens every operand: two paths with ``--no-index``, and without it as well when
+    either is outside the working tree, so a revision such as ``HEAD~1`` is read as a path too,
+    which resolves inside the working directory git runs in. That is every word not starting
+    with ``-``, and every word after the first ``--``: a word an option takes as its value, the
+    ``--`` included, is read as a path at worst. The one value left out is the string or regex
+    of ``-S`` and ``-G`` in the next word, ``GIT_DIFF_SEARCHES``, which git never opens.
+
+    Each subcommand in ``GIT_FILE_OPTIONS``, ``diff`` included, opens the values of its options
+    there. Every word is read for one, the ones after a ``--`` too: an option that takes the next
+    word as its value takes a ``--`` as well, and git goes on reading options after it. Raises
+    ``NoOpinion`` for a value of a ``names`` option that ``GIT_FILE_NAME`` does not match.
+    """
+    subcommand = args[index]
+    found: list[tuple[int, int]] = []
+    if subcommand == "diff":
+        after_terminator = False
+        searched = False
+        for position in range(index + 1, len(args)):
+            arg = args[position]
+            if searched:
+                searched = False
+                continue
+            if after_terminator or not arg.startswith("-"):
+                found.append((position, 0))
+            elif not arg.startswith("--") and arg != "-":
+                flag, start = _short_flag(arg, GIT_DIFF_VALUE_LETTERS, bundles=True)
+                searched = flag in GIT_DIFF_SEARCHES and not start
+            after_terminator = after_terminator or arg == "--"
+    spec = GIT_FILE_OPTIONS.get(subcommand)
+    if spec is None:
+        return found
+    short = spec.get("short", "")
+    letters = {f"-{letter}" for letter in short + spec.get("values", "")}
+    for position in range(index + 1, len(args)):
+        arg = args[position]
+        if arg.startswith("--"):
+            name, equals, _ = arg.partition("=")
+            if name in spec.get("exact", ()):
+                continue
+            value = (position, len(name) + 1) if equals else (position + 1, 0)
+            if any(_git_option_is(name, option) for option in spec.get("long", ())):
+                found.append(value)
+            elif any(_git_option_is(name, option) for option in spec.get("names", ())):
+                at, start = value
+                file_name = args[at][start:] if at < len(args) else ""
+                if not GIT_FILE_NAME.fullmatch(file_name) or SUBSTITUTION_MARKER in file_name:
+                    raise NoOpinion(f"git {subcommand} {name} given other than a file name")
+        elif arg.startswith("-") and arg != "-":
+            flag, start = _short_flag(arg, letters, bundles=True)
+            if flag == f"-{short}":
+                found.append((position, start) if start else (position + 1, 0))
+    return [(position, start) for position, start in dict.fromkeys(found) if position < len(args)]
+
+
 def _check_aws(args: list[str]) -> None:
     """Validate ``aws`` calls, accounting for global options and positional verbs."""
     # The usual way to record which CLI ran: it prints the version and exits before reading
@@ -3282,6 +3402,14 @@ def _check_command(
             problem = _read_scope_problem(arg_tokens[position], args[position], parts, scope)
             if problem is not None:
                 raise NoOpinion(f"git -C points at {problem}")
+        # Layer A, below, for the files git opens, which it resolves from the `-C` directory
+        found = _git_file_operands(args, index)
+        if found and scope is not None:
+            files_scope = scope
+            if directories:
+                token = arg_tokens[directories[0]]
+                files_scope = _directory_scope(token, parts, known_values, scope)
+            _check_read_scope(f"git {args[index]}", found, args, arg_tokens, parts, files_scope)
         directory = args[directories[0]] if directories else None
         _check_git_remote_reach(args[index:], directory, scope)
 
@@ -3294,17 +3422,64 @@ def _check_command(
     # Outside them, or unresolvable, is not a verdict this module can give; the operator's
     # own allow rules decide, as they do for any program the module cannot read.
     if program in READER_SPECS:
-        for index, start in _file_operands(program, args):
-            token, text = arg_tokens[index], args[index]
-            if start:
-                # A path attached to its flag: the flag must be written out, so that the token
-                # can be cut where the text is. `'--from-file=/x'` quotes both together.
-                if token[:start] != text[:start]:
-                    raise NoOpinion(f"{program} given a file flag it cannot split: {text}")
-                token, text = token[start:], text[start:]
-            problem = _read_scope_problem(token, text, parts, scope)
-            if problem is not None:
-                raise NoOpinion(f"{program} reads {problem}")
+        _check_read_scope(program, _file_operands(program, args), args, arg_tokens, parts, scope)
+
+
+def _check_read_scope(
+    reader: str,
+    found: list[tuple[int, int]],
+    args: list[str],
+    arg_tokens: list[str],
+    parts: list[tuple[str, str]],
+    scope: _ReadScope,
+) -> None:
+    """Raise ``NoOpinion`` unless each file ``reader`` opens is in ``scope``.
+
+    ``found`` is where in ``args`` those files are, as ``_file_operands`` gives it, and
+    ``arg_tokens`` the reduced words ``args`` were expanded from.
+    """
+    for index, start in found:
+        token, text = arg_tokens[index], args[index]
+        if start:
+            # A path attached to its flag: the flag must be written out, so that the token
+            # can be cut where the text is. `'--from-file=/x'` quotes both together.
+            if token[:start] != text[:start]:
+                raise NoOpinion(f"{reader} given a file flag it cannot split: {text}")
+            token, text = token[start:], text[start:]
+        problem = _read_scope_problem(token, text, parts, scope)
+        if problem is not None:
+            raise NoOpinion(f"{reader} reads {problem}")
+
+
+def _directory_scope(
+    token: str,
+    parts: list[tuple[str, str]],
+    values: dict[str, list[str] | None],
+    scope: _ReadScope,
+) -> _ReadScope:
+    """``scope``, with the directory ``token`` names, from each base, as the bases.
+
+    For the paths a program resolves from a directory it changes to, as ``git -C`` does:
+    ``git -C sub diff --no-index ../x y`` reads the ``x`` beside ``sub``. The directory is read
+    as the credential check reads a program's directory: `_directory_word`, then
+    `_changed_directories`, with ``values`` as `_known_values` reads them.
+
+    Raises ``NoOpinion`` for a directory below `UNREAD_VALUE`, where no path can be placed: a
+    glob or a substitution, which ``_check_command`` has already refused in its place, and a
+    variable, which may still hold the value the shell had before.
+    """
+    bases = _changed_directories(_directory_word(token, parts), values, scope.bases)
+    if any(UNREAD_VALUE in base for base in bases):
+        raise NoOpinion(
+            f"a path relative to a directory this module cannot resolve: {_expand(token, parts)}"
+        )
+    return _ReadScope(
+        scope.roots,
+        bases,
+        scope.splice_vars,
+        scope.loop_values,
+        spells_escape=scope.spells_escape,
+    )
 
 
 class _GlobRule:
@@ -3715,11 +3890,34 @@ def _program_directories(tokens: list[str], parts: list[tuple[str, str]]) -> lis
         elif word.startswith("-C") and word != "-C":
             directories.append(word[2:])
         elif word in DIRECTORY_OPTIONS and following and not set(following[0]) <= PUNCTUATION_CHARS:
-            value = _expand(following[0], parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
-            if _carries_live_glob(following[0]):
-                value = UNREAD_VALUE
-            directories.append(os.path.expanduser(value) if following[0][0] == "~" else value)
+            directories.append(_directory_word(following[0], parts))
     return directories
+
+
+def _directory_word(token: str, parts: list[tuple[str, str]]) -> str:
+    """The directory ``token``, a word of its own, names for a program that changes to it.
+
+    A command's output, and a wildcard the shell expands, which picks the directory, are
+    `UNREAD_VALUE`. A leading `~` is the home directory. A variable stays as spelled, for
+    `_spellings`.
+    """
+    if _carries_live_glob(token):
+        return UNREAD_VALUE
+    text = _expand(token, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
+    return os.path.expanduser(text) if token.startswith("~") else text
+
+
+def _changed_directories(
+    directory: str, values: dict[str, list[str] | None], bases: list[str]
+) -> list[str]:
+    """Each directory a program that changes to ``directory`` may run in, from each of ``bases``.
+
+    ``directory`` is read as each of its `_spellings`, as a `cd` target is, so one the shell
+    supplies gives a directory below `UNREAD_VALUE`.
+    """
+    return [
+        _joined(base, spelled) for spelled in _spellings(directory, values, bases) for base in bases
+    ]
 
 
 # The most spellings of a word the credential check reads; past it, the variables still in it
@@ -3866,8 +4064,7 @@ def _refuse_credential_paths(
     bases = list(state.shell_bases)
     for tokens in lines:
         for directory in _program_directories(tokens, parts):
-            for spelled in _spellings(directory, state.values, state.shell_bases):
-                bases += [_joined(base, spelled) for base in state.shell_bases]
+            bases += _changed_directories(directory, state.values, state.shell_bases)
     bases = list(dict.fromkeys(bases))
     if len(bases) > MAX_WORKING_DIRECTORIES:
         raise NotReadOnly("more working directories than this module reads, with each -C")
