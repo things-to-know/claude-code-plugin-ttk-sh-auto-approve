@@ -43,8 +43,8 @@ from a command that prompted in a real session.
      3  The suite checking itself
           SuiteIntegrity, CorpusIsSafeToExecute
      4  Baseline verdicts
-          ApprovesReadOnly, ReadsTheRemotesARepositoryConfigures, ReadsAGitConfigAsGitDoes,
-          RefusesAnythingElse, RefusalIsMonotonicUnderComposition, MatchesTheHostsOwnCaution
+          ApprovesReadOnly, ReadsTheRemotesARepositoryConfigures, RefusesAnythingElse,
+          RefusalIsMonotonicUnderComposition, MatchesTheHostsOwnCaution
      5  Commands observed prompting in real sessions
           ObservedCommandsStayApproved, AllowsALoopVariableBoundToLiterals,
           SplicesFlagsFromALiteralAssignment, AllowsACopyIntoTheScratchDirectory,
@@ -613,12 +613,14 @@ def git_directory_at(path: Path, config: str | None = None) -> Path:
 
 
 @contextlib.contextmanager
-def remotes_configured(config: str, *, worktree: bool = False):
-    """Point the module at a repository whose `.git/config` is `config`. With `worktree`, the
-    project is a linked worktree, whose `.git` file and `commondir` lead to that config.
+def remotes_configured(config: str, *, worktree: bool = False, global_config: str = ""):
+    """Point the module at a repository whose `.git/config` is `config`, on branch `main`. With
+    `worktree`, the project is a linked worktree, whose `.git` file and `commondir` lead to that
+    config. `global_config` is the user's `~/.gitconfig`.
 
-    Every `GIT_` variable is unset for the duration: some move the repository git finds or add
-    to its config, so the environment the suite runs in would otherwise decide the verdict."""
+    The module asks git, which reads the environment, so the environment is the test's own for
+    the duration: `HOME` and `XDG_CONFIG_HOME` in the scratch directory, no system config, and
+    every other `GIT_` variable unset."""
     root = Path(tempfile.mkdtemp(prefix="readonly_hook_remotes_"))
     try:
         project = root / "main"
@@ -626,11 +628,12 @@ def remotes_configured(config: str, *, worktree: bool = False):
         if worktree:
             linked = common / "worktrees" / "w"
             linked.mkdir(parents=True)
-            (linked / "HEAD").write_text("ref: refs/heads/w\n")
+            (linked / "HEAD").write_text("ref: refs/heads/main\n")
             (linked / "commondir").write_text("../..\n")
             project = root / "w"
             project.mkdir()
             (project / ".git").write_text(f"gitdir: {linked}\n")
+        (root / ".gitconfig").write_text(global_config)
         with (
             unittest.mock.patch.dict(os.environ),
             unittest.mock.patch.object(hook, "REPO_ROOT", project),
@@ -638,6 +641,9 @@ def remotes_configured(config: str, *, worktree: bool = False):
         ):
             for name in [name for name in os.environ if name.startswith("GIT_")]:
                 del os.environ[name]
+            os.environ.update(
+                {"HOME": str(root), "XDG_CONFIG_HOME": str(root), "GIT_CONFIG_NOSYSTEM": "1"}
+            )
             yield project
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -1300,25 +1306,36 @@ class ApprovesReadOnly(Verdicts, unittest.TestCase):
         )
 
 
+@unittest.skipUnless(GIT, "needs git on PATH")
 class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
     """`git non-read subcommand: ls-remote`, and `remote show`. Both contact a remote, and git
-    reads a name it finds no URL for as a path to another repository, as it does a URL in the
-    config that is one. So a name is read only when the repository git finds, its config read
-    as git reads it, gives that name a network URL. Each refusal sits beside its control, under
-    the same config."""
+    reads a name it has no URL for as a path to another repository, as it does a URL in the
+    config that is one. So a remote is read only when `git ls-remote --get-url`, asked from
+    where the command runs, prints a network URL for it. Each refusal sits beside its control,
+    under the same config."""
 
     ORIGIN = '[remote "origin"]\n\turl = https://example.com/x.git\n'
+    # A second remote, on this machine: what `origin` is the control for
+    BACKUP = '[remote "backup"]\n\turl = /mnt/backup/x.git\n'
 
     def test_a_configured_remote(self):
         with remotes_configured(self.ORIGIN):
             self.assert_allowed("git ls-remote --heads origin", "lists the remote's branches")
             self.assert_allowed("git ls-remote origin refs/heads/main", "a ref pattern")
-            self.assert_allowed("git ls-remote --get-url origin", "prints the URL")
             self.assert_allowed("git ls-remote --sort=-version:refname -t origin", "sorted tags")
             self.assert_allowed("git ls-remote", "the default remote")
             self.assert_allowed("git remote show origin", "contacts origin")
-            self.assert_allowed("git remote show -n origin", "reads the config only")
-            self.assert_allowed("git ls-remote origin; git remote show origin", "read once")
+
+    def test_git_is_asked_once_per_command(self):
+        """Once for the URL and once for the `vcs` lookup, however many calls name the remote."""
+        with (
+            remotes_configured(self.ORIGIN),
+            unittest.mock.patch.object(
+                hook, "_run_git_uncached", wraps=hook._run_git_uncached
+            ) as run,
+        ):
+            self.assert_allowed("git ls-remote origin; git remote show origin", "the control")
+        self.assertEqual(2, run.call_count)
 
     def test_a_name_no_remote_has_is_a_path(self):
         with remotes_configured(self.ORIGIN):
@@ -1327,17 +1344,36 @@ class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
             self.assert_refused("git remote show other", "the same")
             self.assert_refused("git remote show origin other", "one of the 2 is a path")
 
+    def test_a_remote_with_no_url_is_a_path(self):
+        """git counts a remote as configured by its URL, not by its section."""
+        with remotes_configured(
+            self.ORIGIN + '[remote "up"]\n\tfetch = +refs/heads/*:refs/remotes/up/*\n'
+        ):
+            self.assert_allowed("git ls-remote origin", "the control")
+            self.assert_refused("git ls-remote up", "runs git-upload-pack on ./up")
+            self.assert_refused("git remote show up", "the same")
+
+    def test_a_header_inside_a_value(self):
+        r"""A value goes on past a line that ends in `\`, so this `[remote "evil"]` is part of
+        origin's URL, and `evil` names no remote."""
+        continued = '[remote "origin"]\n\turl = https://example.com/x \\\n[remote "evil"]\n'
+        with remotes_configured(continued):
+            self.assert_allowed("git ls-remote origin", "the control")
+            self.assert_refused("git ls-remote evil", "a path, as git reads it")
+
     def test_a_linked_worktree_reads_the_shared_config(self):
         with remotes_configured(self.ORIGIN, worktree=True):
             self.assert_allowed("git ls-remote origin", "configured in the common directory")
             self.assert_refused("git ls-remote other", "configured nowhere")
 
-    def test_a_config_that_includes_another_file(self):
-        """An include could configure the name, or not: the module does not follow it."""
-        with remotes_configured(self.ORIGIN):
-            self.assert_allowed("git ls-remote origin", "the control")
-        with remotes_configured(self.ORIGIN + "[include]\n\tpath = more.config\n"):
-            self.assert_refused("git ls-remote origin", "the config is not read whole")
+    def test_an_include_is_followed(self):
+        """git follows `[include]`, and so does the URL it prints."""
+        included = '[remote "inc"]\n\turl = https://example.com/inc.git\n'
+        included += '[remote "bad"]\n\turl = ../x\n'
+        with remotes_configured(self.ORIGIN + "[include]\n\tpath = more.config\n") as project:
+            (project / ".git" / "more.config").write_text(included)
+            self.assert_allowed("git ls-remote inc", "configured in the included file")
+            self.assert_refused("git ls-remote bad", "a path, configured there")
 
     def test_what_is_not_a_remote_name(self):
         """A URL or a path makes the host the caller's choice, `ext::` runs a command, and
@@ -1352,42 +1388,6 @@ class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
             self.assert_refused("git ls-remote --server-option=x origin", "sends text out")
             self.assert_refused("git remote show https://example.com/x", "a URL")
             self.assert_refused("git remote show --bogus origin", "an unknown flag")
-
-    def test_a_remote_with_no_url_is_a_path(self):
-        """git counts a remote as configured by its URL, not by its section, and from 2.46 an
-        empty `url` empties the list."""
-        config = (
-            self.ORIGIN
-            + '[remote "up"]\n\tfetch = +refs/heads/*:refs/remotes/up/*\n'
-            + '[remote "gone"]\n\turl = https://example.com/gone.git\n\turl =\n'
-        )
-        with remotes_configured(config):
-            self.assert_allowed("git ls-remote origin", "the control")
-            self.assert_refused("git ls-remote up", "runs git-upload-pack on ./up")
-            self.assert_refused("git remote show up", "the same")
-            self.assert_refused("git ls-remote gone", "its one URL was reset")
-        with remotes_configured(self.ORIGIN + '[remote "o"]\n\turl\n'):
-            self.assert_refused("git ls-remote origin", "a url with no value, which git refuses")
-
-    def test_the_config_is_read_as_git_reads_it(self):
-        r"""By character, not by line: a value goes on past a line that ends in `\`, a header
-        can follow another on its line, and the older `[section.subsection]` is lowercased."""
-        continued = '[remote "origin"]\n\turl = https://example.com/x \\\n[remote "evil"]\n'
-        with remotes_configured(continued):
-            self.assert_allowed("git ls-remote origin", "the control")
-            self.assert_refused("git ls-remote evil", "a header inside origin's URL")
-        with remotes_configured('# [remote "evil"]\n' + self.ORIGIN):
-            self.assert_allowed("git ls-remote origin", "the control")
-            self.assert_refused("git ls-remote evil", "a header inside a comment")
-        with remotes_configured('[core] [remote "two"]\n\turl = https://example.com/2.git\n'):
-            self.assert_allowed("git ls-remote two", "a second header on the line")
-        with remotes_configured("[core] [include]\n\tpath = more.config\n" + self.ORIGIN):
-            self.assert_refused("git ls-remote origin", "an include after another header")
-        with remotes_configured("[remote.Origin]\n\turl = https://example.com/x.git\n"):
-            self.assert_allowed("git ls-remote origin", "git lowercases the older spelling")
-            self.assert_refused("git ls-remote Origin", "which leaves no remote Origin")
-        with remotes_configured(self.ORIGIN + "\tpushurl = a\\q\n"):
-            self.assert_refused("git ls-remote origin", "an escape git refuses the file for")
 
     def test_a_url_that_is_not_on_the_network(self):
         """A path or `file://` opens a repository on this machine, and `<helper>::`, another
@@ -1406,7 +1406,6 @@ class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
             "url = file:///srv/x.git",
             "url = ext::sh -c touch% x",
             "url = codecommit://repo",
-            "url = https://example.com/x.git\n\tvcs = foo",
         ):
             with (
                 self.subTest(remote=remote),
@@ -1416,148 +1415,150 @@ class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
                 self.assert_refused("git ls-remote o", "not a network URL")
                 self.assert_refused("git remote show o", "the same")
 
+    def test_a_remote_a_program_fetches(self):
+        """`vcs` hands a remote to `git-remote-<vcs>`, whatever its URL. Which remote a command
+        reads by default is not known, so any `vcs` at all is no opinion."""
+        with remotes_configured(self.ORIGIN):
+            self.assert_allowed("git ls-remote origin", "the control")
+        vcs = '[remote "o"]\n\turl = https://example.com/o.git\n\tvcs = foo\n'
+        with remotes_configured(self.ORIGIN + vcs):
+            self.assert_refused("git ls-remote o", "runs git-remote-foo")
+            self.assert_refused("git ls-remote origin", "any vcs at all")
+
     def test_an_insteadof_that_rewrites_a_url(self):
-        """`url.<base>.insteadOf` reads `origin`'s URL with `<base>` in its place, from the
-        config file or from `GIT_CONFIG_COUNT`."""
-        rewrite = '[url "{base}"]\n\tinsteadOf = https://example.com/\n'
-        with remotes_configured(self.ORIGIN + rewrite.format(base="https://mirror.test/")):
-            self.assert_allowed("git ls-remote origin", "rewritten to another host")
-        with remotes_configured(self.ORIGIN + rewrite.format(base="/srv/mirror/")):
+        """`url.<base>.insteadOf` reads a URL with `<base>` in its place, from the repository's
+        config, the user's, or `GIT_CONFIG_COUNT`."""
+        other = '[remote "other"]\n\turl = https://other.test/x.git\n'
+        rewrite = '[url "/srv/mirror/"]\n\tinsteadOf = https://example.com/\n'
+        with remotes_configured(self.ORIGIN + other + rewrite):
+            self.assert_allowed("git ls-remote other", "the control: no rewrite applies")
             self.assert_refused("git ls-remote origin", "rewritten to a path")
-        for base, approved in (("https://mirror.test/", True), ("/srv/mirror/", False)):
-            environment = {
-                "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": f"url.{base}.insteadOf",
-                "GIT_CONFIG_VALUE_0": "https://example.com/",
-            }
-            with (
-                self.subTest(base=base),
-                remotes_configured(self.ORIGIN),
-                unittest.mock.patch.dict(os.environ, environment),
-            ):
-                (self.assert_allowed if approved else self.assert_refused)("git ls-remote origin")
+        with remotes_configured(self.ORIGIN + other, global_config=rewrite):
+            self.assert_allowed("git ls-remote other", "the control")
+            self.assert_refused("git ls-remote origin", "rewritten by the user's config")
+        environment = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "url./srv/mirror/.insteadOf",
+            "GIT_CONFIG_VALUE_0": "https://example.com/",
+        }
         with (
-            remotes_configured(self.ORIGIN),
-            unittest.mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1"}),
+            remotes_configured(self.ORIGIN + other),
+            unittest.mock.patch.dict(os.environ, environment),
         ):
-            self.assert_refused("git ls-remote origin", "a count with no key: git refuses it")
-        with (
-            remotes_configured(self.ORIGIN),
-            unittest.mock.patch.dict(
-                os.environ,
-                {
-                    "GIT_CONFIG_COUNT": "1",
-                    "GIT_CONFIG_KEY_0": "nosection",
-                    "GIT_CONFIG_VALUE_0": "x",
-                },
-            ),
-        ):
-            self.assert_refused("git ls-remote origin", "a key with no section: git refuses it")
+            self.assert_allowed("git ls-remote other", "the control")
+            self.assert_refused("git ls-remote origin", "rewritten by GIT_CONFIG_COUNT")
 
     def test_the_remote_an_ls_remote_given_none_reads(self):
         """The current branch's `branch.<name>.remote`, which may be a path, or `.`, the
         repository itself; without one, the only remote, or `origin`."""
-        branches = '[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n'
-        branches += '[branch "local"]\n\tremote = .\n'
-        with remotes_configured(self.ORIGIN + branches):
-            self.assert_allowed("git ls-remote", "origin, or the repository itself")
         with remotes_configured(self.ORIGIN + '[branch "main"]\n\tremote = ../evil\n'):
             self.assert_allowed("git ls-remote origin", "the control")
             self.assert_refused("git ls-remote", "runs git-upload-pack on ../evil")
-        with remotes_configured('[remote "only"]\n\turl = https://example.com/x.git\n'):
-            self.assert_allowed("git ls-remote", "the only remote")
+        with remotes_configured(self.ORIGIN + '[branch "other"]\n\tremote = ../evil\n'):
+            self.assert_allowed("git ls-remote", "origin: other is not the current branch")
+        with remotes_configured(self.ORIGIN + '[branch "main"]\n\tremote = .\n'):
+            self.assert_allowed("git ls-remote", "the repository itself")
+        with remotes_configured(self.ORIGIN + self.BACKUP):
+            self.assert_allowed("git ls-remote", "origin, of the two")
+            self.assert_refused("git ls-remote backup", "a path")
         with remotes_configured('[remote "only"]\n\turl = ../x\n'):
+            self.assert_allowed("git ls-remote --get-url", "the control: contacts nothing")
             self.assert_refused("git ls-remote", "the only remote, which is a path")
 
+    def test_the_forms_that_contact_nothing(self):
+        """`remote show -n` and `ls-remote --get-url` print config, and `remote show` given no
+        name lists. `ls-remote` reads options before its first operand only, so a `--get-url`
+        after it is a ref pattern and the remote is contacted."""
+        with remotes_configured(self.ORIGIN + self.BACKUP):
+            self.assert_allowed("git remote show -n backup", "reads the config only")
+            self.assert_allowed("git remote show backup -n", "an option anywhere")
+            self.assert_allowed("git ls-remote --get-url backup", "prints the URL")
+            self.assert_allowed("git remote show", "lists the remotes")
+            self.assert_refused("git remote show backup", "contacts the path")
+            self.assert_refused("git ls-remote backup --get-url", "a pattern: contacts it")
+
     def test_the_repository_git_finds(self):
-        """Where git would look further than this module, or decline the repository it finds,
-        there is no opinion: a bare repository, a `.git` that is not one, a filesystem
-        boundary, another owner, or a variable that moves the repository."""
+        """Where git finds another repository, or declines the one it finds, the name it is
+        given names no remote: a bare repository, another owner, or a variable that moves the
+        repository. A `.git` that is not a repository is passed over, as git passes over it."""
         with remotes_configured(self.ORIGIN) as project:
             git_directory_at(project / "sub.git", "[core]\n\tbare = true\n")
             (project / "vendor" / ".git").mkdir(parents=True)
             (project / "module").mkdir()
             (project / "module" / ".git").write_text("not a gitdir line\n")
-            (project / "mount").mkdir()
             self.assert_allowed("git ls-remote origin", "the control")
-            self.assert_allowed("git -C mount ls-remote origin", "the same repository")
+            self.assert_allowed("git -C vendor ls-remote origin", "git looks past it")
             self.assert_refused("git -C sub.git ls-remote origin", "a bare repository")
             self.assert_refused("cd sub.git && git ls-remote origin", "the same, by cd")
-            self.assert_refused("git -C vendor ls-remote origin", "git looks past it")
             self.assert_refused("git -C module ls-remote origin", "a .git git refuses")
-            nested = git_directory_at(project / "nested" / ".git", self.ORIGIN)
-            for head, approved in (
-                ("refs/heads/main", True),
-                ("../elsewhere", False),
-                ("0" * 40 + "\n", True),
-                ("not a ref\n", False),
+            for variable, value in (
+                ("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1"),
+                ("GIT_DIR", str(project / "sub.git")),
+                ("GIT_OBJECT_DIRECTORY", "/nonexistent"),
             ):
-                with self.subTest(head=head):
-                    (nested / "HEAD").unlink()
-                    if head.endswith("\n"):
-                        (nested / "HEAD").write_text(head)
-                    else:
-                        (nested / "HEAD").symlink_to(head)
-                    verdict = self.assert_allowed if approved else self.assert_refused
-                    verdict("git -C nested ls-remote origin", "a HEAD git takes, or not")
-            mount = Path(os.path.realpath(project / "mount"))
-            with unittest.mock.patch.object(
-                hook, "_device_of", side_effect=lambda path: 2 if path == mount else 1
-            ):
-                self.assert_allowed("git ls-remote origin", "the control")
-                self.assert_refused("git -C mount ls-remote origin", "git stops at a mount")
-            with unittest.mock.patch.object(hook.os, "geteuid", return_value=os.geteuid() + 1):
-                self.assert_refused("git ls-remote origin", "safe.directory")
-            with unittest.mock.patch.dict(os.environ, {"GIT_DIR": str(project / "sub.git")}):
-                self.assert_refused("git ls-remote origin", "GIT_DIR names another")
+                with (
+                    self.subTest(variable=variable),
+                    unittest.mock.patch.dict(os.environ, {variable: value}),
+                ):
+                    self.assert_refused("git ls-remote origin", "git finds no remote origin")
             with (
                 tempfile.TemporaryDirectory() as directory,
                 unittest.mock.patch.object(hook, "REPO_ROOT", Path(directory)),
             ):
                 self.assert_refused("git ls-remote origin", "no repository at all")
             (project / ".git" / "config").write_bytes(b"\xff")
-            self.assert_refused("git ls-remote origin", "a config that is not text")
+            self.assert_refused("git ls-remote origin", "a config git refuses")
 
-    def test_a_worktree_config_counts_when_its_extension_is_on(self):
-        """`config.worktree` is read after the repository's config, from the worktree's own
-        git directory, and only with `extensions.worktreeConfig` on: git ignores it otherwise."""
-        remote = '[remote "wt"]\n\turl = https://example.com/wt.git\n'
-        for extension, read in (
-            ("\tworktreeConfig\n", True),
-            ("\tworktreeConfig = 1\n", True),
-            ("\tworktreeConfig = off\n", False),
-            ("", False),
+    def test_a_directory_outside_the_read_roots_is_not_asked(self):
+        """git runs what a repository's config names, so it is asked only where the read
+        scope allows `-C`, which is checked first."""
+        with (
+            remotes_configured(self.ORIGIN),
+            unittest.mock.patch.object(
+                hook, "_run_git_uncached", wraps=hook._run_git_uncached
+            ) as run,
         ):
-            for worktree in (False, True):
-                config = "[core]\n\trepositoryformatversion = 1\n[extensions]\n" + extension
-                with (
-                    self.subTest(extension=extension, worktree=worktree),
-                    remotes_configured(config + self.ORIGIN, worktree=worktree) as project,
-                ):
-                    gitdir = (
-                        project.parent / "main" / ".git" / "worktrees" / "w"
-                        if worktree
-                        else project / ".git"
-                    )
-                    (gitdir / "config.worktree").write_text(remote)
-                    self.assert_allowed("git ls-remote origin", "the control")
-                    verdict = self.assert_allowed if read else self.assert_refused
-                    verdict("git ls-remote wt", "configured in config.worktree")
-        for extension, worktree_config in (
-            ("maybe", remote),
-            ("true", "[include]\n\tpath = more.config\n"),
-        ):
-            config = f"[extensions]\n\tworktreeConfig = {extension}\n" + self.ORIGIN
-            with self.subTest(extension=extension), remotes_configured(config) as project:
-                (project / ".git" / "config.worktree").write_text(worktree_config)
-                self.assert_refused("git ls-remote origin", "not read whole")
+            self.assert_allowed("git -C . ls-remote origin", "the control")
+            self.assertTrue(run.called)
+            run.reset_mock()
+            self.assert_refused("git -C /etc ls-remote origin", "outside the read roots")
+            run.assert_not_called()
+
+    def test_where_git_cannot_answer(self):
+        """No `git` on `PATH`, a relative one, one that does not finish, output that is not one
+        line of text, and a `vcs` lookup that fails: each is no opinion."""
+        real_run = subprocess.run
+
+        def answering(stdout: bytes, returncode: int = 0, subcommand: str = "ls-remote"):
+            def run(command, **kwargs):
+                if subcommand in command:
+                    return subprocess.CompletedProcess(command, returncode, stdout, b"")
+                return real_run(command, **kwargs)
+
+            return run
+
+        with remotes_configured(self.ORIGIN):
+            self.assert_allowed("git ls-remote origin", "the control")
+            for patch in (
+                unittest.mock.patch("shutil.which", return_value=None),
+                unittest.mock.patch("shutil.which", return_value="git"),
+                unittest.mock.patch(
+                    "subprocess.run", side_effect=subprocess.TimeoutExpired("git", 5.0)
+                ),
+                unittest.mock.patch("subprocess.run", side_effect=answering(b"\xff\n")),
+                unittest.mock.patch("subprocess.run", side_effect=answering(b"a\nb\n")),
+                unittest.mock.patch(
+                    "subprocess.run", side_effect=answering(b"", 3, subcommand="config")
+                ),
+            ):
+                with self.subTest(patch=patch), patch:
+                    self.assert_refused("git ls-remote origin", "git gave no answer to use")
 
     def test_what_the_module_cannot_see_is_the_operators_to_grant(self):
-        """A remote may be configured where the module does not read, so a name it does not
-        find has no opinion, which an operator's rule can grant. A URL in the command is a
-        finding, which no rule overturns."""
+        """A name git prints back is no opinion, which an operator's rule can grant. A URL in
+        the command is a finding, which no rule overturns."""
         with remotes_configured(self.ORIGIN):
-            self.assert_refused("git ls-remote fork", "configured in the global config, perhaps")
+            self.assert_refused("git ls-remote fork", "a path, unless the operator says")
             with operator_rules(allow=["Bash(git ls-remote *)"]):
                 self.assert_allowed("git ls-remote fork", "granted by the rule")
                 self.assert_refused("git ls-remote https://example.com/x", "not overturned")
@@ -1570,94 +1571,6 @@ class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
             self.assertIsNone(hook._check_command(["git", "log"], []))
             with self.assertRaises(hook.NoOpinion):
                 hook._check_command(["git", "ls-remote", "origin"], [])
-
-
-@unittest.skipUnless(GIT, "needs git on PATH")
-class ReadsAGitConfigAsGitDoes(unittest.TestCase):
-    """`_git_config_entries` reads git's config grammar a second time, so it is held to git's
-    own reading: each file goes to `git config --file <file> --list`, and the module must list
-    the same entries, or refuse the file where git does. The cases are the grammar's edges."""
-
-    AGREED = (
-        "[core]\n\tbare = false\n",
-        '[core] [remote "two"]\n\turl = https://example.com/2.git\n',
-        "[remote.Origin]\n\turl = x\n",
-        '[remote "a\\"b\\\\c"]\n\turl = x\n',
-        '[remote "x"]\n\turl = a \\\n[remote "evil"]\n',
-        '[remote "x"]\n\turl = "a ; b" ; a comment\n\tfetch = a#b\n',
-        '[remote "x"]\n\turl = a\\tb\\nc\\"d\\\\e\n',
-        '[remote "x"]\n\tmirror\n\turl =\n\tpushurl =   spaced  out   \n',
-        '[remote "x"]\n\turl = " quoted space "\n',
-        "# a comment\n; another\n[a]\nb=c\n[a]b = d\n",
-        "\ufeff[a]\nb = c\n",
-        "[a]\r\nb = c\r\n",
-        "[a]\n\tb = c",
-        '[a ""]\nb = c\n',
-        '[a.b "c"]\nd = e\n',
-        "[a.B.c]\nd = e\n",
-        "[a]\nb = x  \\\n  y  \n",
-        "[a]\nb\t=\tc\n",
-        "[a] # c\nb = c\n",
-        "[a]\nb = c # x \\\nd = e\n",
-        '[a]\nb = "x\\\ny"\n',
-        "[a]\nb = c\x0b\n",
-        # Each of these git refuses
-        "[a]\nb = \\q\n",
-        '[a]\nb = "open\n',
-        "[a\n",
-        "[ a ]\n",
-        '[a "b" ]\n',
-        "[a]\n1b = c\n",
-        "[a]\nb c\n",
-        '[a "b\nc"]\n',
-        "[a:b]\n",
-        "[]\nb = c\n",
-        "[a]\nb # c\n",
-        "[a]\n\x0bb = c\n",
-    )
-
-    # git reads each of these, and the module has no reading: an include names a file it does
-    # not follow, and the other two are files no config of a real repository looks like
-    STRICTER = ("[include]\n\tpath = x\n", '[includeIf "gitdir:/x"]\n\tpath = x\n')
-    STRICTER += ("b = c\n", "[a]\nb = c\\")
-
-    @staticmethod
-    def listed_by_git(text: str) -> list[str] | None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory, "config")
-            path.write_bytes(text.encode())
-            result = subprocess.run(
-                [GIT, "config", "--file", str(path), "--list", "--null"],
-                capture_output=True,
-                check=False,
-                env={"PATH": os.environ["PATH"], "HOME": directory, "GIT_CONFIG_NOSYSTEM": "1"},
-            )
-        if result.returncode != 0:
-            return None
-        entries = result.stdout.decode().split("\0")[:-1]
-        return [entry.replace("\n", "=", 1) for entry in entries]
-
-    @staticmethod
-    def listed_by_module(text: str) -> list[str] | None:
-        entries = hook._git_config_entries(text)
-        if entries is None:
-            return None
-        return [
-            ".".join(part for part in (section, subsection, key) if part is not None)
-            + ("" if value is None else f"={value}")
-            for section, subsection, key, value in entries
-        ]
-
-    def test_each_file_reads_as_git_reads_it(self):
-        for text in self.AGREED:
-            with self.subTest(text=text):
-                self.assertEqual(self.listed_by_git(text), self.listed_by_module(text))
-
-    def test_where_the_module_reads_less_than_git(self):
-        for text in self.STRICTER:
-            with self.subTest(text=text):
-                self.assertIsNotNone(self.listed_by_git(text), "the control: git reads it")
-                self.assertIsNone(self.listed_by_module(text))
 
 
 class RefusesAnythingElse(Verdicts, unittest.TestCase):

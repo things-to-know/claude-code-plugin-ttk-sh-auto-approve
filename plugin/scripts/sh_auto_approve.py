@@ -39,10 +39,11 @@ A command is approved when every simple command in it clears one of two tiers:
         ``.claude/settings.json`` and ``.claude/settings.local.json`` already allow that
         exact command text.
 
-Tier 1 accepts one kind of write, which the command does not choose: a ``git ls-remote`` or
-``git remote show`` that reaches its remote hands the credential back to the credential helper,
-which may store it again, and ssh may record a host key it has not seen. See
-``_check_git_ls_remote``.
+Tier 1 accepts two writes that the command does not choose, both by a ``git ls-remote`` or
+``git remote show`` that reaches its remote: git hands the credential back to the credential
+helper, which may store it again, and ssh may record a host key it has not seen. See
+``_check_git_ls_remote``. To learn which URL such a command reaches, the module runs
+``git ls-remote --get-url``, which contacts nothing; see ``_check_git_remote_reach``.
 
 Tier 1 is a superset of the host's own built-in read-only set, because a pipeline is only
 useful if ``cut``, ``printf``, ``sort`` and ``tr`` are reachable inside it. It reads the
@@ -770,23 +771,9 @@ GIT_NETWORK_URL = re.compile(
     r"|(?!-)[^:/]+:(?!:|//).*"
 )
 
-# What changes the repository git finds, or the config it reads, from outside both. The module
-# does not model them, so with one set it gives no opinion on a remote name.
-# `GIT_CONFIG_COUNT` is not here: its entries are read, in `_git_environment_config`.
-GIT_REPOSITORY_ENV = (
-    "GIT_DIR",
-    "GIT_COMMON_DIR",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    "GIT_CONFIG_PARAMETERS",
-)
-
-# What git's own `isspace` matches in a config file, less the newline, which every reader there
-# handles first. Narrower than C's: no `\v` or `\f`.
-GIT_CONFIG_SPACE = " \t\r"
-
-# The escapes a git config value may hold. Any other is an error, as in `parse_value`.
-GIT_CONFIG_ESCAPES = {"t": "\t", "b": "\b", "n": "\n", "\\": "\\", '"': '"'}
+# The longest the hook waits for git to say where a remote leads: `git ls-remote --get-url`
+# reads config and contacts nothing, so it takes milliseconds unless a file it opens blocks
+GIT_RESOLVE_TIMEOUT = 5.0
 
 
 class NotReadOnly(Exception):  # noqa: N818 - a verdict, not an error
@@ -1749,7 +1736,7 @@ def _check_git_remote(args: list[str]) -> None:
     docstring says what that writes. It is read for names that ``GIT_REMOTE_NAME`` matches only:
     git takes a word that names no configured remote as a URL, so a URL in the command would be
     a host of the caller's choosing. Where each name leads is checked where the command's
-    directories are known: ``_check_git_remote_names``.
+    directories are known: ``_check_git_remote_reach``.
     """
     if args in ([], ["-v"], ["--verbose"]):
         return
@@ -1774,7 +1761,7 @@ def _check_git_ls_remote(args: list[str]) -> None:
     that ``GIT_REMOTE_NAME`` matches, or absent, which reads the default remote. A URL, a path
     or ``ext::`` would make the host, or the command, the caller's choice. The operands after it
     are ref patterns, which only filter the output. Where the name, or the default, leads is
-    checked where the command's directories are known: ``_check_git_remote_names``.
+    checked where the command's directories are known: ``_check_git_remote_reach``.
 
     Contacting a remote can write, though nothing the command chooses, and both are accepted:
     - On success git hands the credential it used back to the credential helper, which may
@@ -1803,424 +1790,116 @@ def _git_operands(args: list[str]) -> list[str]:
 
 
 def _git_remote_names(args: list[str]) -> list[str] | None:
-    """The remotes an ``ls-remote`` or a ``remote show`` names, or None for any other command.
+    """The remotes a ``git`` command contacts, given ``args`` from its subcommand on.
 
-    An ``ls-remote`` given none reads the default remote. A ``remote show`` given none lists the
-    remotes and contacts none, so it counts as any other command.
+    None for a command that contacts no remote: any other subcommand, an ``ls-remote
+    --get-url``, a ``remote show -n``, and a ``remote show`` given no name, which lists. An
+    ``ls-remote`` given no name contacts the default remote, which is ``[]`` here.
+
+    ``ls-remote`` reads its options up to its first operand only, and ``remote show`` reads them
+    wherever they are. So in ``git ls-remote origin --get-url`` the ``--get-url`` is a ref
+    pattern, and the remote is contacted.
     """
-    index, _ = _git_global_options(args)
-    subcommand, rest = args[index : index + 1], args[index + 1 :]
+    subcommand, rest = args[:1], args[1:]
     if subcommand == ["ls-remote"]:
-        return _git_operands(rest)[:1]
+        operands = _git_operands(rest)
+        options = rest[: rest.index(operands[0])] if operands else rest
+        return None if "--get-url" in options else operands[:1]
     if subcommand == ["remote"] and rest[:1] == ["show"]:
-        return _git_operands(rest[1:]) or None
+        names = _git_operands(rest[1:])
+        return None if "-n" in rest[1:] or not names else names
     return None
 
 
-def _check_git_remote_names(args: list[str], scope: _ReadScope | None) -> None:
-    """Require what an ``ls-remote`` or a ``remote show`` reaches to be a network URL.
+def _check_git_remote_reach(
+    args: list[str], directory: str | None, scope: _ReadScope | None
+) -> None:
+    """Require each remote a ``git`` command contacts to be reached over the network.
 
-    From every directory the command may run in, the repository's config must give a URL to
-    each remote the command names, or, to an ``ls-remote`` that names none, to the remote it
-    reads by default. git reads a name it finds no URL for as a path, and a URL in the config
-    may be a path too.
-    Either opens a repository on this machine with ``git upload-pack``, and that repository's
-    config is one this module never read.
+    ``args`` run from the subcommand on, and ``directory`` is the one ``-C`` names, if any; the
+    read scope has already cleared it. git reads a name it has no URL for as a path, a URL in
+    the config may be a path too, and either opens a repository on this machine with ``git
+    upload-pack``, whose config this module never read. ``url.<base>.insteadOf``, the current
+    branch's remote, ``safe.directory`` and the ``GIT_`` variables all decide which it is.
 
-    Each failure is no opinion, which an operator's rule can still grant: the remote may be
-    configured where this module does not read, and git may not take the path. With no scope
-    there is no directory to read a config from.
+    So git is asked, from every directory the command may run in: ``git ls-remote --get-url``
+    prints the URL the command would reach, every one of those applied, and contacts nothing.
+    A remote with ``remote.<name>.vcs`` is fetched by a ``git-remote-<vcs>`` program, which no
+    URL shows, so any one configured is no opinion as well.
+
+    Each failure is no opinion, which an operator's rule can still grant. With no scope there is
+    no directory to ask from.
     """
     names = _git_remote_names(args)
     if names is None:
         return
     if scope is None:
-        raise NoOpinion("git given a remote, and no directory to read its config from")
-    _, directories = _git_global_options(args)  # one at most, which `_check_command` saw to
+        raise NoOpinion("git given a remote, and no directory to resolve it from")
     for base in scope.bases:
-        directory = os.path.join(base, args[directories[0]]) if directories else base
-        if directory not in scope.git_remotes:
-            scope.git_remotes[directory] = _read_git_remotes(directory)
-        remotes = scope.git_remotes[directory]
-        if remotes is None:
-            raise NoOpinion(f"git remotes whose config cannot be read whole from {directory}")
-        problems = [remotes.problem(name) for name in names] or [remotes.default_problem()]
-        problem = next((problem for problem in problems if problem), None)
-        if problem is not None:
-            raise NoOpinion(f"git reaches {problem}")
+        cwd = os.path.join(base, directory) if directory is not None else base
+        for name in names or [None]:
+            url = _git_remote_url(cwd, name, scope)
+            if url is None:
+                remote = name or "the default remote"
+                raise NoOpinion(f"git cannot tell where {remote} leads from {cwd}")
+            # `.`, from `branch.<name>.remote = .`, is the repository the command runs in
+            if url != "." and not GIT_NETWORK_URL.fullmatch(url):
+                raise NoOpinion(f"git reaches {url}, not a network URL")
+        helpers = _run_git(scope, cwd, "config", "--get-regexp", r"^remote\..*\.vcs$")
+        if helpers is None or helpers[0] not in (0, 1):
+            raise NoOpinion(f"git cannot tell which remotes a program fetches, from {cwd}")
+        if helpers[0] == 0:
+            raise NoOpinion("git remote fetched by a git-remote-<vcs> program")
 
 
-class _GitRemotes:
-    """The remotes a repository's config defines, as ``remote.c`` reads them.
+def _git_remote_url(directory: str, name: str | None, scope: _ReadScope) -> str | None:
+    """The URL ``git ls-remote [<name>]`` reaches from ``directory``, or None if git cannot say.
 
-    Read from the entries ``_read_git_remotes`` collects, in the order git reads them:
-    - ``remote.<name>.url``: each adds a URL, and an empty one empties the list, as it does from
-      git 2.46. Before, it adds a URL that reaches nothing.
-    - ``remote.<name>.vcs``: the remote is fetched by a ``git-remote-<vcs>`` program
-    - ``branch.<name>.remote``: the remote an ``ls-remote`` given none reads, on that branch
-    - ``url.<base>.insteadOf``: a URL that starts with the value is read with ``<base>`` in its
-      place
+    For a name no remote has, git prints the name, which is the path it would read.
     """
-
-    __slots__ = ("branch_remotes", "helpers", "rewrites", "urls")
-
-    def __init__(self, entries: list[tuple[str, str | None, str, str | None]]) -> None:
-        self.urls: dict[str, list[str]] = {}
-        self.helpers: set[str] = set()
-        self.rewrites: list[tuple[str, str]] = []
-        branches: dict[str, str] = {}
-        for section, subsection, key, value in entries:
-            if subsection is None:
-                continue
-            if section == "remote" and not subsection.startswith("/"):
-                urls = self.urls.setdefault(subsection, [])
-                if key == "url":
-                    url = _git_config_string(value)
-                    urls[:] = [*urls, url] if url else []
-                elif key == "vcs":
-                    self.helpers.add(subsection)
-            elif section == "branch" and key == "remote":
-                branches[subsection] = _git_config_string(value)
-            elif section == "url" and key == "insteadof":
-                self.rewrites.append((_git_config_string(value), subsection))
-        self.branch_remotes = set(branches.values())
-
-    def problem(self, name: str, *, given: bool = True) -> str | None:
-        """Why the remote ``name`` may lead other than to a network URL; None if it cannot.
-
-        ``given`` is false for the remote git falls back on when no name is given anywhere,
-        which, configured with no URL, makes git stop rather than read it as a path.
-        """
-        if name in self.helpers:
-            return f"remote {name}, which a git-remote-<vcs> program fetches"
-        # `.` with no remote of that name is the repository the command runs in, read whole
-        urls = self.urls.get(name) or ([name] if name == "." else [])
-        if not urls and given:
-            return f"{name}, which no remote has a URL for, so git reads it as a path"
-        for url in urls:
-            for reached in self._reaches(url):
-                if reached != "." and not GIT_NETWORK_URL.fullmatch(reached):
-                    return f"remote {name}, which leads to {reached}, not a network URL"
+    result = _run_git(scope, directory, "ls-remote", "--get-url", *([name] if name else []))
+    if result is None or result[0] != 0:
         return None
-
-    def default_problem(self) -> str | None:
-        """The same, for the remote an ``ls-remote`` given none reads.
-
-        That is the current branch's ``branch.<name>.remote``, and without one the only remote
-        configured, or ``origin``. The current branch is not read, so every branch's counts.
-        A ``branch.<name>.remote`` of ``.`` is the repository itself.
-        """
-        for name in sorted(self.branch_remotes):
-            problem = self.problem(name)
-            if problem is not None:
-                return problem
-        for name in ("origin", *self.urls):
-            problem = self.problem(name, given=False)
-            if problem is not None:
-                return problem
-        return None
-
-    def _reaches(self, url: str) -> list[str]:
-        """``url``, and what each ``insteadOf`` that matches it rewrites it to.
-
-        git applies only the longest match; every match is checked, so none has to be chosen.
-        """
-        return [url] + [
-            base + url[len(start) :] for start, base in self.rewrites if url.startswith(start)
-        ]
+    lines = result[1].splitlines()
+    return lines[0] if len(lines) == 1 else None
 
 
-def _read_git_remotes(directory: str) -> _GitRemotes | None:
-    """The remotes git sees from ``directory``, or None where this module cannot tell.
+def _run_git(scope: _ReadScope, directory: str, *args: str) -> tuple[int, str] | None:
+    """The exit status and output of ``git <args>`` run in ``directory``, once per command.
 
-    Read from files, never by running ``git``, which would run what the config names. The
-    repository's config, its ``config.worktree`` when ``extensions.worktreeConfig`` is on, and
-    then ``GIT_CONFIG_COUNT``, in the order git reads them.
-
-    Not the global or the system config, which belong to the operator: a remote configured
-    only there is one this module does not know, and an ``insteadOf`` there is not applied.
+    Only for subcommands that read config and contact nothing. It is the ``git`` on ``PATH``,
+    in this process's environment, which is the one the command gets, short of what the shell's
+    startup file changes. git still does whatever that config has it do on every call, such as
+    writing a ``trace2`` target. None where git cannot run, does not finish within
+    ``GIT_RESOLVE_TIMEOUT`` (a FIFO it opens blocks it), or prints other than UTF-8.
     """
-    if any(name in os.environ for name in GIT_REPOSITORY_ENV):
+    key = (directory, *args)
+    if key not in scope.git_runs:
+        scope.git_runs[key] = _run_git_uncached(directory, args)
+    return scope.git_runs[key]
+
+
+def _run_git_uncached(directory: str, args: tuple[str, ...]) -> tuple[int, str] | None:
+    # Imported here, not at the top: `subprocess` costs about 10 ms to import, which every Bash
+    # call would pay, and only a command that contacts a remote needs it
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    git = shutil.which("git")
+    if git is None or not os.path.isabs(git):
         return None
     try:
-        found = _git_repository(directory)
-        if found is None:
-            return None
-        gitdir, common = found
-        entries = _git_config_entries((common / "config").read_text(encoding="utf-8"))
-        if entries is None:
-            return None
-        flags = [
-            value
-            for section, subsection, key, value in entries
-            if (section, subsection, key) == ("extensions", None, "worktreeconfig")
-        ]
-        worktree_config = gitdir / "config.worktree"
-        if flags and _git_config_true(flags[-1]) and worktree_config.exists():
-            more = _git_config_entries(worktree_config.read_text(encoding="utf-8"))
-            if more is None:
-                return None
-            entries += more
-        return _GitRemotes(entries + _git_environment_config())
-    except (OSError, UnicodeDecodeError, ValueError, KeyError):
+        result = subprocess.run(  # noqa: S603 - git's own path, and arguments this module wrote
+            [git, "--no-pager", *args],
+            cwd=directory,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=GIT_RESOLVE_TIMEOUT,
+            check=False,
+        )
+        return result.returncode, result.stdout.decode("utf-8")
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return None
-
-
-def _git_repository(directory: str) -> tuple[Path, Path] | None:
-    """The git directory, and its common directory, of the repository git finds from ``directory``.
-
-    Found as ``setup_git_directory_gently_1`` in ``setup.c`` finds it. Where git would keep
-    looking, or decline, this is None, which is no opinion rather than a guess:
-    - A ``.git`` that is not a valid repository, where git tries the parent
-    - A directory with a ``HEAD``, which may be a bare repository or the inside of a git directory
-    - A filesystem boundary, where git stops
-    - A worktree or a git directory another user owns, which git declines unless
-      ``safe.directory`` allows it
-    """
-    here = Path(os.path.realpath(directory))
-    device = _device_of(here)
-    for path in (here, *here.parents):
-        if _device_of(path) != device:
-            return None
-        dotgit = path / ".git"
-        if os.path.lexists(dotgit):
-            break
-        if os.path.lexists(path / "HEAD"):
-            return None
-    else:
-        return None
-    gitdir, owned = dotgit, [path, dotgit]
-    if dotgit.is_file():
-        text = dotgit.read_text(encoding="utf-8").rstrip("\r\n")
-        if not text.startswith("gitdir: ") or len(text) == len("gitdir: "):
-            return None
-        gitdir = dotgit.parent / text[len("gitdir: ") :]
-        owned.append(gitdir)
-    if not _is_git_directory(gitdir):
-        return None
-    if any(os.lstat(entry).st_uid != os.geteuid() for entry in owned):
-        return None
-    return gitdir, _git_common_directory(gitdir)
-
-
-def _device_of(path: Path) -> int:
-    """The device ``path`` is on, which git compares to stay on one filesystem."""
-    return os.stat(path).st_dev
-
-
-def _is_git_directory(path: Path) -> bool:
-    """Whether git takes ``path`` for a git directory: ``is_git_directory`` in ``setup.c``.
-
-    A ``HEAD`` that is a symlink into ``refs/``, a ``ref: refs/...`` or an object name, and an
-    ``objects`` and a ``refs`` that can be entered in its common directory.
-    """
-    head = path / "HEAD"
-    try:
-        if head.is_symlink():
-            if not os.readlink(head).startswith("refs/"):
-                return False
-        else:
-            with head.open("rb") as file:
-                text = file.read(255).decode("latin-1")
-            ref = text.removeprefix("ref:")
-            symbolic = ref != text and ref.lstrip(" \t\n\r").startswith("refs/")
-            if not symbolic and not re.match(r"[0-9a-fA-F]{40}", text):
-                return False
-        common = _git_common_directory(path)
-    except (OSError, UnicodeDecodeError):
-        return False
-    return os.access(common / "objects", os.X_OK) and os.access(common / "refs", os.X_OK)
-
-
-def _git_common_directory(gitdir: Path) -> Path:
-    """Where ``gitdir/commondir`` points, relative to ``gitdir``; ``gitdir`` itself without one."""
-    pointer = gitdir / "commondir"
-    if not pointer.exists():
-        return gitdir
-    return Path(os.path.realpath(gitdir / pointer.read_text(encoding="utf-8").rstrip("\r\n")))
-
-
-def _git_environment_config() -> list[tuple[str, str | None, str, str | None]]:
-    """The entries ``GIT_CONFIG_COUNT`` adds, from ``GIT_CONFIG_KEY_<n>`` and ``_VALUE_<n>``.
-
-    A KeyError or ValueError where git would refuse them: a missing key or value, or a key with
-    no section.
-    """
-    entries = []
-    for index in range(int(os.environ.get("GIT_CONFIG_COUNT") or 0)):
-        name = os.environ[f"GIT_CONFIG_KEY_{index}"]
-        value = os.environ[f"GIT_CONFIG_VALUE_{index}"]
-        section, _, rest = name.partition(".")
-        subsection, dot, key = rest.rpartition(".")
-        if not section or not key:
-            raise ValueError(f"git config key with no section: {name}")
-        entries.append((section.lower(), subsection if dot else None, key.lower(), value))
-    return entries
-
-
-def _git_config_string(value: str | None) -> str:
-    """A value git reads as a string, which a key with no ``=`` is not: ValueError for that."""
-    if value is None:
-        raise ValueError("git config key with no value where a string is needed")
-    return value
-
-
-def _git_config_true(value: str | None) -> bool:
-    """A value as ``git_config_bool`` reads it; ValueError for one it refuses."""
-    if value is None:
-        return True
-    lowered = value.lower()
-    if lowered in ("true", "yes", "on"):
-        return True
-    if lowered in ("false", "no", "off", ""):
-        return False
-    return int(lowered, 10) != 0
-
-
-def _git_config_entries(text: str) -> list[tuple[str, str | None, str, str | None]] | None:
-    r"""Each entry of a git config file, in order, read as ``git_parse_source`` in ``config.c``.
-
-    An entry is ``(section, subsection, key, value)``. The section and the key are lowercased, as
-    git compares them; a quoted subsection is not. The subsection is None in a header with none,
-    and the value is None for a key with no ``=``. None for a file git refuses to parse, and for
-    one with an
-    ``[include]`` or an ``[includeIf]``, whose other file this does not read.
-
-    Read a character at a time, as git does, rather than a line at a time: a value continues
-    past a line that ends in ``\``, so a ``[section]`` on the next line is part of the value,
-    and one header can follow another on the same line.
-    """
-    text = text.removeprefix("﻿").replace("\r\n", "\n") + "\n"
-    entries = []
-    section: tuple[str, str | None] | None = None
-    index = 0
-    try:
-        while index < len(text):
-            char = text[index]
-            index += 1
-            if char == "\n" or char in GIT_CONFIG_SPACE:
-                continue
-            if char in "#;":
-                index = text.index("\n", index) + 1
-                continue
-            if char == "[":
-                header = _git_config_header(text, index)
-                if header is None:
-                    return None
-                section, index = header
-                if section[0] in ("include", "includeif"):
-                    return None
-                continue
-            if section is None or not (char.isascii() and char.isalpha()):
-                return None
-            end = index
-            while _git_key_char(text[end]):
-                end += 1
-            key = text[index - 1 : end].lower()
-            while text[end] in " \t":
-                end += 1
-            if text[end] == "\n":
-                entries.append((*section, key, None))
-                index = end
-                continue
-            if text[end] != "=":
-                return None
-            parsed = _git_config_value(text, end + 1)
-            if parsed is None:
-                return None
-            entries.append((*section, key, parsed[0]))
-            index = parsed[1]
-    except IndexError:
-        return None  # a `\` at the very end, which git reads and this does not
-    return entries
-
-
-def _git_key_char(char: str) -> bool:
-    """``iskeychar`` in ``config.c``."""
-    return char.isascii() and (char.isalnum() or char == "-")
-
-
-def _git_config_header(text: str, index: int) -> tuple[tuple[str, str | None], int] | None:
-    """The header whose ``[`` is just before ``text[index]``, and the index past its ``]``.
-
-    ``get_base_var`` and ``get_extended_base_var`` in ``config.c``: ``[section]``,
-    ``[section "subsection"]``, and the older ``[section.subsection]``, which git lowercases
-    whole. None where git refuses it.
-    """
-    base = ""
-    while True:
-        char = text[index]
-        index += 1
-        if char == "]":
-            break
-        if char == "\n" or char in GIT_CONFIG_SPACE:
-            while char in GIT_CONFIG_SPACE:
-                char = text[index]
-                index += 1
-            if char != '"':
-                return None
-            subsection = ""
-            while (char := text[index]) != '"':
-                index += 1
-                if char == "\\":
-                    char = text[index]
-                    index += 1
-                if char == "\n":
-                    return None
-                subsection += char
-            if text[index + 1] != "]":
-                return None
-            base, index = f"{base}.{subsection}", index + 2
-            break
-        if not (_git_key_char(char) or char == "."):
-            return None
-        base += char.lower()
-    section, dot, subsection = base.partition(".")
-    if not section:
-        return None
-    return (section, subsection if dot else None), index
-
-
-def _git_config_value(text: str, index: int) -> tuple[str, int] | None:
-    r"""The value that starts at ``text[index]``, and the index past its line: ``parse_value``.
-
-    Quotes are taken out and escapes replaced, a ``\`` at the end of a line joins the next one,
-    and a ``#`` or ``;`` outside quotes starts a comment. Unquoted space at either end is dropped.
-    None where git refuses the value: an unknown escape, or a quote left open.
-    """
-    value = ""
-    quoted = comment = False
-    trim = 0
-    while True:
-        char = text[index]
-        index += 1
-        if char == "\n":
-            if quoted:
-                return None
-            return (value[:trim] if trim else value), index
-        if comment:
-            continue
-        if char in GIT_CONFIG_SPACE and not quoted:
-            trim = trim or len(value)
-            if value:
-                value += char
-            continue
-        if char in "#;" and not quoted:
-            comment = True
-            continue
-        trim = 0
-        if char == "\\":
-            char = text[index]
-            index += 1
-            if char == "\n":
-                continue
-            if char not in GIT_CONFIG_ESCAPES:
-                return None
-            value += GIT_CONFIG_ESCAPES[char]
-        elif char == '"':
-            quoted = not quoted
-        else:
-            value += char
 
 
 def _refuse_git_global(arg: str) -> None:
@@ -3110,12 +2789,21 @@ def _check_command(
     elif program not in READ_ONLY:
         raise NoOpinion(f"unrecognized program: {program}")
 
-    # Before the early return below, which would otherwise approve a remote name unchecked.
-    # Both readers of `-C` below take one directory: each `-C` is relative to the last.
+    # `-C` points git at the repository there, and so at that repository's config, which
+    # can name a program git runs: `core.fsmonitor` on `status`, `gpg.program` on a `log`
+    # that shows signatures. That is `--git-dir` under another name, so a directory
+    # outside the read roots is not this module's to approve. Read before the early return
+    # below, and before `_check_git_remote_reach`, which runs git in that directory.
     if program == "git":
-        if len(_git_global_options(args)[1]) > 1:
+        index, directories = _git_global_options(args)
+        if len(directories) > 1:
             raise NoOpinion("git -C given more than once, each relative to the last")
-        _check_git_remote_names(args, scope)
+        for position in directories if scope is not None else []:
+            problem = _read_scope_problem(arg_tokens[position], args[position], parts, scope)
+            if problem is not None:
+                raise NoOpinion(f"git -C points at {problem}")
+        directory = args[directories[0]] if directories else None
+        _check_git_remote_reach(args[index:], directory, scope)
 
     # The read scope comes after the validator, so a write the validator found keeps its
     # verdict whatever a rule says: `sort -o out /etc/hostname` writes `out` wherever it reads.
@@ -3137,16 +2825,6 @@ def _check_command(
             problem = _read_scope_problem(token, text, parts, scope)
             if problem is not None:
                 raise NoOpinion(f"{program} reads {problem}")
-
-    # `-C` points git at the repository there, and so at that repository's config, which
-    # can name a program git runs: `core.fsmonitor` on `status`, `gpg.program` on a `log`
-    # that shows signatures. That is `--git-dir` under another name, so a directory
-    # outside the read roots is not this module's to approve.
-    if program == "git":
-        for index in _git_global_options(args)[1]:
-            problem = _read_scope_problem(arg_tokens[index], args[index], parts, scope)
-            if problem is not None:
-                raise NoOpinion(f"git -C points at {problem}")
 
 
 class _GlobRule:
@@ -3431,7 +3109,7 @@ def _refuse_credential_paths(reduced: str, parts: list[tuple[str, str]]) -> None
 class _ReadScope:
     """Where a reader may read from, and what is known about the command's variables."""
 
-    __slots__ = ("bases", "git_remotes", "loop_values", "roots", "spells_escape", "splice_vars")
+    __slots__ = ("bases", "git_runs", "loop_values", "roots", "spells_escape", "splice_vars")
 
     def __init__(
         self,
@@ -3449,9 +3127,9 @@ class _ReadScope:
         # Whether any word of the command spells a terminal escape, which makes every value
         # `echo` or `printf` expands one that may carry it; see `TERMINAL_CONTROL_BYTE`.
         self.spells_escape = spells_escape
-        # The remotes read from each directory, once per command however many git calls it
-        # makes; see `_check_git_remote_names`
-        self.git_remotes: dict[str, _GitRemotes | None] = {}
+        # What git said when asked, once per command however many git calls it makes; see
+        # `_run_git`
+        self.git_runs: dict[tuple[str, ...], tuple[int, str] | None] = {}
 
 
 def _in_scope(absolute: str, scope: _ReadScope) -> bool:
