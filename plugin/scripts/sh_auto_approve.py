@@ -252,11 +252,12 @@ TERMINAL_CONTROL_SPELLED = re.compile(
 )
 INTERPRETS_ESCAPES = ("echo", "printf")
 
-# Claude Code gives each session a scratch directory and tells the model to use it. Writes
-# that land inside it are contained by construction: the path carries the session id, the
-# directory dies with the session, and nothing reads from it afterwards. The shape below is
-# the observed layout; `SH_AUTO_APPROVE_SCRATCH` replaces it with an exact directory.
-SCRATCH_ENV = "SH_AUTO_APPROVE_SCRATCH"
+# Claude Code gives each session a scratch directory, tells the model to use it, and names it in
+# the hook payload as `scratchpad_dir`, from Claude Code 2.1.257 on. Writes that land inside it
+# are contained: the directory sits under the system temp directory, outside the project, and
+# is this session's alone, so no other session's scratchpad is in reach. Its files last as long
+# as the session's transcript. No setting names one instead: a directory named for every session
+# would be one they all share, where one session could rewrite a script another is about to run.
 
 # One path component that is not `..`, spelled only in characters the shell passes through
 # untouched. Without the lookahead the trailing `(?:/COMPONENT)+` happily matches
@@ -264,12 +265,11 @@ SCRATCH_ENV = "SH_AUTO_APPROVE_SCRATCH"
 # `"../../x"` (a placeholder by now), a `$d` the shell fills in, and a `..*` the shell globs,
 # each of which lands wherever it likes.
 SCRATCH_COMPONENT = r"(?:/(?!\.\.?(?:/|$|[\s;|&)]))[A-Za-z0-9._@%+=,-]+)"
-# The scratchpad's path, matched, never written: hence the `noqa`
-SCRATCH_PATH = (
-    r"/tmp/claude-\d+/(?!\.\.?/)[A-Za-z0-9._-]+/[0-9a-fA-F-]{36}/scratchpad"  # noqa: S108
-    + SCRATCH_COMPONENT
-    + r"+"
-)
+# A `scratchpad_dir` the hook can match as the shell reads it: absolute and normalized, every
+# component spelled in `SCRATCH_COMPONENT`'s characters. One of any other shape gets no
+# scratchpad, since the shell would read the same text as another path: it ends the target of
+# `> /tmp/a b/scratchpad/x` at the space, and so writes `/tmp/a`.
+SCRATCH_DIRECTORY = re.compile(SCRATCH_COMPONENT + "+")
 
 # --------------------------------------------------------------------------------------
 # Read scope
@@ -362,6 +362,10 @@ PATH_SPECIAL = re.compile(r"[$*?\[{`]")
 # The working directory Claude Code reports in the hook payload. Set by `main()`; when it is
 # set, a relative operand must be in scope from there too.
 _SESSION_CWD: str | None = None
+
+# The `scratchpad_dir` of the hook payload. Set by `main()`; the scratchpad in reach is that
+# directory, and none is while it is unset. See `_scratch_directory`.
+_SCRATCHPAD_DIR: str | None = None
 
 # Variable assignment matching
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
@@ -3143,7 +3147,8 @@ def _in_scope_unguarded(absolute: str, scope: _ReadScope) -> bool:
     normal = os.path.normpath(absolute)
     if normal in DEVICE_READS:
         return True
-    if _scratch_path_pattern().fullmatch(normal):
+    scratch = _scratch_path_pattern()
+    if scratch is not None and scratch.fullmatch(normal):
         return True
     resolved = os.path.realpath(normal)
     return any(_is_under(normal, root) and _is_under(resolved, root) for root in scope.roots)
@@ -3537,26 +3542,37 @@ def _file_operands(program: str, args: list[str]) -> list[tuple[int, int]]:
     return found
 
 
-def _scratch_path_pattern() -> re.Pattern[str]:
-    """This session's scratch directory, or anything under it, as a whole-path pattern."""
-    override = os.environ.get(SCRATCH_ENV, "").rstrip("/")
-    path = (
-        re.escape(override) + SCRATCH_COMPONENT + "*"
-        if override
-        else (SCRATCH_PATH.rstrip("+") + "*")
-    )
-    return re.compile(path)
+def _scratch_directory() -> str | None:
+    """This session's scratch directory, as a pattern; `None` when there is none.
 
+    The payload's `scratchpad_dir`, exactly: another session's scratchpad is no more in reach
+    than any other directory, since a session that could write into one could rewrite a script
+    that session is about to run. Without a `scratchpad_dir`, or with one `SCRATCH_DIRECTORY`
+    does not match, there is none.
 
-def _scratch_redirect() -> re.Pattern[str]:
-    """The redirection shape that writes into this session's scratch directory.
-
-    Built per call rather than at import so that `SH_AUTO_APPROVE_SCRATCH` can name an
-    exact directory -- which is what the tests do, and what a deployment should do if the
-    layout below ever changes. `re.compile` caches, so this costs nothing after the first.
+    Built per call rather than at import, from `_SCRATCHPAD_DIR`, which `main` sets per call.
+    `re.compile` caches, so the patterns built from it cost nothing after the first.
     """
-    override = os.environ.get(SCRATCH_ENV, "").rstrip("/")
-    path = re.escape(override) + SCRATCH_COMPONENT + "+" if override else SCRATCH_PATH
+    if _SCRATCHPAD_DIR is None:
+        return None
+    directory = _SCRATCHPAD_DIR.rstrip("/")
+    if SCRATCH_DIRECTORY.fullmatch(directory) is None:
+        return None
+    return re.escape(directory)
+
+
+def _scratch_path_pattern() -> re.Pattern[str] | None:
+    """This session's scratch directory, or anything under it, as a whole-path pattern."""
+    directory = _scratch_directory()
+    return None if directory is None else re.compile(directory + SCRATCH_COMPONENT + "*")
+
+
+def _scratch_redirect() -> re.Pattern[str] | None:
+    """The redirection shape that writes into this session's scratch directory."""
+    directory = _scratch_directory()
+    if directory is None:
+        return None
+    path = directory + SCRATCH_COMPONENT + "+"
     return re.compile(r"(?<![^\s;|&(])&?>>?\s*(?:" + path + r")(?=[\s;|&)]|$)")
 
 
@@ -3656,7 +3672,9 @@ def _classify(command: str, depth: int = 0) -> None:
     # reads or contained writes. Everything `_segments` still meets after this is a `>` at
     # a path this module could not account for, which is the one it has to refuse.
     stripped = SAFE_REDIRECTS.sub(" ", reduced)
-    stripped = _scratch_redirect().sub(" ", stripped)
+    scratch_redirect = _scratch_redirect()
+    if scratch_redirect is not None:
+        stripped = scratch_redirect.sub(" ", stripped)
     stripped = FILE_INPUT_REDIRECT.sub(
         lambda match: (
             " " if _readable_input_target(match.group(1), parts, roots) else match.group(0)
@@ -3778,9 +3796,12 @@ def main() -> int:
             return 0
         # Claude Code's shell keeps its working directory between calls, so a relative path
         # is read from wherever the session last stood. The payload says where that is.
-        global _SESSION_CWD, REPO_ROOT  # noqa: PLW0603 - one process per Bash call
+        global _SESSION_CWD, _SCRATCHPAD_DIR, REPO_ROOT  # noqa: PLW0603 - one process per call
         cwd = payload.get("cwd")
         _SESSION_CWD = os.path.realpath(cwd) if isinstance(cwd, str) and cwd else None
+        # This session's scratchpad; see `_scratch_directory`
+        scratchpad_dir = payload.get("scratchpad_dir")
+        _SCRATCHPAD_DIR = scratchpad_dir if isinstance(scratchpad_dir, str) else None
         root = _project_root(_SESSION_CWD or os.getcwd())
         if root is None:
             return 0
