@@ -663,11 +663,38 @@ GIT_EXECUTION_OPTS = (
 # Git options that point it at a repository whose config this module never read
 GIT_LOCATION_OPTS = ("--git-dir", "--work-tree", "--namespace")
 
-# Exact options that are also a prefix of one above, which git reads as themselves:
-# `git grep --text` and `git diff --text` treat binary files as text.
+# Global options that take a value, which hides the subcommand git runs when the value is the
+# next word (see `GIT_GLOBAL_FLAGS`): `--attr-source` (git 2.41 and later), `--shallow-file`, and
+# `--super-prefix` (git 2.39 and earlier)
+GIT_VALUE_GLOBAL_OPTS = ("--attr-source", "--shallow-file", "--super-prefix")
+
+# The global options, before the subcommand, that `_git_global_options` walks past besides
+# `-C <dir>`. None takes a value, and git matches each exactly (`handle_options` in `git.c`
+# compares with `strcmp`), so this set is matched exactly too.
+# - An allowlist, because a global option that takes the next word as its value makes that word
+#   look like the subcommand: `git --attr-source log clean -fdx` reads as `git log`, and git runs
+#   `git clean -fdx`. `GIT_VALUE_GLOBAL_OPTS` lists the ones known, and git can add another
+# - Left out:
+#   - `--bare`, which makes the current directory the repository: `--git-dir=.`
+#   - `--help` and `-h`, which end the options, and git runs `help` in their place:
+#     `git --help log` is `git help log`, which starts a man viewer
+#   - `--version` and `-v`, which end the options too: see `GIT_VERSION_FLAGS`
+GIT_GLOBAL_FLAGS = frozenset(
+    {"-p", "--paginate", "-P", "--no-pager"}
+    | {"--no-replace-objects", "--no-lazy-fetch", "--no-optional-locks", "--no-advice"}
+    | {"--literal-pathspecs", "--no-literal-pathspecs", "--glob-pathspecs"}
+    | {"--noglob-pathspecs", "--icase-pathspecs"}
+)
+
+# Global options that end git's options, where git runs `git version` in their place and hands
+# it the words after them: `git --version clean -fdx` fails with `unknown switch 'f'`
+GIT_VERSION_FLAGS = frozenset({"--version", "-v"})
+
+# Exact options that are also a prefix of one in `GIT_EXECUTION_OPTS`, which git reads as
+# themselves: `git grep --text` and `git diff --text` treat binary files as text.
 GIT_EXACT_SAFE_OPTS = frozenset({"--text"})
 
-# Git subcommands that read repository state
+# Git subcommands that read repository state, and `version`, which prints git's own
 GIT_READ_SUBCOMMANDS = {
     "blame",
     "cat-file",
@@ -685,6 +712,7 @@ GIT_READ_SUBCOMMANDS = {
     "show-ref",
     "status",
     "tag",
+    "version",
     "worktree",
 }
 
@@ -1565,41 +1593,20 @@ def _check_awk(args: list[str]) -> None:
 
 def _check_git(args: list[str]) -> None:
     """Validate ``git`` subcommands, ensuring read-only behavior and safe options."""
-    # Global writing / execution flags
+    # Flags that write a file or run a program, wherever they are: after the subcommand they are
+    # its own (`git diff --output=x`), and before it `--exec-path=<dir>` is git's. The global
+    # options that set config or move the repository are refused by `_git_global_options`,
+    # before the subcommand, the only place git reads them.
     for arg in args:
-        # `-c diff.external=cmd` and `-c core.pager=cmd` name a program to run, and
-        # `--config-env` does the same by way of a variable. No read-only call needs one.
-        if arg in ("-c", "--config-env") or arg.startswith("--config-env="):
-            raise NotReadOnly(f"git configuration override: {arg}")
         # `--ext-diff`, `--textconv` and `--filters` run whatever the repository's own
         # config or `.gitattributes` names, so a read of a checkout is an execution of it.
         # The `--no-` spellings are the safe ones and do not match these prefixes.
         if arg.startswith("-O") or any(_git_option_is(arg, o) for o in GIT_EXECUTION_OPTS):
             raise NotReadOnly(f"git mutating or execution flag: {arg}")
 
-        # A repository whose config this module never read names the programs `git` will
-        # run: `core.pager`, `diff.external`, a hook path. Pointing at one gets the
-        # execution that `-c core.pager=touch` gets, with no `-c` in the command.
-        if any(_git_option_is(arg, o) for o in GIT_LOCATION_OPTS):
-            raise NotReadOnly(f"git repository location override: {arg}")
-
-    # Consume global `git` options (e.g. `-C <dir>`, `-c <name>=<value>`)
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg in ("-C", "-c"):
-            i += 2
-            continue
-        if arg.startswith("-"):
-            i += 1
-            continue
-        break
-
-    if i >= len(args):
-        raise NotReadOnly("git with no subcommand")
-
-    subcommand = args[i]
-    sub_args = args[i + 1 :]
+    index, _ = _git_global_options(args)
+    subcommand = "version" if args[index] in GIT_VERSION_FLAGS else args[index]
+    sub_args = args[index + 1 :]
 
     # Check for glob expansion in git arguments
     if any("*" in a or "?" in a for a in sub_args):
@@ -1689,22 +1696,60 @@ def _check_git_remote(args: list[str]) -> None:
     raise NotReadOnly(f"git remote other than a listing or get-url: {' '.join(args)}")
 
 
-def _git_directories(args: list[str]) -> list[int]:
-    """Indexes into ``args`` of each ``-C`` directory, read from the global options only.
+def _refuse_git_global(arg: str) -> None:
+    """Refuse ``arg`` where git reads it as a global option this module refuses.
 
-    After the subcommand ``-C`` is another flag: copy detection in ``log``, ``diff`` and
-    ``blame``. The walk is the one ``_check_git`` does to find the subcommand.
+    Those set config, point git at another repository, or take a value. git matches each of
+    them exactly, so ``arg`` is too, up to any ``=``.
     """
-    found: list[int] = []
+    name = arg.partition("=")[0]
+    # `-c diff.external=cmd` and `-c core.pager=cmd` name a program to run, and `--config-env`
+    # does the same by way of a variable. No read-only call needs one.
+    if name in ("-c", "--config-env"):
+        raise NotReadOnly(f"git configuration override: {arg}")
+    # A repository whose config this module never read names the programs `git` will run:
+    # `core.pager`, `diff.external`, a hook path. Pointing at one gets the execution that
+    # `-c core.pager=touch` gets, with no `-c` in the command. `--bare` is `--git-dir=.`.
+    if name in GIT_LOCATION_OPTS or name == "--bare":
+        raise NotReadOnly(f"git repository location override: {arg}")
+    if name in GIT_VALUE_GLOBAL_OPTS:
+        raise NotReadOnly(f"git global option that takes a value: {arg}")
+
+
+def _git_global_options(args: list[str]) -> tuple[int, list[int]]:
+    """The index into ``args`` of ``git``'s subcommand, and of each ``-C`` directory before it.
+
+    Walks past ``-C <dir>`` and ``GIT_GLOBAL_FLAGS`` only, and stops at ``GIT_VERSION_FLAGS``,
+    which stand for the subcommand: whether an option takes the next word as its value is what
+    decides which word git runs. ``_refuse_git_global`` refuses the options
+    known to set config, move the repository or take a value. Any other option before the
+    subcommand, the next one git adds included, is one this module cannot read, and the
+    operator's rules decide. After the subcommand ``-C`` is another flag: copy detection in
+    ``log``, ``diff`` and ``blame``.
+    """
+    directories: list[int] = []
     index = 0
     while index < len(args) and args[index].startswith("-"):
-        if args[index] in ("-C", "-c"):
-            if args[index] == "-C" and index + 1 < len(args):
-                found.append(index + 1)
+        arg = args[index]
+        if arg == "-C":
+            directories.append(index + 1)
             index += 2
-        else:
+        elif arg in GIT_GLOBAL_FLAGS:
             index += 1
-    return found
+        elif arg in GIT_VERSION_FLAGS:
+            break
+        else:
+            _refuse_git_global(arg)
+            # Whether this option takes the next word as its value decides where git's own
+            # options end, so one refused anywhere after it may still be git's:
+            # `git --frobnicate -c core.pager=touch log`
+            for later in args[index + 1 :]:
+                _refuse_git_global(later)
+            raise NoOpinion(f"git global option not known to be read-only: {arg}")
+    # A `-C` with nothing after it leaves `index` past the end, so each index returned is in range
+    if index >= len(args):
+        raise NotReadOnly("git with no subcommand")
+    return index, directories
 
 
 def _git_option_is(arg: str, option: str) -> bool:
@@ -2564,7 +2609,7 @@ def _check_command(
     # that shows signatures. That is `--git-dir` under another name, so a directory
     # outside the read roots is not this module's to approve.
     if program == "git":
-        directories = _git_directories(args)
+        _, directories = _git_global_options(args)
         if len(directories) > 1:
             raise NoOpinion("git -C given more than once, each relative to the last")
         for index in directories:

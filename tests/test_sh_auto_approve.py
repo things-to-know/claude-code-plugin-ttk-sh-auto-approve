@@ -76,6 +76,7 @@ from a command that prompted in a real session.
     13  Vendor CLIs: git, aws, gcloud
           RefusesVendorFlagsAndSubcommands, ApprovesOrdinaryOptionForms,
           RefusesGitConfigDrivenExecution, RefusesGitSubcommandsOutsideTheReadSet,
+          RefusesUnlistedGitGlobalOptions, GitGlobalOptionsUnderOperatorRules,
           RefusesAwsCallsThatWriteOrExecute, RefusesAwsCallsThatPrintASecret,
           ApprovesGcloudHelpForABlockedVerb, RefusesGcloudCallsThatWriteLocallyOrExecute,
           RefusesGhApiCallsThatWriteOrLeak, ApprovesReadOnlyGhSubcommands,
@@ -121,9 +122,12 @@ Five properties this file holds to
    corpus stays confined to relative paths inside a scratch directory whose `HOME` and
    `TMPDIR` are redirected into it, and the payloads are limited to `touch PWNED`, a
    write to `PWNED`, an edit or deletion of the scratch tree's own `AGENTS.md`, and a
-   planted executable inside the same tree. `CorpusIsSafeToExecute` enforces the
-   confinement mechanically -- read it before adding a case, and do not add one it
-   rejects.
+   planted executable inside the same tree. The `git` corpus alone adds a `clean`, a
+   `branch -D` and a `push`, run only in the repository and its bare `origin` that
+   `RefusesUnlistedGitGlobalOptions._repository` builds inside the tree: run from a real
+   checkout, the `push` would reach that checkout's remote. `CorpusIsSafeToExecute`
+   enforces the confinement mechanically -- read it before adding a case, and do not add
+   one it rejects.
 
 5. **Assert the property, not the verdict, where approval is not the point.** In the
    classes marked `@approvals_budgeted`, a case whose approval is not itself a risk does
@@ -423,6 +427,26 @@ needs_bash_44 = unittest.skipUnless(
     BASH and BASH_VERSINFO >= (4, 4),
     f"needs bash >= 4.4 for ${{var@P}}; found {BASH_VERSINFO}",
 )
+
+GIT = shutil.which("git")
+
+
+def _git_version() -> tuple[int, int]:
+    """The major and minor version of the `git` on `PATH`, or `(0, 0)` without one."""
+    if not GIT:
+        return (0, 0)
+    try:
+        out = subprocess.run(
+            [GIT, "--version"], capture_output=True, text=True, timeout=10, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return (0, 0)
+    match = re.search(r"(\d+)\.(\d+)", out)
+    return (int(match[1]), int(match[2])) if match else (0, 0)
+
+
+GIT_VERSION = _git_version()
+needs_git = unittest.skipUnless(GIT, "needs git on PATH")
 
 # --------------------------------------------------------------------------------------
 # What the host approves, and what this repository approves beyond it
@@ -1089,6 +1113,10 @@ class CorpusIsSafeToExecute(unittest.TestCase):
         yield from ((c, "hygiene") for c in PUNCTUATION_BASH_REJECTS.values())
         yield from ((c, "executed") for c in EXECUTED_ATTACKS)
         yield from ((c, "differential") for c in DifferentialAgainstZsh.ATTACKS)
+        # Run only in the scratch repository `_repository` builds: elsewhere the `push` would
+        # reach a real remote, which no rule of `is_corpus_safe` stops
+        yield from ((c, "git") for c, _, _ in RefusesUnlistedGitGlobalOptions.EXECUTED)
+        yield from ((c, "git") for c, _ in RefusesUnlistedGitGlobalOptions.APPROVED_AND_EXECUTED)
 
     def test_no_command_reaches_outside_the_scratch_tree(self):
         for command, origin in self.all_corpora():
@@ -3903,6 +3931,298 @@ class RefusesGitSubcommandsOutsideTheReadSet(Verdicts, unittest.TestCase):
         """The guard on all of the above: these are asserted in `ApprovesReadOnly` too, and
         a fix that tightens `git` must not reach them."""
         self.assert_allowed("git log --oneline -5", "`ApprovesReadOnly` asserts this")
+
+
+class RefusesUnlistedGitGlobalOptions(Verdicts, unittest.TestCase):
+    """A global option that takes the next word as its value hides the subcommand git runs.
+
+    To find the subcommand, the hook skipped every option before it, as if only `-C` and `-c`
+    took a value. `--attr-source <tree>` (git 2.41 and later), `--shallow-file <file>` and
+    `--super-prefix <path>` (git 2.39 and earlier) take one too. So the value read as the
+    subcommand, and git ran the word after it: `git --attr-source log clean -fdx` was approved
+    as `git log`. The walk now passes `-C` and `GIT_GLOBAL_FLAGS` only. It refuses the options
+    known to take a value, set config or move the repository, whatever the operator's rules
+    say, and leaves any other option before the subcommand, the next one git adds included, to
+    those rules.
+
+    Each refusal sits beside a control approved under the same setup.
+    `test_git_runs_the_hidden_subcommand` runs the refused commands with the installed git, in
+    a repository of their own, so that each refusal stands for a real execution, and goes red
+    if a later git stops reading the value from the next word.
+    """
+
+    # For `test_git_runs_the_hidden_subcommand`: the command, the oldest git that reads the
+    # option's value from the next word, and the fact about the repository that the command
+    # changes. `--attr-source` pushing to a local remote is left out: its `receive-pack`
+    # inherits `GIT_ATTR_SOURCE` and fails on the tree it names.
+    EXECUTED = (
+        ("git --attr-source log clean -fdx", (2, 41), "untracked file"),
+        ("git --attr-source log branch -D victim", (2, 41), "branch victim"),
+        ("git --shallow-file log branch -D victim", (2, 0), "branch victim"),
+        ("git --shallow-file log push origin HEAD:refs/heads/pwned", (2, 0), "pushed branch"),
+    )
+
+    # For `test_git_runs_version_with_the_words_after_it`: approved commands, and the fact each
+    # would change if git ran the words after the option as a subcommand
+    APPROVED_AND_EXECUTED = (
+        ("git --version clean -fdx", "untracked file"),
+        ("git -v branch -D victim", "branch victim"),
+    )
+
+    def assert_no_opinion(self, command: str, why: str = "") -> None:
+        with self.assertRaises(hook.NoOpinion, msg=why or command):
+            hook._classify(command)
+
+    def assert_refused_outright(self, command: str, why: str = "") -> None:
+        """Refused, and not as `NoOpinion`, so that no operator rule overturns it."""
+        with self.assertRaises(hook.NotReadOnly, msg=why or command) as raised:
+            hook._classify(command)
+        self.assertNotIsInstance(raised.exception, hook.NoOpinion, why or command)
+
+    def test_an_option_that_takes_the_next_word(self):
+        """Each refusal was approved as `git log`, and is now refused outright.
+
+        The `--super-prefix` one is read from `git.c` and `builtin/read-tree.c` at v2.39.5, not
+        executed: git 2.40 dropped the option. Below 2.40 every builtin without
+        `SUPPORT_SUPER_PREFIX` dies under it, `clean` among them, and `read-tree` has it.
+        """
+        for refused, control in (
+            ("git --attr-source log clean -fdx", "git --no-pager log -1"),
+            (
+                "git --attr-source log push origin HEAD:refs/heads/pwned",
+                "git --no-optional-locks log -1",
+            ),
+            ("git --attr-source log branch -D victim", "git --no-replace-objects log -1"),
+            ("git --attr-source log -C /etc status", "git --no-pager -C . status"),
+            ("git --shallow-file log branch -D victim", "git -p log -1"),
+            (
+                "git --shallow-file log push origin HEAD:refs/heads/pwned",
+                "git --no-lazy-fetch log -1",
+            ),
+            ("git --super-prefix log read-tree --empty", "git --literal-pathspecs log -1"),
+        ):
+            with self.subTest(refused=refused):
+                self.assert_refused_outright(refused, "runs the subcommand after the value")
+                self.assert_allowed(control, "the option before `log` takes no value")
+
+    def test_the_read_scope_walks_past_a_listed_option(self):
+        """The read scope finds `-C` with the walk `_check_git` uses, past the options it
+        lists. `_check_git` approves this command, so the read scope is what stops it: git
+        would load the config of the repository at `/etc`. Before the walk was shared, the
+        read scope's own stopped at the `log` in `git --attr-source log -C /etc status`, which
+        `test_an_option_that_takes_the_next_word` now refuses before the read scope runs."""
+        with self.assertRaises(hook.NoOpinion) as raised:
+            hook._classify("git --no-pager -C /etc status")
+        self.assertIn("git -C points at", str(raised.exception))
+        self.assert_allowed("git --no-pager -C . status", "the walk reaches its -C, in scope")
+
+    def test_an_option_the_list_lacks(self):
+        """`--frobnicate` stands for the next option git adds, which this module cannot read: a
+        prompt, unless the operator's rules grant that exact shape, which
+        `GitGlobalOptionsUnderOperatorRules` asserts. The attached `--attr-source=` takes no
+        next word, and is refused outright all the same, as an option known to take a value."""
+        self.assert_no_opinion("git --frobnicate log -1", "an option the list lacks")
+        self.assert_refused_outright("git --attr-source=HEAD log -1", "takes a value")
+        self.assert_allowed("git log -1", "the control")
+
+    def test_the_options_that_stand_for_a_repository_or_a_command(self):
+        """`--bare` makes the current directory the repository, which is the `--git-dir=.`
+        that `GIT_LOCATION_OPTS` refuses, and is refused outright. `--help` ends the options,
+        and git runs `help` in its place: `git --help log` is `git help log`, which starts a
+        man viewer. Whether that only prints the page is not settled, so it is left to the
+        operator's rules."""
+        self.assert_refused_outright("git --bare log -1", "reads the config in the current dir")
+        self.assert_no_opinion("git --help log", "runs git help log")
+        self.assert_allowed("git log -1", "the control")
+
+    def test_the_version_options(self):
+        """`--version` and `-v` end git's options, and git runs `git version` in their place.
+        `--help` and `-h` end them too, for `git help`, which starts a man viewer, and stay left
+        to the operator's rules."""
+        for approved, not_approved in (
+            ("git --version", "git --help"),
+            ("git -v", "git -h"),
+            ("git version --build-options", "git help log"),
+            ("git --no-pager --version", "git --no-pager --help log"),
+        ):
+            with self.subTest(approved=approved):
+                self.assert_allowed(approved, "prints git's version")
+                self.assert_refused(not_approved, "starts a man viewer")
+
+    def test_a_global_spelling_after_the_subcommand(self):
+        """git reads its global options before the subcommand only. After it, `-c` counts
+        matches in `grep` and shows a combined diff in `log`, and `rev-parse --git-dir` prints
+        where the repository is. Each was refused while the module looked for `-c` and
+        `--git-dir` in every word; before the subcommand they stay refused outright."""
+        for refused, approved in (
+            ("git -c core.pager=touch grep -e x", "git grep -c -e x"),
+            ("git -c core.pager=touch log -1", "git log -c -1"),
+            ("git --git-dir=elsewhere rev-parse HEAD", "git rev-parse --git-dir"),
+            ("git -C . -c core.pager=touch log -1", "git -C . log -c -1"),
+        ):
+            with self.subTest(refused=refused):
+                self.assert_refused_outright(refused, "sets the pager or moves the repository")
+                self.assert_allowed(approved, "the subcommand's own flag")
+
+    def test_options_with_no_subcommand_after_them(self):
+        """Refused as having no subcommand. For a `-C` that ends the command, that refusal is
+        also what keeps the read scope from looking up a directory past the end of the words."""
+        for command in ("git", "git --no-pager", "git -C", "git -C docs", "git -C docs -P"):
+            with self.subTest(command=command):
+                self.assert_refused(command, "gets no subcommand")
+        self.assert_allowed("git -C docs -P log -1", "the control")
+
+    def test_every_listed_option_stays_approved(self):
+        """Spelled out rather than read from `GIT_GLOBAL_FLAGS`, so that a change to the list
+        is a change here too: an option added there that takes a value would hide the
+        subcommand again, and fails the equality below unless this test changes with it."""
+        listed = (
+            "-p",
+            "--paginate",
+            "-P",
+            "--no-pager",
+            "--no-replace-objects",
+            "--no-lazy-fetch",
+            "--no-optional-locks",
+            "--no-advice",
+            "--literal-pathspecs",
+            "--no-literal-pathspecs",
+            "--glob-pathspecs",
+            "--noglob-pathspecs",
+            "--icase-pathspecs",
+        )
+        self.assertEqual(hook.GIT_GLOBAL_FLAGS, frozenset(listed))
+        self.assertEqual(hook.GIT_VERSION_FLAGS, frozenset({"--version", "-v"}))
+        for flag in listed:
+            with self.subTest(flag=flag):
+                self.assert_allowed(f"git {flag} log -1")
+                self.assert_allowed(f"git -C docs {flag} log -1")
+
+    @staticmethod
+    def _git_env(root: str) -> dict[str, str]:
+        """`sandbox_env`, with no system config and an identity to commit as."""
+        identity = {
+            f"GIT_{role}_{field}": value
+            for role in ("AUTHOR", "COMMITTER")
+            for field, value in (("NAME", "t"), ("EMAIL", "t@example.com"))
+        }
+        return sandbox_env(root) | {"GIT_CONFIG_NOSYSTEM": "1"} | identity
+
+    @contextlib.contextmanager
+    def _repository(self):
+        """A scratch tree holding a repository, `work`, with one commit, an untracked file and
+        a branch `victim`, and its `origin`, a bare repository beside it."""
+        with scratch_tree() as root:
+            env = self._git_env(root)
+            work, origin = Path(root, "work"), Path(root, "origin.git")
+            for argv in (
+                [GIT, "init", "-q", str(work)],
+                [GIT, "init", "-q", "--bare", str(origin)],
+                [GIT, "-C", str(work), "commit", "-q", "--allow-empty", "-m", "init"],
+                [GIT, "-C", str(work), "branch", "victim"],
+                [GIT, "-C", str(work), "remote", "add", "origin", str(origin)],
+            ):
+                subprocess.run(argv, env=env, capture_output=True, check=True, timeout=10)
+            (work / "untracked.txt").write_text("x\n")
+            yield root
+
+    def _facts(self, root: str) -> dict[str, bool]:
+        """What each executed command changes, read with `git` itself."""
+        env = self._git_env(root)
+        work, origin = Path(root, "work"), Path(root, "origin.git")
+
+        def has(repository: Path, ref: str) -> bool:
+            argv = [GIT, "-C", str(repository), "show-ref", "--verify", "--quiet", ref]
+            return subprocess.run(argv, env=env, check=False, timeout=10).returncode == 0
+
+        return {
+            "untracked file": (work / "untracked.txt").exists(),
+            "branch victim": has(work, "refs/heads/victim"),
+            "pushed branch": has(origin, "refs/heads/pwned"),
+        }
+
+    @needs_bash
+    @needs_git
+    def test_git_runs_the_hidden_subcommand(self):
+        for command, oldest, fact in self.EXECUTED:
+            with self.subTest(command=command):
+                if GIT_VERSION < oldest:  # noqa: SIM300 - the git found, against the case's minimum
+                    self.skipTest(f"git {GIT_VERSION} reads no value for this option")
+                self.assert_refused(command, "runs the subcommand after the value")
+                with self._repository() as root:
+                    before = self._facts(root)
+                    result = self._run(root, command)
+                    after = self._facts(root)
+                self.assertNotEqual(
+                    before[fact], after[fact], f"git left the {fact} as it was:\n{result.stderr}"
+                )
+
+    @needs_bash
+    @needs_git
+    def test_git_runs_version_with_the_words_after_it(self):
+        """Each command is approved, and must change nothing: git 2.48.1 fails both with
+        `unknown switch`, from `git version`."""
+        for command, fact in self.APPROVED_AND_EXECUTED:
+            with self.subTest(command=command):
+                self.assert_allowed(command, "git runs version, with the words after it")
+                with self._repository() as root:
+                    before = self._facts(root)
+                    result = self._run(root, command)
+                    after = self._facts(root)
+                self.assertEqual(
+                    before[fact], after[fact], f"git changed the {fact}:\n{result.stderr}"
+                )
+
+    def _run(self, root: str, command: str) -> subprocess.CompletedProcess:
+        """Run ``command`` with bash in the scratch repository, as an agent would."""
+        return subprocess.run(
+            [BASH, "-c", command],
+            cwd=Path(root, "work"),
+            env=self._git_env(root),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+
+class GitGlobalOptionsUnderOperatorRules(Verdicts, unittest.TestCase):
+    """The cases of `RefusesUnlistedGitGlobalOptions` that install a rule file.
+
+    Kept apart because the harvester skips any class that does (`RULE_DEPENDENT`), and the
+    approvals of that class are worth executing. An unlisted global option is `NoOpinion`, so an
+    operator's rule for its exact shape approves it; an option the walk refuses stays refused,
+    whatever the rules say.
+    """
+
+    assert_no_opinion = RefusesUnlistedGitGlobalOptions.assert_no_opinion
+    assert_refused_outright = RefusesUnlistedGitGlobalOptions.assert_refused_outright
+
+    def test_an_option_the_list_lacks(self):
+        """`--frobnicate` stands for the next option git adds: a rule for that exact shape
+        approves it. The attached `--attr-source=` stays refused under a rule that matches it,
+        as an option known to take a value."""
+        self.assert_no_opinion("git --frobnicate log -1", "the control: no rule")
+        with operator_rules(allow=["Bash(git --frobnicate log *)"]):
+            self.assert_allowed("git --frobnicate log -1", "the operator granted this shape")
+        with operator_rules(allow=["Bash(git --attr-source*)"]):
+            self.assert_refused_outright("git --attr-source=HEAD log -1", "takes a value")
+
+    def test_a_refused_option_after_one_the_list_lacks(self):
+        """Whether the unlisted option takes the next word decides where git's options end, so
+        an option the walk refuses, anywhere after it, is refused outright too. That costs a
+        prompt where the refused spelling was a subcommand's own flag, as in `grep -c`."""
+        with operator_rules(allow=["Bash(git *)"]):
+            for command in (
+                "git --frobnicate -c core.pager=touch log",
+                "git --frobnicate x --git-dir=elsewhere log",
+                "git --frobnicate log --attr-source log clean -fdx",
+                "git --frobnicate grep -c x",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "the option may be git's own")
+            self.assert_allowed("git --frobnicate log -1", "the control: nothing refused after it")
 
 
 @approvals_budgeted
