@@ -1845,6 +1845,191 @@ class MatchesTheHostsOwnCaution(Verdicts, unittest.TestCase):
                 self.assert_allowed(control, "the control")
                 self.assert_refused(refused, "a file named -o, -delete, -i or --output=x")
 
+    def test_a_glob_given_to_any_program_with_a_validator(self):
+        """A validator reads the words, and a wildcard the shell expands is words it never
+        read. Beside a file named `-f`, `awk [-]f x` runs `x` as an awk program; beside one
+        named `x;BEGIN{system("id")}`, `awk x*` runs that; beside `a.txt` and `b.txt`, `uniq
+        *.txt` writes over `b.txt`; beside one named `-v`, `printf [-]v PATH .` sets `PATH` for
+        the commands after it. Quoted, each is the word it spells."""
+        for refused, control in (
+            ("printf [-]v PATH .", "printf '%s\\n' [-]v"),
+            ("awk [-]f x", "awk '[-]f' x"),
+            ("gawk [-]f x", "gawk '[-]f' x"),
+            ("awk x* /dev/null", "awk 'x*' /dev/null"),
+            ("uniq *.txt", "uniq a.txt"),
+            ("xxd *.bin", "xxd a.bin"),
+            ("file [-]C [-]m x", "file x"),
+            ("tail [-]f x", "tail -n 5 x"),
+            ("date [-]s 2020-01-01", "date +%s"),
+            ("jq e* f.json", "jq . f.json"),
+            ("cd d*", "cd docs"),
+            ("gh api [-]XPOST repos/a/b/issues", "gh api repos/a/b/issues"),
+        ):
+            with self.subTest(command=refused):
+                self.assert_allowed(control, "the control")
+                self.assert_refused_outright(refused, "the program gets what the directory held")
+
+    def test_an_unquoted_jq_index_is_a_glob_too(self):
+        """`.[0]` is a bracket expression, so jq gets `.0` beside a file of that name, and zsh
+        runs nothing without one ("no matches found"). The cost of the rule above: quoted, it
+        is the filter it spells."""
+        self.assert_allowed("jq '.[0]' f.json", "the control: quoted")
+        self.assert_refused_outright("jq .[0] f.json", "a bracket expression the shell expands")
+
+    def test_a_value_bash_globs_where_a_validator_gets_it(self):
+        """bash splits and globs what an unquoted `$q` expands to where it is used, glued to text
+        or not: `q='*'; awk x$q /dev/null` is `awk x*`, which runs a file named
+        `x;BEGIN{system("id")}` as its program; `q='a -o out'; sort x$q` is `sort xa -o out`;
+        and `q=']'; sort [-${q}o x` is `sort [-]o x`. A value the module did not read, or one
+        that splits or holds a pattern character, is refused; a plain word the command spells
+        out, or a use in quotes, is the word it reads."""
+        for unread, control in (
+            ("q='*'; awk x$q /dev/null", "q=x; awk x$q /dev/null"),
+            ("for f in '*'; do awk x$f /dev/null; done", "for f in a; do awk x$f /dev/null; done"),
+            ("for f in '*'; do uniq a$f; done", "for f in a b; do uniq x$f; done"),
+            ("for f in *.md; do uniq a$f; done", 'for f in *.md; do uniq "a$f"; done'),
+            ("awk x$_ /dev/null", "awk 'x$_' /dev/null"),
+            ("q='a -o out'; sort x$q", "q=a; sort x$q"),
+            ("for f in 'a -o out'; do sort x$f; done", 'for f in "a -o out"; do sort "x$f"; done'),
+            ("q='a -i'; sed -e p x$q", "q=''; sed -e p x$q"),
+            ("q=']'; sort [-${q}o x", "q=']'; sort \"[-${q}o\" x"),
+            ("for f in ']'; do sort [-${f}o x; done", "for f in ']'; do sort \"[-${f}o\" x; done"),
+            ("q='['; sort ${q}-]o x", "q='['; sort \"${q}-]o\" x"),
+            # The value as assigned, not as `splice_vars` splits it: bash keeps the edges
+            ("q=' -o'; sort x$q out", "q=' -o'; sort \"x$q\" out"),
+            ("q='a '; sort x${q}-oout in", "q='a '; sort \"x${q}-oout\" in"),
+        ):
+            with self.subTest(command=unread):
+                self.assert_allowed(control, "the control")
+                self.assert_refused_outright(unread, "bash splits or globs the value where used")
+
+    def test_a_known_value_that_makes_its_word_a_flag(self):
+        """`_word_the_shell_decides` lets a parameter glued to text through, as a value an
+        earlier command set. When this command sets it, the validator reads the word with the
+        value in place, however the word spells it: `q=-o; sort ${q}ut in`, `''${q}ut`,
+        `${q}${r}ut` with an empty `q`, and `q=o; sort -${q}ut in` are each `sort -out in`, which
+        writes `ut`. A value the command doesn't set may not spell a flag's name, and an operator
+        can supply the `-` itself."""
+        for refused, control in (
+            ("q=-o; sort ${q}ut in", "q=o; sort ${q}ut in"),
+            ('q=-o; sort "${q}ut" in', 'q=o; sort "${q}ut" in'),
+            ("q='-o '; sort ${q}out in", "q=o; sort ${q}out in"),
+            ('for f in -o; do sort "${f}ut" in; done', 'for f in o; do sort "${f}ut" in; done'),
+            ("q=''; sort \"${q}-oout\" in", "q=''; sort \"${q}oout\" in"),
+            ('q=-v; printf "${q}x" PATH', 'q=v; printf "${q}x" PATH'),
+            ('git log "${R:--p}x"', 'git log "${R}x"'),
+            # An empty part before the expansion, and an expansion after an empty one
+            ("q=-o; sort ''${q}ut in", "q=x; sort ''${q}ut in"),
+            ("q=''; r=-o; sort ${q}${r}ut in", "q=''; r=x; sort ${q}${r}ut in"),
+            # A `-` the command spells, and letters a value supplies
+            ("q=o; sort -${q}ut in", "q=r; sort -${q}ut in"),
+            ("q=i; sed -e p -${q} x", "q=n; sed -e p -${q} x"),
+            ("q=f; awk -${q} prog", "q=F; awk -${q}: '{print}' prog"),
+            ('git log "-${N}"', 'git log --since="${D}" -1'),
+        ):
+            with self.subTest(command=refused):
+                self.assert_allowed(control, "the control")
+                self.assert_refused_outright(refused, "the word arrives as a flag")
+
+    def test_a_backslash_inside_double_quotes_is_kept_as_bash_keeps_it(self):
+        r"""Inside double quotes bash drops a backslash only before `$`, a backtick, `"`, `\` and a
+        newline, so `q=--; git log "${q}output=x\y" -1` is `git log --output=x\y -1`, which
+        writes `x\y`, under zsh too. The word is read with the value in place, as it is without
+        the backslash, and a backslash in a `sed` script beside an expansion stays approved."""
+        for refused, control in (
+            ('q=--; git log "${q}output=x\\y" -1', 'q=x; git log "${q}output=x\\y" -1'),
+            ('q=-o; sort "${q}u\\t" in', 'q=r; sort "${q}u\\t" in'),
+            ('q=i; sed -e p "-${q}\\x" x', 'q=i; sed -e p "x-${q}\\x" x'),
+        ):
+            with self.subTest(command=refused):
+                self.assert_allowed(control, "the control")
+                self.assert_refused_outright(refused, "the word arrives as a flag")
+        self.assert_allowed('sed "s/\\(a\\)/${x}/" README.md', "a backslash in a sed script")
+
+    def test_a_word_with_too_many_shapes_is_left_to_the_rules(self):
+        """Each combination of the values a word's names hold is one shape of it, and past
+        `MAX_WORD_SHAPES` the word is not read: nine loop values twice over are 81 shapes, one
+        of them `--output=x`, which bash runs first. Eight are 64 shapes, read and refused."""
+        self.assert_allowed(
+            "q=x; for a in '' b c d e f g h; do git log \"${a}${a}${q}output=x\" -1; done",
+            "the control: 64 shapes, none of them a flag",
+        )
+        self.assert_refused_outright(
+            "q=--; for a in '' b c d e f g h; do git log \"${a}${a}${q}output=x\" -1; done",
+            "64 shapes, read: one is --output=x",
+        )
+        self.assert_no_opinion(
+            "q=--; for a in '' b c d e f g h i; do git log \"${a}${a}${q}output=x\" -1; done",
+            "81 shapes, which this module does not read",
+        )
+
+    def test_a_name_the_command_binds_to_a_value_it_never_read(self):
+        """A name the command binds where this module reads no value is not one an earlier
+        command set: a second assignment, an append, an assignment after `do`, `then` or `{`, a
+        header inside a loop's body, a glob list, which a planted file name decides, a second
+        name in a zsh `for` header, `$_`, which each command sets to its last word, and a name
+        the command around a substitution binds. Each can make the word it starts a flag:
+        `q=a; q=--; git log "${q}output=x" -1` writes `x`, and so do
+        `for f in *; do git log "${f}utput=x" -1; done` beside a file named `--o`,
+        `echo --o; git log "${_}utput=x" -1` and `q=--; echo "$(git log "${q}output=x" -1)"`,
+        under bash and zsh both. After an `=`, the value is a flag's own."""
+        for refused, control in (
+            ('q=a; q=--; git log "${q}output=x" -1', 'q=a; q=--; git log --author="${q}" -1'),
+            ('q=-; q+=-; git log "${q}output=x" -1', 'q=-; q+=-; git log --author="${q}" -1'),
+            ('q=a; q=-o; sort "${q}ut" in', 'q=a; sort "${q}ut" in'),
+            (
+                'for f in [-]-o; do git log "${f}utput=x" -1; done',
+                'for f in [-]-o; do git log --author="${f}" -1; done',
+            ),
+            (
+                'for f in *; do git log "${f}utput=x" -1; done',
+                'for f in *; do git log -1 -- "x${f}"; done',
+            ),
+            (
+                'q=a; for i in 1; do q=--; done; git log "${q}output=x" -1',
+                'q=a; for i in 1; do true; done; git log "${q}output=x" -1',
+            ),
+            (
+                'for i in 1; do q=--; done; git log "${q}output=x" -1',
+                'for i in 1; do q=--; done; git log --author="${q}" -1',
+            ),
+            ('q=a; { q=-o; }; sort "${q}ut" in', 'q=a; { true; }; sort "${q}ut" in'),
+            (
+                'if true; then q=--; fi; git log "${q}output=x" -1',
+                'if true; then q=--; fi; git log --author="${q}" -1',
+            ),
+            (
+                'for q in a; do for q in --o; do git log "${q}utput=x" -1; done; done',
+                'for q in a; do for q in b; do git log --author="${q}" -1; done; done',
+            ),
+            # zsh binds every name before `in`; bash refuses the syntax
+            (
+                'for q p in a --o; do git log "${p}utput=x" -1; done',
+                'for q p in a b; do git log --author="${p}" -1; done',
+            ),
+            # Every command sets `$_` to its last word
+            ('echo --o; git log "${_}utput=x" -1', 'echo --o; git log --author="${_}" -1'),
+            # A substitution inherits the variables of the command around it
+            (
+                'q=--; echo "$(git log "${q}output=x" -1)"',
+                'q=--; echo "$(git log --author="${q}" -1)"',
+            ),
+            (
+                'for q in --; do echo "$(git log "${q}output=x" -1)"; done',
+                'for q in --; do echo "$(git log --author="${q}" -1)"; done',
+            ),
+        ):
+            with self.subTest(command=refused):
+                self.assert_allowed(control, "the control")
+                self.assert_refused_outright(refused, "the word arrives as a flag")
+
+    def test_a_glob_given_to_a_program_without_a_validator(self):
+        """A program in `READ_ONLY` with no validator has no flag worth forging, so the rule
+        above leaves its globs alone: these read whatever the shell hands them."""
+        for command in ("cat *.md", "wc -l *.py", "grep x *.md", "printf '%s\\n' *"):
+            with self.subTest(command=command):
+                self.assert_allowed(command)
+
     def test_a_bracket_the_shell_leaves_alone(self):
         """A `[` with no `]` after it is no pattern: bash passes it as spelled and zsh refuses
         the command, so neither can turn it into a flag."""
@@ -3775,6 +3960,22 @@ class RefusesAllowlistedProgramsThatWrite(Verdicts, unittest.TestCase):
         self.assert_refused("xxd -r a.hex AGENTS.md", "overwrites AGENTS.md")
         self.assert_refused("echo x | uniq - /tmp/evil", "writes /tmp/evil from the pipe")
         self.assert_refused("printf 'x' | xxd -r - /tmp/evil", "writes /tmp/evil")
+
+    def test_a_wildcard_can_be_two_operands(self):
+        """One word to the operand count, and as many as it matches when the program runs.
+
+        Beside `AGENTS.md` and `README.md`, `uniq [AR]*.md` is `uniq AGENTS.md README.md`, which
+        overwrites `README.md`, and no file of a chosen name has to be there first (#43). From
+        #44, which refused these in `_check_uniq` and `_check_xxd`.
+        """
+        for program in ("uniq", "xxd"):
+            with self.subTest(program=program):
+                self.assert_allowed(f"{program} AGENTS.md", "the control: one operand")
+                self.assert_allowed(f"{program} '[AR]*.md'", "the control: quoted, one file")
+                self.assert_allowed(f"sort AGENTS.md | {program}", "the control: reads the pipe")
+                self.assert_refused_outright(f"{program} [AR]*.md", "overwrites README.md")
+                self.assert_refused_outright(f"{program} *", "overwrites the second of two")
+                self.assert_refused_outright(f"{program} -- AGENTS.m?", "after the terminator")
 
     def test_writing_flags_the_table_omits(self):
         """`WRITING_FLAGS` matches `flag`, `flag=`, and attached two-character shorts.
