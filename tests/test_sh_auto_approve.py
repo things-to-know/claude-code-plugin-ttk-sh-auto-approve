@@ -2023,6 +2023,21 @@ class MatchesTheHostsOwnCaution(Verdicts, unittest.TestCase):
                 self.assert_allowed(control, "the control")
                 self.assert_refused_outright(refused, "the word arrives as a flag")
 
+    def test_a_word_timeout_reads_for_itself(self):
+        """`timeout` takes its options and duration by position, so a word among them that the
+        shell splits or globs moves the command it runs: beside files `5` and `rm`, `timeout
+        [5r]* cat README.md` is `timeout 5 rm cat README.md`, and under bash `t='5 rm'; timeout
+        $t cat README.md` is too, with no file needed."""
+        for refused, control in (
+            ("timeout [5r]* cat README.md", "timeout 5 cat '[5r]*'"),
+            ("timeout 5* cat README.md", "timeout 5 cat README.md"),
+            ("t='5 rm'; timeout $t cat README.md", "t='5 rm'; timeout 5 cat \"$t\""),
+            ("timeout [-]s KILL 5 cat README.md", "timeout -s KILL 5 cat README.md"),
+        ):
+            with self.subTest(command=refused):
+                self.assert_allowed(control, "the control")
+                self.assert_refused_outright(refused, "the shell moves the command timeout runs")
+
     def test_a_glob_given_to_a_program_without_a_validator(self):
         """A program in `READ_ONLY` with no validator has no flag worth forging, so the rule
         above leaves its globs alone: these read whatever the shell hands them."""

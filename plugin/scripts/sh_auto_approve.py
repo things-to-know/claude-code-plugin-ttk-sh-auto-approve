@@ -3153,6 +3153,19 @@ def _check_command(
     # the inner program's; the inner `_check_command` splices again with the same vars.
     if program in WRAPPERS:
         inner = WRAPPERS[program](words[1:])
+        # The wrapper's own words are read by position, so one the shell splits or globs
+        # moves the command it runs: beside files `5` and `rm`, `timeout [5r]* cat README.md`
+        # is `timeout 5 rm cat README.md`, and under bash `t='5 rm'; timeout $t cat README.md`
+        # is too, with no file needed.
+        for word in words[1 : len(words) - len(inner)]:
+            if (
+                _carries_live_glob(word)
+                or _has_bare_variable(word, parts)
+                or _carries_substitution(word, parts)
+            ):
+                raise NotReadOnly(
+                    f"{program} given a word the shell still builds: {_expand(word, parts)}"
+                )
         _check_command(inner, parts, depth + 1, safe_names, splice_vars, scope, known_values)
         return
 
