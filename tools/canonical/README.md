@@ -1,7 +1,7 @@
 # Canonical-grammar prototype
 
-A prototype for #47, not wired into the hook. Instead of approving the text Claude wrote, the hook would
-parse it with a small static grammar, validate the argv it gets, and approve its own
+A prototype for #47, not wired into the hook. Instead of approving the text Claude wrote, the
+hook would parse it with a small static grammar, validate the argv it gets, and approve its own
 re-serialization through `hookSpecificOutput.updatedInput.command`. What runs is the hook's text,
 so safety rests on two things:
 
