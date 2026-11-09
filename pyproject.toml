@@ -14,7 +14,7 @@ dev = [
     # `make test-coverage`: `patch = ["subprocess"]`, below, needs 7.10 or later
     "coverage==7.17.0",
     # The formatter: its output has to match on every machine and in CI, so the version is exact
-    "ruff==0.17.1",
+    "ruff==0.17.2",
 ]
 
 [tool.uv]
