@@ -78,3 +78,11 @@ convention = "pep257"
     "SLF001",
     "T201",
 ]
+# The canonical-grammar prototype: scripts run by path, never imported as a package; they
+# print their reports, run bash and zsh with a fixed argv, and fuzz from a seeded `random`
+"tools/canonical/*.py" = [
+    "INP001",
+    "S311",
+    "S603",
+    "T201",
+]
