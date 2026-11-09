@@ -215,6 +215,12 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
     `BASE=<revision>` compares with another
   - Past a dozen rows: a summary table, one example per issue or cause with its count, and
     every row below it in a collapsed `<details>`
+- Reproduce a gap that reaches a credential store against a fake store, never the real `~/.ssh`,
+  `~/.aws` or another
+  - While a link to a real store sits in a directory the hook approves reads from, such as the
+    scratchpad, the gap under test can read through it with no prompt
+  - Make a scratch home holding the fake store, with the project inside it; the hook reads `HOME`
+    at call time: `HOME=<home> make explain PROJECT=<home>/proj CWD=<home>/proj NO_RULES=1`
 - Triage a command that prompted by replaying it in its session's context, never a guessed one:
   - Find the session's transcript by its id: `ls ~/.claude/projects/*/<session-id>.jsonl`. It
     moves when the session is resumed elsewhere, and every directory there starts with `-`, so
