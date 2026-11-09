@@ -1021,6 +1021,23 @@ def _carries_substitution(token: str, parts: list[tuple[str, str]]) -> bool:
     return any(parts[int(index)][0] in RUNS_A_COMMAND for index in PLACEHOLDER.findall(token))
 
 
+def _has_wildcard(text: str) -> bool:
+    """Whether the shell would match this text against the directory, were it unquoted.
+
+    The wildcards are `*`, `?` and a bracket expression: a `[` that a later `]` closes, which
+    both shells match against the directory as they match the other two, so `[-]delete` is
+    `-delete` once a file of that name is there. A `[` with no `]` after it is none: bash leaves
+    the word as it is spelled, and zsh refuses to run the command ("bad pattern"). Any `]`
+    counts as the close, which errs toward a wildcard: bash reads `[]x` and `[!]` as unclosed,
+    while zsh globs both. Two `find` calls, not a regex: a search for `[`, anything, `]`
+    restarts at each `[` it fails from, which is quadratic in a word of unclosed ones.
+    """
+    if "*" in text or "?" in text:
+        return True
+    start = text.find("[")
+    return start >= 0 and text.find("]", start + 1) >= 0
+
+
 def _carries_live_glob(token: str) -> bool:
     """Whether the shell will expand a wildcard in this word.
 
@@ -1029,9 +1046,10 @@ def _carries_live_glob(token: str) -> bool:
     star through and `find` does the matching, in the second the shell has already
     replaced the word with whatever the directory held -- which is how an operand becomes
     a flag. Only the unquoted one is a hazard, and only the reduced token can tell them
-    apart, because quoting put the quoted one in the parts table.
+    apart, because quoting put the quoted one in the parts table. The wildcards are the ones
+    `_has_wildcard` lists.
     """
-    return any(char in "*?" for char in PLACEHOLDER.sub("", token))
+    return _has_wildcard(PLACEHOLDER.sub("", token))
 
 
 # A brace expansion the shell performs before the command runs: `{a,b}`, `{a,}`, `{1..3}`,
@@ -1154,7 +1172,11 @@ def _literal_assignments(
             expanded_value = _expand(value_token, parts)
             if (
                 _carries_substitution(value_token, parts)
-                or _carries_live_glob(value_token)
+                # The value as expanded, not the token: bash globs the words of an unquoted
+                # `$q` where it is used, however the assignment quoted them, so `q='*'; find .
+                # $q` hands find every name in the directory. zsh does not, but `${=q}` and
+                # `$q` are read the same here.
+                or _has_wildcard(expanded_value)
                 or _carries_brace_expansion(value_token)
                 or _has_bare_variable(value_token, parts)
                 # Defense in depth: word-splitting does not re-run the parser, so a `;` in
@@ -1206,6 +1228,75 @@ PATH_COMPONENT = "\x02entry\x02"
 LISTING_BODY = re.compile(r"^\s*ls(?:\s+-1)?(?:\s+[A-Za-z0-9_./-]+)*\s*$")
 
 
+def _glob_may_climb(path: str) -> bool:
+    """Whether a path the shell globs can land above the directory in front of its wildcard.
+
+    The read scope places a globbed path in that directory, which holds only while nothing
+    from the wildcard on climbs out of it. A `..` after the wildcard, as in `*/../../x`, climbs
+    from whatever the wildcard matched. A component that starts with `.` and carries a
+    wildcard, as `.*` and `.?` do, matches `..` itself in a bash older than 5.2, or in one
+    with `globskipdots` off.
+    """
+    special = PATH_SPECIAL.search(path)
+    if special is None:
+        return False
+    start = path.rfind("/", 0, special.start()) + 1
+    return any(
+        component == ".." or _may_match_dot_dot(component) for component in path[start:].split("/")
+    )
+
+
+def _may_match_dot_dot(component: str) -> bool:
+    """Whether a glob component can match `..`: a `.`, then a rest that can be `.` alone.
+
+    `.*`, `.?` and `.[!a]` can; `.env*` can't, as its `e` is no `.`. A bracket expression counts
+    as one that matches `.`, and a value the shell supplies, `$`, `{` or a backtick, as one that
+    may be `.`, both of which err toward a climb.
+    """
+    if not component.startswith("."):
+        return False
+    rest = component[1:]
+    if any(char in rest for char in "${`"):
+        return True
+    positions = {0}  # how much of the one-character "." the pattern has consumed
+    index = 0
+    while index < len(rest) and positions:
+        char = rest[index]
+        close = _bracket_end(rest, index) if char == "[" else -1
+        if char == "*":
+            positions = {0, 1} if 0 in positions else positions
+        elif char == "?" or close >= 0:
+            positions = {1} if 0 in positions else set()
+            index = close if close >= 0 else index
+        else:
+            positions = {1} if char == "." and 0 in positions else set()
+        index += 1
+    return 1 in positions
+
+
+def _bracket_end(text: str, start: int) -> int:
+    """The index of the `]` that closes the bracket expression at `start`, or -1.
+
+    A `]` first in the set, after any `!` or `^`, is a member, and `[:punct:]`, `[=a=]` and
+    `[.a.]` inside it are one member each, whose own `]` closes nothing.
+    """
+    index = start + 1
+    if text[index : index + 1] in ("!", "^"):
+        index += 1
+    if text[index : index + 1] == "]":
+        index += 1
+    while index < len(text):
+        if text[index] == "[" and text[index + 1 : index + 2] in (":", "=", "."):
+            end = text.find(text[index + 1] + "]", index + 2)
+            if end >= 0:
+                index = end + 2
+                continue
+        if text[index] == "]":
+            return index
+        index += 1
+    return -1
+
+
 def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | None:
     """What one `for`-list word contributes to the variable, for the read scope.
 
@@ -1226,10 +1317,19 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
         return None
     if _carries_live_glob(token):
         head = PATH_SPECIAL.split(expanded, 1)[0]
-        directory, _, stem = head.rpartition("/")
-        if stem.startswith(".") or expanded.startswith(("/", "~")) or ".." in directory.split("/"):
+        directory = head.rpartition("/")[0]
+        if (
+            _glob_may_climb(expanded)
+            or expanded.startswith(("/", "~"))
+            or ".." in directory.split("/")
+        ):
             return None
         return [f"{directory}/{PATH_COMPONENT}" if directory else PATH_COMPONENT]
+    # Quoted, the word is a literal here, but bash globs it again where an unquoted `$f` uses
+    # it: `for f in '.?'; do grep -r x $f; done` reads `..` in a bash older than 5.2. Placed as
+    # the literal it spells, such a value would be measured below the directory it climbs from.
+    if _has_wildcard(expanded) and _glob_may_climb(expanded):
+        return None
     return [expanded]
 
 
@@ -1641,8 +1741,13 @@ def _check_awk(args: list[str]) -> None:
             raise NotReadOnly("awk external access function")
 
 
-def _check_git(args: list[str]) -> None:
+def _check_git(args: list[str], live_globs: list[bool]) -> None:
     """Validate ``git`` subcommands, ensuring read-only behavior and safe options."""
+    # A wildcard the shell expands can supply a flag: `git log [-]-output=x` is `git log
+    # --output=x` once a file of that name is there. The check on `*` and `?` below reads the
+    # expanded words, so it misses a bracket expression and refuses a quoted `'*'` too.
+    if any(live_globs):
+        raise NotReadOnly("git with an unquoted glob")
     # Flags that write a file or run a program, wherever they are: after the subcommand they are
     # its own (`git diff --output=x`), and before it `--exec-path=<dir>` is git's. The global
     # options that set config or move the repository are refused by `_git_global_options`,
@@ -2713,7 +2818,7 @@ MAX_WRAPPER_DEPTH = 4
 # Explicit dispatch table mapping programs to their dedicated validator functions
 # Validators that need to know which words carry a wildcard the shell will expand, and
 # so take the parallel `live_globs` list as a second argument.
-GLOB_AWARE = frozenset({"find", "sed", "sort"})
+GLOB_AWARE = frozenset({"find", "git", "sed", "sort"})
 
 PROGRAM_VALIDATORS = {
     "aws": _check_aws,
@@ -3323,6 +3428,8 @@ def _read_scope_problem(
     for spelled in candidates:
         candidate = _expand_home(spelled, tilde=False)
         if _carries_live_glob(token):
+            if _glob_may_climb(candidate):
+                return f"a glob that may climb out of its directory: {candidate}"
             # The directory the glob runs in: everything up to the last `/` before it.
             head = PATH_SPECIAL.split(candidate, 1)[0]
             candidate = head.rsplit("/", 1)[0] if "/" in head else "."

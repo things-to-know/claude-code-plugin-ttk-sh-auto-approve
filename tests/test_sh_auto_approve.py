@@ -1829,6 +1829,45 @@ class MatchesTheHostsOwnCaution(Verdicts, unittest.TestCase):
         self.assert_refused("find . *", "a file named -delete makes this a write")
         self.assert_refused("git log *", "a glob can supply a git flag")
 
+    def test_a_bracket_expression_can_expand_into_a_flag(self):
+        """`[-]o` is `-o` once a file of that name is in the directory, in bash and zsh both.
+        Quoted, it is the file it spells."""
+        for refused, control in (
+            ("sort [-]o x.txt", "sort '[-]o' x.txt"),
+            ("sort []-]o x.txt", "sort '[]-]o' x.txt"),
+            ("find . [-]delete", "find . '[-]delete'"),
+            ("find . [[:punct:]]delete", "find . -name '[[:punct:]]delete'"),
+            ("sed -e p [-]i x.txt", "sed -e p '[-]i' x.txt"),
+            ("git log [-]-output=Makefile", "git log '[-]p'"),
+            ('for f in [-]o; do sort "$f" x.txt; done', 'for f in o; do sort "$f" x.txt; done'),
+        ):
+            with self.subTest(command=refused):
+                self.assert_allowed(control, "the control")
+                self.assert_refused(refused, "a file named -o, -delete, -i or --output=x")
+
+    def test_a_bracket_the_shell_leaves_alone(self):
+        """A `[` with no `]` after it is no pattern: bash passes it as spelled and zsh refuses
+        the command, so neither can turn it into a flag."""
+        self.assert_allowed("sort x.txt [-o", "unclosed")
+        self.assert_allowed("sort x.txt \\[-]o", "the `[` is escaped")
+        self.assert_refused("sort x.txt [-]o", "the same word, closed")
+
+    def test_a_glob_as_the_git_directory(self):
+        """`-C` takes the next word as its directory, and a glob there that matches two
+        entries is two words: beside `c/` and `clean`, `git -C c* status -fdx :/` is
+        `git -C c clean status -fdx :/`, and git runs `clean`. Quoted, it is the directory it
+        spells."""
+        for refused, control in (
+            ("git -C c* status -fdx :/", "git -C c status -fdx :/"),
+            ("git -C c* log -1", "git -C 'c*' log -1"),
+            ("git -C c? status", "git -C c status"),
+            ("git -C [ac]lean status -fdx :/", "git -C '[ac]lean' status"),
+            ("git -C doc* log -1", "git -C docs log -1"),
+        ):
+            with self.subTest(command=refused):
+                self.assert_allowed(control, "the control")
+                self.assert_refused(refused, "beside c/ and clean, git runs clean")
+
     def test_file_with_path_opening_flags(self):
         self.assert_refused("file -m /tmp/magic a.md", "opens /tmp/magic")
         self.assert_refused("file -f /tmp/list a.md", "opens /tmp/list")
@@ -2144,6 +2183,17 @@ class SplicesFlagsFromALiteralAssignment(Verdicts, unittest.TestCase):
             "the value carries a second, unread variable",
         )
 
+    def test_a_value_bash_globs_where_it_is_used(self):
+        """Bash globs the words of an unquoted `$q` at the use site, however the assignment
+        quoted them: with a file named `-delete` in the directory, `q='*'; find . $q` is
+        `find . -delete`."""
+        self.assert_allowed("q=x; find . $q", "the control: a literal word")
+        for value in ("'*'", "\\*", '"?delete"', "'[-]delete'"):
+            with self.subTest(value=value):
+                self.assert_refused(f"q={value}; find . $q", "globbed at the use site")
+        self.assert_allowed("_o='-r'; sort ${=_o} AGENTS.md", "the control: a literal flag")
+        self.assert_refused("_o='[-]o'; sort ${=_o} AGENTS.md", "`-o`, given a file of that name")
+
     def test_a_value_with_a_shell_metacharacter_is_not_resolved(self):
         """Word-splitting leaves these inert, so bash would not run the `rm` -- but a value
         shaped like a command is refused rather than spliced."""
@@ -2237,6 +2287,8 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
         self.assert_refused("find . -name *.md")
         self.assert_refused("sort *")
         self.assert_refused("sed -n '1p' *.md")
+        self.assert_allowed("sed -n '1p' '[ab].md'", "the control: quoted, one file")
+        self.assert_refused("sed -n '1p' [ab].md", "a bracket expression is a wildcard too")
 
     def test_the_output_form_of_process_substitution(self):
         """`<(...)` runs a command. `>(...)` runs one and hands it a stream to write."""
@@ -3220,6 +3272,35 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         self.assert_refused('for f in $(ls -a); do wc -l "$f"; done', "-a lists ..")
         self.assert_refused('for f in .*; do cat "$f"; done', "may match ..")
         self.assert_refused('for f in ../*; do cat "$f"; done', "starts outside")
+
+    def test_a_glob_that_climbs_past_its_directory(self):
+        """A globbed path is measured from the directory in front of its wildcard, which holds
+        only while nothing after the wildcard climbs: `*/..` lands above whatever `*` matched,
+        and `.*` or `.?` matches `..` itself in a bash older than 5.2. `.env*` can't: its `e` is
+        no `.`."""
+        up = "/".join([".."] * 12)
+        self.assert_allowed("cat docs/*/a.md", "the control: the glob stays below docs")
+        self.assert_allowed('for f in docs/*/a.md; do cat "$f"; done', "the control, in a loop")
+        self.assert_allowed(
+            "for f in 'docs/*/a.md'; do cat $f; done", "the control: quoted, globbed at $f"
+        )
+        self.assert_allowed("cat .env*", "the control: a dot-name that can't be `..`")
+        for command in (
+            f"cat */{up}/etc/os-release",
+            f"cat docs/*/{up}/etc/os-release",
+            "cat " + "/".join([".*"] * 12) + "/etc/os-release",
+            "grep -r x .?",
+            "cat .[!a]",
+            "grep -r x .[[:punct:]]",
+            f'for f in */{up}/etc/os-release; do cat "$f"; done',
+            # Quoted in the list, and globbed where the unquoted `$f` uses it
+            "for f in '" + "/".join([".?"] * 12) + "/etc/os-release'; do cat $f; done",
+            "for f in '.?'; do grep -r x $f; done",
+            "for f in '.*'; do grep -r x $f; done",
+            "for f in '*/..'; do grep -r x $f; done",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command)
 
     def test_a_nul_byte_is_refused_rather_than_crashing(self):
         """Bash ends a string at a NUL, so the hook and bash would read different commands."""
