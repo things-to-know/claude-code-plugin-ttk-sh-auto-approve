@@ -147,6 +147,12 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
 - Before saying the hook approves, refuses or has no opinion on a command, run the command
   through `make explain` and quote the verdict it prints: reading the code is not a verdict
   - e.g. `printf '%s\n' 'grep -rf /etc/os-release .' | make explain`
+- Reproduce a gap that reaches a credential store against a fake store, never the real `~/.ssh`,
+  `~/.aws` or another
+  - While a link to a real store sits in a directory the hook approves reads from, such as the
+    scratchpad, the gap under test can read through it with no prompt
+  - Make a scratch home holding the fake store, with the project inside it; the hook reads `HOME`
+    at call time: `HOME=<home> make explain PROJECT=<home>/proj CWD=<home>/proj NO_RULES=1`
 - Triage a command that prompted by replaying it in its session's context, never a guessed one:
   - Find the session's transcript by its id: `ls ~/.claude/projects/*/<session-id>.jsonl`. It
     moves when the session is resumed elsewhere, and every directory there starts with `-`, so
