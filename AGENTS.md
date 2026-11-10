@@ -169,6 +169,8 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   `make help` lists them.
   - `make check` lints and tests as CI does, but with the linters installed on your machine and
     your `python3`
+  - The lint targets read `git ls-files`, so a new file goes unchecked until it is committed:
+    pass it, as in `make lint-py PY_FILES='<file>'`
   - For exactly CI's checks: `make check LINTERS_FROM_IMAGES=1`,
     `SH_AUTO_APPROVE_REQUIRE_ZSH=1 make test-all-python-matrix` and `make validate`
   - `make` runs `ruff` and `coverage` through `uv`, which has to be on `PATH`: from `.venv`, at
