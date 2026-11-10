@@ -3776,6 +3776,19 @@ class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase
             self.assert_allowed("cat src/lib/x.tx?", "the control")
             self.assert_refused_outright("cat k/id_rs?", "k is ~/.ssh")
 
+    def test_a_wildcard_in_proc(self):
+        """A process's environment is a name in its directory in `/proc`, which a wildcard
+        anywhere in `/proc` can reach, and so is each of its threads'."""
+        with operator_rules(allow=["Bash(cat *)"]):
+            self.assert_allowed("cat /proc/cpuinfo", "the control: the rule approves this")
+            for command in (
+                "cat /proc/self/env*",
+                "cat /proc/*/environ",
+                "cat /proc/self/task/1/environ",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
+
     def test_a_value_the_shell_supplies(self):
         """`$PWD` is each working directory, and a variable the command assigns or loops over
         is each value it gives. Any other value, a command's output included, can be any

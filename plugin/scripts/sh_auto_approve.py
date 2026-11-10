@@ -352,9 +352,11 @@ CREDENTIAL_HOME_PATHS = (
 # Absolute. `/root` is another user's home; the rest hold system credentials.
 CREDENTIAL_SYSTEM_PATHS = ("/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/root")
 
-# A process's environment and memory. `/proc/self/environ` is the hook's own environment,
-# which is where the session's tokens live.
-PROCESS_SECRETS = re.compile(r"^/proc/(?:self|thread-self|\d+)/(?:environ|mem|cmdline|auxv)\b")
+# A process's environment and memory, or one of its threads'. `/proc/self/environ` is the hook's
+# own environment, which is where the session's tokens live.
+PROCESS_SECRETS = re.compile(
+    r"^/proc/(?:self|thread-self|\d+)/(?:task/\d+/)?(?:environ|mem|cmdline|auxv)\b"
+)
 
 # Paths that read nothing from disk.
 DEVICE_READS = frozenset({"/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr"})
@@ -3611,9 +3613,12 @@ def _names_a_credential_unguarded(
                 candidate = os.path.normpath(os.path.join(resolved, partial)).rstrip("/") + "/"
             else:
                 candidate = resolved.rstrip("/") + "/" + partial
+            # A process's secrets are a name below its directory, which a wildcard anywhere
+            # in `/proc` can reach: `/proc/*/environ` and `/proc/self/env*` are each of them
             if (
                 any(root.startswith(candidate) or _is_under(candidate, root) for root in roots)
-                or PROCESS_SECRETS.match(candidate) is not None
+                or "/proc/".startswith(candidate)
+                or _is_under(candidate, "/proc")
             ):
                 return True
     return False
