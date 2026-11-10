@@ -4881,7 +4881,9 @@ def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[s
 
     Where the program spells no target, the shell picks it, and the target is `UNREAD_VALUE`:
     `pushd -` goes to `$OLDPWD`, `pushd +1` and `pushd -0` to an entry of the directory stack,
-    and a bare `cd` to `$HOME`. So does a target `_tilde_expansion` doesn't read, as `pushd ~-`.
+    and a bare `cd` to `$HOME`. So does a target `_tilde_expansion` doesn't read, as `pushd ~-`,
+    and one with a second operand: zsh's `cd old new` and `pushd old new` go to the working
+    directory with its first `old` replaced by `new`, which bash refuses.
     """
     targets = []
     program = _program_index(words)
@@ -4889,7 +4891,7 @@ def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[s
         if _expand(word, parts) not in DIRECTORY_CHANGERS:
             continue
         spelled = None
-        for following in words[index + 1 :]:
+        for position, following in enumerate(words[index + 1 :], start=index + 1):
             target = _expand(following, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
             if target in DIRECTORY_CHANGER_OPTIONS:
                 continue
@@ -4898,7 +4900,8 @@ def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[s
                     target = _tilde_expansion(target) or UNREAD_VALUE
                 if _carries_live_glob(following):
                     raise NotReadOnly(f"cd to a directory a wildcard picks: {target}")
-                spelled = target
+                if index != program or position == len(words) - 1:
+                    spelled = target
             break
         if spelled is not None:
             targets.append(spelled)

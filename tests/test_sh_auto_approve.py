@@ -4419,6 +4419,35 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
                 "pushd ~; git log --output=PWNED", "a validator's refusal still stands"
             )
 
+    def test_a_second_operand_that_rewrites_the_directory(self):
+        """zsh's `pushd old new` and `cd old new` go to the working directory with its first
+        `old` replaced by `new`, so the shell picks the directory, wherever the first operand
+        leads (#82). From `~/a/b/proj`, zsh 5.9 moved to `~/.ssh` for `pushd a/b/proj .ssh` and
+        grepped the key there, and to `~/a` for `pushd a/b/proj a`; bash 5.2 refused the second
+        operand and stayed. Layer B reads `.ssh` below that directory, as it reads a word after
+        `pushd "$d"`."""
+        with a_project_below_home(), operator_rules(allow=["Bash(pushd *)"]):
+            for command in (
+                "pushd src; grep -rl PRIVATE .",
+                "pushd src >/dev/null 2>&1; grep -rl PRIVATE .",
+                "echo pushd a b; ls",  # a word `pushd` that is no command moves nothing
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            for command in (
+                "pushd a/b/proj a; grep -rl PRIVATE .",
+                "pushd -- a/b/proj a; grep -rl PRIVATE .",
+                "pushd proj x; git status",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command)
+            self.assert_refused_outright("pushd a/b/proj .ssh; grep -rl PRIVATE .")
+        with a_project_below_home():
+            self.assert_allowed("cd src; grep -rl PRIVATE .", "the control")
+            self.assert_refused_outright(
+                "cd a/b/proj .ssh; grep -rl PRIVATE .", "`cd` takes one operand here"
+            )
+
     def test_a_glob_that_climbs_past_its_directory(self):
         """A globbed path is measured from the directory in front of its wildcard, which holds
         only while nothing after the wildcard climbs: `*/..` lands above whatever `*` matched,
