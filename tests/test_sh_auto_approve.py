@@ -5888,8 +5888,32 @@ class RefusesVendorFlagsAndSubcommands(Verdicts, unittest.TestCase):
 
     def test_git_pager_execution(self):
         """-O/--open-files-in-pager runs its argument with stdout on a pipe, so this is
-        execution and not a tty quirk."""
+        execution and not a tty quirk.
+
+        git reads the `O` anywhere in a bundle of short flags, after a `-<num>` too, and with
+        nothing after it runs the configured pager (#37). Each refused form ran the program
+        after its `O`, or the repository's `core.pager`, under bash and zsh, with git 2.43.0
+        and 2.48.1. Each control is the same command without the `O`, or with it as the pattern
+        `-e` takes.
+
+        The letters are every one `grep` reads as taking nothing: one wrongly listed in
+        `GIT_FILE_OPTIONS["grep"]` would end the walk before the `O`."""
         self.assert_refused("git grep -O'sh -c \"id\"' needle", "runs id through the pager")
+        pairs = [
+            ("git grep -5O'sh -c id' needle", "git grep -5 needle"),
+            ("git grep -inO needle", "git grep -in needle"),
+            ("git grep -inO -e needle", "git grep -ineO -e needle"),
+        ]
+        for letter in "viwaIrEGFPnhHlLzocpWq":
+            control = f"git grep -{letter} needle"
+            pairs += [
+                (f"git grep -{letter}O'sh -c id' needle", control),
+                (f"git grep -{letter}O needle", control),
+            ]
+        for refused, approved in pairs:
+            with self.subTest(refused=refused):
+                self.assert_refused(refused, "runs a program through the pager")
+                self.assert_allowed(approved, "has no O, or has it as the pattern")
 
     def test_a_git_diff_option_that_writes(self):
         self.assert_refused("git diff --output=/tmp/evil", "writes /tmp/evil")
