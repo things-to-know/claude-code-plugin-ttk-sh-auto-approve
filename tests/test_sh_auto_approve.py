@@ -3762,13 +3762,14 @@ class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase
             self.assert_refused_outright("cd -P src && cat lib2/id_rsa", "src/lib2 is ~/.ssh")
 
     def test_more_working_directories_than_it_reads(self):
-        """Each `cd` doubles the directories a relative word may be resolved from. Past the
-        cap the command is refused outright, rather than read from the first ones only."""
-        self.assertEqual(2**5, hook.MAX_WORKING_DIRECTORIES)
+        """Each `cd` doubles the directories a relative word may be resolved from, and one that
+        `CDPATH` may look up adds the home directory's. Past the cap the command is refused
+        outright, rather than read from the first ones only."""
+        self.assertEqual(2**6, hook.MAX_WORKING_DIRECTORIES)
         with a_project_below_home(), operator_rules(allow=["Bash(cat *)"]):
-            within = " && ".join(f"cd d{level}" for level in range(5))
-            self.assert_allowed(f"{within} && cat README.md", "the control: 32 directories")
-            self.assert_refused_outright(f"{within} && cd d5 && cat README.md", "64 of them")
+            within = " && ".join(f"cd ./d{level}" for level in range(6))
+            self.assert_allowed(f"{within} && cat README.md", "the control: 64 directories")
+            self.assert_refused_outright(f"{within} && cd ./d6 && cat README.md", "128 of them")
 
     def test_a_literal_part_through_a_link(self):
         with a_project_below_home():
@@ -3817,6 +3818,31 @@ class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase
                 self.assert_refused_outright('pushd "$d" && cat .ssh/id_rsa', "$d can be ~")
                 self.assert_allowed("pushd src && cat lib/x.txt", "the control")
                 self.assert_refused_outright("pushd k* && cat id_rsa", "k* can be k")
+
+    def test_a_directory_a_program_or_cdpath_moves_to(self):
+        """`git -C`, `tar -C` and `env --chdir` resolve a relative word from the directory they
+        name. Both shells look `cd .ssh` up in `CDPATH` first, which a startup file can set to
+        `~`, so `cd .ssh` is refused, and a relative word after `cd .config` is read from
+        `~/.config` too."""
+        with a_project_below_home():
+            for command in (
+                "git -C src diff --no-index lib/x.txt /dev/null",
+                "grep -C 3 one README.md",
+                "cd src && cat lib/x.txt",
+                "cd .config && ls",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            for command in (
+                "git -C src diff --no-index ../../../../.ssh/id_rsa /dev/null",
+                "git -C ../../.. diff --no-index .ssh/id_rsa /dev/null",
+                "tar -C ../../.. -cf - .ssh",
+                "env --chdir=../../.. cat .ssh/id_rsa",
+                "cd .ssh && ls",
+                "cd .config && cat gh/hosts.yml",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
 
 
 @approvals_budgeted

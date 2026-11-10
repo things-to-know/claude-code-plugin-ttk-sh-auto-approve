@@ -3597,8 +3597,8 @@ def _names_a_credential_unguarded(
     relative_directory, _, relative_partial = text[: special.start()].rpartition("/")
     if not text.startswith("/") and not relative_partial and relative_directory in ("", "."):
         # The wildcard or expansion reads the base itself, as `*` and `"$f"` do: the read
-        # scope's question. A base holds a credential store only through a link, which
-        # neither layer reads here, as for `grep -R x .`
+        # scope's question. No base is in a credential store, `_working_directories` sees to
+        # that, and a link in one is read by neither layer, as for `grep -R x .`
         return False
     for absolute in spellings:
         prefix = absolute[: len(absolute) - len(text) + special.start()]
@@ -3651,7 +3651,7 @@ def _below_an_unread_value(path: str, *, live_glob: bool) -> bool:
 # More directories than this that a relative word may be resolved from, and the command is
 # refused: each costs a resolution of every word in it, and the credential check, which refuses
 # outright, has to read the word from all of them
-MAX_WORKING_DIRECTORIES = 32
+MAX_WORKING_DIRECTORIES = 64
 
 # The programs that change the shell's working directory, and the options that leave their
 # target the next word. `_check_cd` refuses any other option, and `pushd` has no opinion.
@@ -3685,6 +3685,33 @@ def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[s
             targets.append(target)
             break
     return targets
+
+
+# The options that run a program in another directory, which it resolves a relative word from:
+# `git -C`, `make -C`, `tar -C` and `--directory`, `env -C` and `--chdir`
+DIRECTORY_OPTIONS = frozenset({"-C", "--directory", "--chdir"})
+
+
+def _program_directories(tokens: list[str], parts: list[tuple[str, str]]) -> list[str]:
+    """The directory each `DIRECTORY_OPTIONS` option in these tokens names.
+
+    Whatever program it belongs to: `grep -C 3` adds `3`, which costs a refusal at most.
+    """
+    directories = []
+    for index, token in enumerate(tokens):
+        word = _expand(token, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
+        name, equals, value = word.partition("=")
+        following = tokens[index + 1 : index + 2]
+        if equals and name in DIRECTORY_OPTIONS:
+            directories.append(value)
+        elif word.startswith("-C") and word != "-C":
+            directories.append(word[2:])
+        elif word in DIRECTORY_OPTIONS and following and not set(following[0]) <= PUNCTUATION_CHARS:
+            value = _expand(following[0], parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
+            if _carries_live_glob(following[0]):
+                value = UNREAD_VALUE
+            directories.append(os.path.expanduser(value) if following[0][0] == "~" else value)
+    return directories
 
 
 # The most spellings of a word the credential check reads; past it, the variables still in it
@@ -3727,15 +3754,19 @@ def _spellings(word: str, values: dict[str, list[str] | None], bases: list[str])
 class _ShellState:
     """What the words of a command are read against.
 
-    ``bases`` are the directories the shell may be in, `_working_directories`, and ``values``
-    the ones its variables may hold, as `_known_values` reads them. A substitution's body runs
-    in the shell around it, so it is read against that one's.
+    ``bases`` are the directories the shell may be in, and ``shell_bases`` those and the ones
+    `CDPATH` may take it to, `_working_directories`; ``values`` are the ones its variables may
+    hold, as `_known_values` reads them. A substitution's body runs in the shell around it, so
+    it is read against that one's.
     """
 
-    __slots__ = ("bases", "values")
+    __slots__ = ("bases", "shell_bases", "values")
 
-    def __init__(self, bases: list[str], values: dict[str, list[str] | None]) -> None:
+    def __init__(
+        self, bases: list[str], shell_bases: list[str], values: dict[str, list[str] | None]
+    ) -> None:
         self.bases = bases
+        self.shell_bases = shell_bases
         self.values = values
 
 
@@ -3744,32 +3775,58 @@ def _working_directories(
     parts: list[tuple[str, str]],
     inherited: _ShellState | None,
     values: dict[str, list[str] | None],
-) -> list[str]:
-    """Every directory a relative word in this command may be resolved from.
+) -> tuple[list[str], list[str]]:
+    """Every directory a relative word in this command may be resolved from, and with `CDPATH`.
 
     The project and the session's working directory, or for a substitution's body the
     directories of the command it sits in, then each `cd` or `pushd` target from each of those,
     in turn: after `cd a && cd b`, `a`, `b` and `a/b` too. That is more than the shell uses,
     since a `cd` in a pipeline or after `||` may never move it, and the read scope and the
     credential check read a relative word from each, which costs a no-opinion or a refusal.
+    The second list adds the directories `CDPATH` may take the shell to, which only the
+    credential check reads.
 
     A target is read as each of its `_spellings`, so one the shell supplies, such as `"$d"`,
     gives a directory below `UNREAD_VALUE`, which the read scope never vouches for.
+
+    Both shells look a target up in each directory `CDPATH` lists first, unless it starts with
+    `/`, `./` or `../`. A startup file the hook can't read sets it, and the credential stores are
+    in the home directory, so for the credential check each such target is read from there too.
+    A directory that is in a store, as `cd .ssh` can be, refuses the command outright.
     """
     if inherited is not None:
-        bases = list(inherited.bases)
+        bases, shell_bases = list(inherited.bases), list(inherited.shell_bases)
     else:
         bases = [str(REPO_ROOT)]
         if _SESSION_CWD and os.path.isabs(_SESSION_CWD) and bases[0] != _SESSION_CWD:
             bases.append(_SESSION_CWD)
+        shell_bases = list(bases)
     for segment in segments:
         for target in _directory_targets(segment, parts):
-            spellings = _spellings(target, values, bases)
-            bases += [_joined(base, path) for path in spellings for base in bases]
-            bases = list(dict.fromkeys(bases))
-            if len(bases) > MAX_WORKING_DIRECTORIES:
+            spellings = _spellings(target, values, shell_bases)
+            bases = list(
+                dict.fromkeys(bases + [_joined(base, path) for path in spellings for base in bases])
+            )
+            moved = [
+                _joined(base, path)
+                for path in spellings
+                for base in shell_bases + ([_home()] if _searches_cdpath(path) else [])
+            ]
+            added = [base for base in dict.fromkeys(moved) if base not in shell_bases]
+            if len(shell_bases) + len(added) > MAX_WORKING_DIRECTORIES:
                 raise NotReadOnly(f"more working directories than this module reads: {target}")
-    return bases
+            for base in added:
+                if UNREAD_VALUE not in base and _names_a_credential(
+                    base, tilde=False, bases=[], live_glob=False
+                ):
+                    raise NotReadOnly(f"cd into a credential store, through CDPATH: {target}")
+            shell_bases += added
+    return bases, shell_bases
+
+
+def _searches_cdpath(target: str) -> bool:
+    """Whether `cd` looks ``target`` up in `CDPATH`: unless it starts with `/`, `./` or `../`."""
+    return not target.startswith(("/", "./", "../", UNREAD_VALUE)) and target not in (".", "..")
 
 
 def _joined(base: str, path: str) -> str:
@@ -3790,15 +3847,24 @@ def _refuse_credential_paths(
     Reads the reduced command, its redirections included, so a `< ~/.ssh/id_rsa` target is a
     word here like any other. Every word of every segment is checked, whichever program it
     belongs to, because the operator tier never sees what a word *opens*. A relative word is
-    read from each of the command's working directories, and each word as each of its
-    `_spellings`.
+    read from each directory the shell may be in, `CDPATH` included, and each one a program's
+    `DIRECTORY_OPTIONS` names; and each word as each of its `_spellings`.
 
     A wildcard the shell expands, followed by a `..`, can land anywhere, credential stores
     included, and is refused for that. Only a live wildcard counts: a quoted one is the
     program's pattern, as in `sed 's|.*/../||'`.
     """
-    for line in reduced.split("\n"):
-        for token in _tokenize(line):
+    lines = [_tokenize(line) for line in reduced.split("\n")]
+    bases = list(state.shell_bases)
+    for tokens in lines:
+        for directory in _program_directories(tokens, parts):
+            for spelled in _spellings(directory, state.values, state.shell_bases):
+                bases += [_joined(base, spelled) for base in state.shell_bases]
+    bases = list(dict.fromkeys(bases))
+    if len(bases) > MAX_WORKING_DIRECTORIES:
+        raise NotReadOnly("more working directories than this module reads, with each -C")
+    for tokens in lines:
+        for token in tokens:
             if set(token) <= PUNCTUATION_CHARS:
                 continue
             word = _expand(token, parts)
@@ -3808,10 +3874,8 @@ def _refuse_credential_paths(
             # A tilde is expanded only at the start of an unquoted word, so a quoted
             # `'~/x'` is the literal path it spells. A placeholder start means quoted.
             tilde = token.startswith("~") or bool(REDIRECTION_PREFIX.match(token))
-            for spelled in _spellings(word, state.values, state.bases):
-                if _names_a_credential(
-                    spelled, tilde=tilde, bases=state.bases, live_glob=live_glob
-                ):
+            for spelled in _spellings(word, state.values, state.shell_bases):
+                if _names_a_credential(spelled, tilde=tilde, bases=bases, live_glob=live_glob):
                     raise NotReadOnly(f"names a credential store: {word}")
 
 
@@ -4423,8 +4487,8 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
 
     # Where a relative word may be resolved from, worked out once for the credential check, the
     # read scope and each substitution's body
-    bases = _working_directories(segments, parts, inherited, known_values)
-    state = _ShellState(bases, known_values)
+    bases, shell_bases = _working_directories(segments, parts, inherited, known_values)
+    state = _ShellState(bases, shell_bases, known_values)
 
     # Layer B: no word may name a credential store, whatever program it belongs to and
     # whatever tier would otherwise approve it.
