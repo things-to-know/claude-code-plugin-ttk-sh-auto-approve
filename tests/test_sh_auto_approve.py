@@ -2602,6 +2602,36 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
                 with self.subTest(command=command, case=case):
                     self.assert_refused(command.format(other), "it is not this session's")
 
+    def test_a_scratch_path_in_any_characters(self):
+        """A read is placed in the scratchpad by its path, as one in the project is, so a name in
+        characters the redirection pattern leaves out is a file in it too: `HEAD~1`, which
+        `git diff` reads as a path, `a b`, `x:y`, `@{u}`. Where that stops, each beside its
+        approval: `..` out of it, a name that only starts with the scratchpad's, another
+        session's, and a recursive read of the directory that holds every session's. A write
+        is matched in the command's own text, and keeps the pattern's characters."""
+        for approved, refused in (
+            (f"cat {SCRATCH}/HEAD~1", f"cat {SCRATCH}/../HEAD~1"),
+            (f"cat '{SCRATCH}/a b.txt'", f"cat '{SCRATCH} b.txt'"),
+            (f"cat {SCRATCH}/@{{u}}", f"cat {OTHER_SCRATCH}/@{{u}}"),
+            (f"grep -rn token {SCRATCH}/x:y", f"grep -rn token {SCRATCH}/../.."),
+        ):
+            with self.subTest(approved=approved):
+                self.assert_allowed(approved, "a file in the scratchpad")
+                self.assert_no_opinion(refused, "outside it")
+        self.assert_allowed(f"wc -l < {SCRATCH}/x:y", "a read through `<`")
+        self.assert_refused(f"wc -l < {SCRATCH}x:y", "beside the scratchpad")
+        self.assert_allowed(f"wc -l AGENTS.md > {SCRATCH}/x.txt", "the control for the write")
+        self.assert_refused(f"wc -l AGENTS.md > {SCRATCH}/x:y", "the pattern's characters")
+
+    def test_a_scratch_path_below_a_directory_the_shell_supplies(self):
+        """`pushd "$d"` moves the shell to a directory this module didn't read, `UNREAD_VALUE`,
+        so `x` after it is `$d/x`, wherever `$d` is. Below the scratchpad that is no path to
+        place: the read scope gives it no opinion, as the pattern did. The control: the same
+        read with no `pushd "$d"`. Below the project, #72 is that the read scope places it."""
+        with operator_rules(allow=["Bash(pushd *)"]):
+            self.assert_allowed(f"pushd {SCRATCH} && cat x", "x in the scratchpad")
+            self.assert_no_opinion(f'pushd {SCRATCH} && pushd "$d" && cat x', "x below $d")
+
     def test_no_scratch_directory_without_scratchpad_dir(self):
         """A payload without a `scratchpad_dir` names no scratchpad, so none is in reach, as in
         a session that has none. The control: the same commands, with this session's."""

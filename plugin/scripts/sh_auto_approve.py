@@ -3924,8 +3924,13 @@ def _in_scope_unguarded(absolute: str, scope: _ReadScope) -> bool:
     normal = os.path.normpath(absolute)
     if normal in DEVICE_READS:
         return True
-    scratch = _scratch_path_pattern()
-    if scratch is not None and scratch.fullmatch(normal):
+    # The scratchpad holds a path as a root does, by the path: `absolute` is the text the program
+    # gets, which the callers have already expanded, so `<scratch>/HEAD~1` and `<scratch>/a b` are
+    # the files they name. `SCRATCH_COMPONENT`'s characters are for the redirection, which reads
+    # the command's own text. A directory below a value this module didn't read is none to place
+    # a path in: `UNREAD_VALUE`, #72.
+    scratch = _scratch_root()
+    if scratch is not None and _is_under(normal, scratch) and UNREAD_VALUE not in normal:
         return True
     resolved = os.path.realpath(normal)
     return any(_is_under(normal, root) and _is_under(resolved, root) for root in scope.roots)
@@ -4332,18 +4337,16 @@ def _scratch_directory() -> str | None:
     Built per call rather than at import, from `_SCRATCHPAD_DIR`, which `main` sets per call.
     `re.compile` caches, so the patterns built from it cost nothing after the first.
     """
+    directory = _scratch_root()
+    return None if directory is None else re.escape(directory)
+
+
+def _scratch_root() -> str | None:
+    """This session's scratch directory, as the path `_scratch_directory` matches."""
     if _SCRATCHPAD_DIR is None:
         return None
     directory = _SCRATCHPAD_DIR.rstrip("/")
-    if SCRATCH_DIRECTORY.fullmatch(directory) is None:
-        return None
-    return re.escape(directory)
-
-
-def _scratch_path_pattern() -> re.Pattern[str] | None:
-    """This session's scratch directory, or anything under it, as a whole-path pattern."""
-    directory = _scratch_directory()
-    return None if directory is None else re.compile(directory + SCRATCH_COMPONENT + "*")
+    return directory if SCRATCH_DIRECTORY.fullmatch(directory) is not None else None
 
 
 def _scratch_redirect() -> re.Pattern[str] | None:
