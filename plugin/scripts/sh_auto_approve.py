@@ -590,6 +590,9 @@ DANGEROUS_ENV_VARS = {
     "GLIBC_TUNABLES",
     "GCONV_PATH",
     "LOCPATH",
+    # Where zsh loads a module from, and it loads some on demand: expanding `$commands` loads
+    # `zsh/parameter`. zsh ties it to `module_path`, which the upper-casing covers
+    "MODULE_PATH",
 }
 
 # `aws` read operations pattern

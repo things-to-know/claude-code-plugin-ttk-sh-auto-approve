@@ -1181,6 +1181,8 @@ class CorpusIsSafeToExecute(unittest.TestCase):
         yield from ((c, "planted loop") for c in planted.LOOP_ATTACKS)
         yield from ((c, "planted loop") for c in DifferentialAgainstZsh.LOOP_ATTACKS)
         yield from ((c, "short loop") for c in DifferentialAgainstZsh.SHORT_LOOP_ATTACKS)
+        yield from ((c, "planted module") for c in DifferentialAgainstZsh.MODULE_PATH_ATTACKS)
+        yield (DifferentialAgainstZsh.MODULE_PATH_CONTROL, "planted module")
         for _, chain in DifferentialAcrossOneSession.CHAINS:
             yield from ((c, "session") for c in chain)
         yield from ((c, "hygiene") for c in PUNCTUATION_BASH_REJECTS.values())
@@ -4319,6 +4321,23 @@ class RefusesControlOfTheEnvironmentAndTheProgram(Verdicts, unittest.TestCase):
         self.assert_refused("BASH_ENV=/tmp/exploit.sh ls", "sources /tmp/exploit.sh")
         self.assert_refused("PYTHONPATH=/tmp ls", "repoints module resolution")
         self.assert_refused("GIT_EXTERNAL_DIFF=/tmp/x git diff HEAD~1", "runs /tmp/x per file")
+
+    def test_zsh_loads_a_module_from_its_module_path(self):
+        """#80: expanding `$commands` loads `zsh/parameter`, from a planted
+        `./zsh/parameter.so` once `module_path` is `.`, however the command binds it.
+        `DifferentialAgainstZsh.test_a_module_path_in_zsh` runs the zsh spellings."""
+        self.assert_allowed("echo $commands", "the control: zsh loads its own module")
+        for command, why in (
+            ("module_path=.; echo $commands", "has none, but zsh loads ./zsh/parameter.so"),
+            ("MODULE_PATH=.; echo $commands", "has none, but zsh loads ./zsh/parameter.so"),
+            ("for module_path in .; do echo $commands; done", "has none, but zsh binds it too"),
+            ("for q module_path in a .; do echo $commands; done", "rejects it, but zsh binds it"),
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command, why)
+        # `set` is no program the hook knows, so `NoOpinion` would prompt too, unless a rule
+        # approved it
+        self.assert_refused_outright("set -A module_path .; echo $commands", "binds it in zsh")
 
     def test_a_bare_assignment_persists_in_the_session(self):
         """The segment is skipped, `checked` is still 1 from the `ls`, and the variable
@@ -7765,6 +7784,33 @@ class DifferentialAgainstZsh(unittest.TestCase):
                 before = snapshot(root)
                 run_in_zsh(command, root)
                 self.assertNotEqual(before, snapshot(root), "zsh ran no body: a dead case")
+                self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
+
+    # #80: expanding `$commands` loads `zsh/parameter`, from the directories `module_path` lists.
+    # bash has no `module_path`, and rejects the second header and `set -A`. Not `export
+    # module_path=.`: zsh rejects a scalar for the array, and stops there
+    MODULE_PATH_PLANT = "./zsh/parameter.so"
+    MODULE_PATH_CONTROL = "echo $commands"
+    MODULE_PATH_ATTACKS = (
+        "module_path=.; echo $commands",
+        "for module_path in .; do echo $commands; done",
+        "for q module_path in a .; do echo $commands; done",
+        "set -A module_path .; echo $commands",
+    )
+
+    def test_a_module_path_in_zsh(self):
+        """The plant holds text, as the suite builds no library: zsh fails to load it, and names
+        it on stderr. A library would have its constructor run, as #80 shows."""
+        for command in (self.MODULE_PATH_CONTROL, *self.MODULE_PATH_ATTACKS):
+            with self.subTest(command=command), scratch_tree() as root:
+                plant = Path(root, self.MODULE_PATH_PLANT)
+                plant.parent.mkdir()
+                plant.write_text("not a library\n")
+                tried = self.MODULE_PATH_PLANT in run_in_zsh(command, root).stderr
+                if command == self.MODULE_PATH_CONTROL:
+                    self.assertFalse(tried, "zsh tried the plant with its own module_path")
+                    continue
+                self.assertTrue(tried, "zsh tried no plant: a dead case")
                 self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
 
     def test_no_approved_command_mutates_the_tree_in_zsh(self):
