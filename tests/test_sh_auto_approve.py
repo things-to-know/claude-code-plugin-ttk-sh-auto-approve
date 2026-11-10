@@ -60,13 +60,14 @@ from a command that prompted in a real session.
      8  Redirection, sockets, and egress
           RefusesDescriptorAndSocketRedirection, RefusesRedirectionAttachedToACompound,
           RefusesReadsOutsideTheWorkingDirectories, RefusesACredentialStoreAWildcardOrABaseReaches,
-          RefusesEgressThroughAnApprovedProgram
+          RefusesAScratchPathThroughALinkOut, RefusesEgressThroughAnApprovedProgram
      9  Program identity, environment, and session state
           RefusesControlOfTheEnvironmentAndTheProgram, StripsTheWrapperTheHostStrips,
           RefusesBuiltinsThatRunAProgram, RefusesSessionScopedEnvironmentHandover,
           RefusesSessionScopedProgramDefinitions
     10  `cd`
-          ApprovesCdInsideTheRepository, RefusesCdTargetsThatOnlyLookInside
+          ApprovesCdInsideTheRepository, RefusesCdTargetsThatOnlyLookInside,
+          RefusesADotDotAfterALinkOut
     11  Allowlisted programs: flags and operands
           RefusesAllowlistedProgramsThatWrite, RefusesWritingFlagsBundledIntoAShortOption,
           RefusesOutputOperandsPastAnOptionTerminator, RefusesFindWritingPredicates,
@@ -78,6 +79,7 @@ from a command that prompted in a real session.
           RefusesVendorFlagsAndSubcommands, ApprovesOrdinaryOptionForms,
           RefusesGitConfigDrivenExecution, RefusesGitSubcommandsOutsideTheReadSet,
           RefusesUnlistedGitGlobalOptions, GitGlobalOptionsUnderOperatorRules,
+          RefusesAGitStashThatPushes, RefusesGitReadsOutsideTheWorkingDirectories,
           RefusesAwsCallsThatWriteOrExecute, RefusesAwsCallsThatPrintASecret,
           ApprovesGcloudHelpForABlockedVerb, RefusesGcloudCallsThatWriteLocallyOrExecute,
           RefusesGhApiCallsThatWriteOrLeak, ApprovesReadOnlyGhSubcommands,
@@ -124,9 +126,10 @@ Five properties this file holds to
    `TMPDIR` are redirected into it, and the payloads are limited to `touch PWNED`, a
    write to `PWNED`, an edit or deletion of the scratch tree's own `AGENTS.md`, and a
    planted executable inside the same tree. The `git` corpus alone adds a `clean`, a
-   `branch -D` and a `push`, run only in the repository and its bare `origin` that
-   `RefusesUnlistedGitGlobalOptions._repository` builds inside the tree: run from a real
-   checkout, the `push` would reach that checkout's remote. `CorpusIsSafeToExecute`
+   `branch -D`, a `push` and a `stash`, run only in the repositories, and a bare `origin`,
+   that `RefusesUnlistedGitGlobalOptions._repository` and `RefusesAGitStashThatPushes._repository`
+   build inside the tree: run from a real checkout, the `push` would reach that checkout's
+   remote, and the `stash` would take its uncommitted work. `CorpusIsSafeToExecute`
    enforces the confinement mechanically -- read it before adding a case, and do not add
    one it rejects.
 
@@ -1183,6 +1186,7 @@ class CorpusIsSafeToExecute(unittest.TestCase):
         # reach a real remote, which no rule of `is_corpus_safe` stops
         yield from ((c, "git") for c, _, _ in RefusesUnlistedGitGlobalOptions.EXECUTED)
         yield from ((c, "git") for c, _ in RefusesUnlistedGitGlobalOptions.APPROVED_AND_EXECUTED)
+        yield from ((c, "git") for c in RefusesAGitStashThatPushes.EXECUTED)
 
     def test_no_command_reaches_outside_the_scratch_tree(self):
         for command, origin in self.all_corpora():
@@ -2599,6 +2603,36 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
                 with self.subTest(command=command, case=case):
                     self.assert_refused(command.format(other), "it is not this session's")
 
+    def test_a_scratch_path_in_any_characters(self):
+        """A read is placed in the scratchpad by its path, as one in the project is, so a name in
+        characters the redirection pattern leaves out is a file in it too: `HEAD~1`, which
+        `git diff` reads as a path, `a b`, `x:y`, `@{u}`. Where that stops, each beside its
+        approval: `..` out of it, a name that only starts with the scratchpad's, another
+        session's, and a recursive read of the directory that holds every session's. A write
+        is matched in the command's own text, and keeps the pattern's characters."""
+        for approved, refused in (
+            (f"cat {SCRATCH}/HEAD~1", f"cat {SCRATCH}/../HEAD~1"),
+            (f"cat '{SCRATCH}/a b.txt'", f"cat '{SCRATCH} b.txt'"),
+            (f"cat {SCRATCH}/@{{u}}", f"cat {OTHER_SCRATCH}/@{{u}}"),
+            (f"grep -rn token {SCRATCH}/x:y", f"grep -rn token {SCRATCH}/../.."),
+        ):
+            with self.subTest(approved=approved):
+                self.assert_allowed(approved, "a file in the scratchpad")
+                self.assert_no_opinion(refused, "outside it")
+        self.assert_allowed(f"wc -l < {SCRATCH}/x:y", "a read through `<`")
+        self.assert_refused(f"wc -l < {SCRATCH}x:y", "beside the scratchpad")
+        self.assert_allowed(f"wc -l AGENTS.md > {SCRATCH}/x.txt", "the control for the write")
+        self.assert_refused(f"wc -l AGENTS.md > {SCRATCH}/x:y", "the pattern's characters")
+
+    def test_a_scratch_path_below_a_directory_the_shell_supplies(self):
+        """`pushd "$d"` moves the shell to a directory this module didn't read, `UNREAD_VALUE`,
+        so `x` after it is `$d/x`, wherever `$d` is. Below the scratchpad that is no path to
+        place: the read scope gives it no opinion, as the pattern did. The control: the same
+        read with no `pushd "$d"`. Below the project, #72 is that the read scope places it."""
+        with operator_rules(allow=["Bash(pushd *)"]):
+            self.assert_allowed(f"pushd {SCRATCH} && cat x", "x in the scratchpad")
+            self.assert_no_opinion(f'pushd {SCRATCH} && pushd "$d" && cat x', "x below $d")
+
     def test_no_scratch_directory_without_scratchpad_dir(self):
         """A payload without a `scratchpad_dir` names no scratchpad, so none is in reach, as in
         a session that has none. The control: the same commands, with this session's."""
@@ -3858,6 +3892,104 @@ class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase
                     self.assert_refused_outright(command)
 
 
+class RefusesAScratchPathThroughALinkOut(Verdicts, unittest.TestCase):
+    """The scratch directory was matched by its text alone, so a link inside it led a read or a
+    write wherever it pointed: with `out -> /etc` there, `cat <scratch>/out/hostname` and
+    `wc -l AGENTS.md > <scratch>/out/x` were approved, and `cat /etc/hostname` was not.
+
+    A link gets there through a command the operator approves, such as a `git worktree add` or a
+    `tar x` of a tree that holds one. Now a path in the scratch directory, read or written, has
+    to stay there once each link is resolved, as a path under any other read root does.
+
+    The verdict depends on the links on disk, so each case makes real ones, in a scratch
+    directory of its own: `out` leads to a directory outside it, `in` to `inner` inside it, and
+    `inner` is the plain path. Each refusal sits beside a control approved under the same setup.
+    """
+
+    # Each `{}` is a directory in the scratch directory
+    READS_AND_WRITES = (
+        "cat {}/f",
+        "grep -rn x {}/",
+        "wc -l < {}/f",
+        "wc -l AGENTS.md > {}/f",
+        "wc -l AGENTS.md >> {}/f",
+    )
+
+    @contextlib.contextmanager
+    def _scratch(self, *, through_a_link: bool = False):
+        """The scratch directory, and its links, beside a directory outside it. With
+        `through_a_link`, the scratch directory is named by a link to it, as a scratch
+        directory under `/tmp` is on macOS, where `/tmp` leads to `/private/tmp`."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_links_") as directory:
+            top = Path(os.path.realpath(directory))
+            scratch, outside = top / "scratch", top / "outside"
+            (scratch / "inner").mkdir(parents=True)
+            outside.mkdir()
+            (outside / "f").write_text("x\n")
+            (scratch / "out").symlink_to(outside)
+            (scratch / "in").symlink_to("inner")
+            (scratch / "out-file").symlink_to(outside / "f")
+            (scratch / "in-file").symlink_to(scratch / "inner" / "f")
+            (scratch / "dangling").symlink_to(outside / "new")
+            named = scratch
+            if through_a_link:
+                named = top / "scratch-link"
+                named.symlink_to(scratch)
+            with with_scratchpad_dir(str(named)):
+                yield named
+
+    def test_a_link_to_a_directory(self):
+        with self._scratch() as scratch:
+            for spelling in self.READS_AND_WRITES:
+                with self.subTest(spelling=spelling):
+                    self.assert_refused(spelling.format(f"{scratch}/out"), "leads outside it")
+                    self.assert_allowed(spelling.format(f"{scratch}/in"), "leads inside it")
+                    self.assert_allowed(spelling.format(f"{scratch}/inner"), "a plain path")
+
+    def test_a_link_to_a_file(self):
+        """The last component is a link too: a redirection writes the file it leads to, and a
+        dangling link creates that file."""
+        with self._scratch() as scratch:
+            for refused, approved in (
+                (f"cat {scratch}/out-file", f"cat {scratch}/in-file"),
+                (f"wc -l < {scratch}/out-file", f"wc -l < {scratch}/in-file"),
+                (f"wc -l AGENTS.md > {scratch}/out-file", f"wc -l AGENTS.md > {scratch}/in-file"),
+                (f"wc -l AGENTS.md > {scratch}/dangling", f"wc -l AGENTS.md > {scratch}/new"),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_refused(refused, "leads outside the scratch directory")
+                    self.assert_allowed(approved, "stays inside it")
+
+    def test_a_dot_dot_after_a_link(self):
+        """The kernel resolves `out` before the `..` after it, so `<scratch>/out/..` is the
+        directory holding `outside`, not the scratchpad: `normpath` would drop `out/..` first.
+        Under bash 5.2.37 and zsh 5.9, `cat <scratch>/out/../secret` printed a file beside
+        `out`'s target. The control goes through `in`, whose `..` is the scratchpad either way."""
+        with self._scratch() as scratch:
+            for refused, approved in (
+                (f"cat {scratch}/out/../outside/f", f"cat {scratch}/in/../inner/f"),
+                (f"grep -rn x {scratch}/out/..", f"grep -rn x {scratch}/in/.."),
+                (f"wc -l < {scratch}/out/../outside/f", f"wc -l < {scratch}/in/../inner/f"),
+                (
+                    f"git diff --no-index {scratch}/out/../outside/f AGENTS.md",
+                    f"git diff --no-index {scratch}/in/../inner/f AGENTS.md",
+                ),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_refused(refused, "leads outside the scratch directory")
+                    self.assert_allowed(approved, "stays inside it")
+
+    def test_a_scratch_directory_named_through_a_link(self):
+        """The scratch directory is resolved as well as the path, so naming it through a link
+        changes no verdict."""
+        with self._scratch(through_a_link=True) as scratch:
+            for spelling in self.READS_AND_WRITES:
+                with self.subTest(spelling=spelling):
+                    self.assert_refused(spelling.format(f"{scratch}/out"), "leads outside it")
+                    self.assert_allowed(spelling.format(f"{scratch}/in"), "leads inside it")
+                    self.assert_allowed(spelling.format(f"{scratch}/inner"), "a plain path")
+
+
 @approvals_budgeted
 class RefusesEgressThroughAnApprovedProgram(Verdicts, unittest.TestCase):
     """`DifferentialAgainstBash` can only see the working tree change.
@@ -4214,6 +4346,67 @@ class RefusesCdTargetsThatOnlyLookInside(Verdicts, unittest.TestCase):
             self.assert_refused(
                 f"cd '{relative}/out' && ls", "follows a symlink out of the repository"
             )
+
+
+class RefusesADotDotAfterALinkOut(Verdicts, unittest.TestCase):
+    """The kernel resolves a link before the `..` after it, so `sub/l/../x` is the `x` beside
+    where `l` leads. The read scope resolved the path after `normpath` had dropped `l/..`, and
+    so placed it at `sub/x`: with `l` leading out of the project, `cat sub/l/../hostname` was
+    approved, a read outside it.
+
+    `cd` reads such a target two ways: `cd -L`, the default, drops `l/..` as `normpath` does,
+    and `cd -P`, or a startup file's `set -P` or zsh's `chase_dots`, climbs from where `l`
+    leads. A target has to stay in the project under both.
+
+    A project of its own beside `outside`: `sub/l` leads to `outside/ssl`, beside
+    `outside/hostname`, and `sub/m` to the project's `docs`. Each refusal sits beside the same
+    command through `m`, which stays in the project either way. Under bash 5.2.37 and zsh 5.9,
+    `cat sub/l/../hostname` printed `outside/hostname`, `cd sub/l/..` landed in `sub`, and
+    `cd -P sub/l/..` in `outside`.
+    """
+
+    @contextlib.contextmanager
+    def _project(self):
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_dotdot_") as directory:
+            top = Path(os.path.realpath(directory))
+            project, outside = top / "project", top / "outside"
+            (project / "sub").mkdir(parents=True)
+            (project / "docs").mkdir()
+            (project / "README.md").write_text("x\n")
+            (outside / "ssl").mkdir(parents=True)
+            (outside / "hostname").write_text("x\n")
+            (project / "sub" / "l").symlink_to(outside / "ssl")
+            (project / "sub" / "m").symlink_to(project / "docs")
+            with (
+                unittest.mock.patch.object(hook, "REPO_ROOT", project),
+                unittest.mock.patch.object(hook, "_SESSION_CWD", None),
+            ):
+                yield project
+
+    def test_a_read(self):
+        with self._project() as project:
+            for refused, control in (
+                ("cat sub/l/../hostname", "cat sub/m/../README.md"),
+                (f"cat {project}/sub/l/../hostname", f"cat {project}/sub/m/../README.md"),
+                ("grep -rn x sub/l/..", "grep -rn x sub/m/.."),
+                (
+                    "git -C sub diff --no-index l/../hostname x",
+                    "git -C sub diff --no-index m/../README.md x",
+                ),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_no_opinion(refused, "reads outside the project")
+                    self.assert_allowed(control, "stays inside it")
+
+    def test_a_cd(self):
+        with self._project():
+            for refused, control in (
+                ("cd sub/l/.. && ls", "cd sub/m/.. && ls"),
+                ("cd -P sub/l/.. && ls", "cd -P sub/m/.. && ls"),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_refused_outright(refused, "lands outside the project")
+                    self.assert_allowed(control, "stays inside it")
 
 
 # ======================================================================================
@@ -5159,6 +5352,332 @@ class GitGlobalOptionsUnderOperatorRules(Verdicts, unittest.TestCase):
                 with self.subTest(command=command):
                     self.assert_refused_outright(command, "the option may be git's own")
             self.assert_allowed("git --frobnicate log -1", "the control: nothing refused after it")
+
+
+class RefusesAGitStashThatPushes(Verdicts, unittest.TestCase):
+    """git takes the first word after `stash` alone as its subcommand. Any other word there, an
+    option included, runs `git stash push` with every word, and `-m` and `--message` take the
+    next word as their value (`cmd_stash` and `push_stash` in `builtin/stash.c`, git 2.48.1).
+
+    The hook read the first word not starting with `-` as the subcommand instead, so it approved
+    `git stash -m list` as `git stash list`, and git stashed every change to a tracked file, with
+    `list` as the message. Now `list` or `show` must come right after `stash`; the options after
+    them go to `git log` and `git diff`, where the scan at the top of `_check_git` reads them.
+
+    Each refusal sits beside a control approved under the same setup.
+    `test_git_stashes_the_working_tree` runs the refusals with the installed git, in a repository
+    of their own, so that each stands for a real stash.
+    """
+
+    # For `test_git_stashes_the_working_tree`. Left out: `-p show`, which asks before each hunk,
+    # and `-q list`, which git refuses: `'push' can't be assumed due to unexpected token`
+    EXECUTED = (
+        "git stash -m list",
+        "git stash --message list",
+        "git stash -um show",
+        "git stash -- list",
+    )
+
+    assert_refused_outright = RefusesUnlistedGitGlobalOptions.assert_refused_outright
+    _git_env = staticmethod(RefusesUnlistedGitGlobalOptions._git_env)
+    _run = RefusesUnlistedGitGlobalOptions._run
+
+    def test_a_word_before_the_subcommand(self):
+        for refused, control in (
+            ("git stash -m list", "git stash list"),
+            ("git stash --message list", "git stash list --oneline"),
+            ("git stash -um show", "git stash show"),
+            ("git stash -- list", "git stash list -n 1"),
+            ("git stash -p show", "git stash show -p"),
+            ("git stash -q list", "git stash show --stat"),
+        ):
+            with self.subTest(refused=refused):
+                self.assert_refused_outright(refused, "runs git stash push")
+                self.assert_allowed(control, "lists the stashes, or shows one")
+
+    @contextlib.contextmanager
+    def _repository(self):
+        """A scratch tree holding a repository, `work`, whose tracked files `list` and
+        `tracked.txt` each carry an edit, beside an untracked file."""
+        with scratch_tree() as root:
+            env = self._git_env(root)
+            work = Path(root, "work")
+            work.mkdir()
+            for name in ("list", "tracked.txt"):
+                (work / name).write_text("committed\n")
+            for argv in (
+                [GIT, "init", "-q", str(work)],
+                [GIT, "-C", str(work), "add", "."],
+                [GIT, "-C", str(work), "commit", "-q", "-m", "init"],
+            ):
+                subprocess.run(argv, env=env, capture_output=True, check=True, timeout=10)
+            for name in ("list", "tracked.txt"):
+                (work / name).write_text("committed\nedited\n")
+            (work / "untracked.txt").write_text("x\n")
+            yield root
+
+    def _stashes(self, root: str) -> int:
+        """How many stash entries the repository holds, read with `git` itself."""
+        argv = [GIT, "-C", str(Path(root, "work")), "stash", "list"]
+        result = subprocess.run(
+            argv, env=self._git_env(root), capture_output=True, text=True, check=True, timeout=10
+        )
+        return len(result.stdout.splitlines())
+
+    @needs_bash
+    @needs_git
+    def test_git_stashes_the_working_tree(self):
+        for command in self.EXECUTED:
+            with self.subTest(command=command):
+                self.assert_refused(command, "stashes the working tree")
+                with self._repository() as root:
+                    before = self._stashes(root)
+                    result = self._run(root, command)
+                    after = self._stashes(root)
+                self.assertEqual(before + 1, after, f"git stashed nothing:\n{result.stderr}")
+
+
+class RefusesGitReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
+    """Layer A of `RefusesReadsOutsideTheWorkingDirectories`, for the files git opens.
+
+    It bounded where `git -C` may point, and none of the paths git reads. So the hook approved
+    `git diff --no-index ~ .`, a diff of the whole home directory, dot-directories included,
+    where it has no opinion on `cat` of one file there. Layer B refuses a word that names a
+    credential store, and `~` and `~/.config` name the directories holding them.
+
+    The files git opens, each printed in part, from git 2.48.1:
+    - `diff`: every operand, with `--no-index`, and without it when either is outside the
+      working tree, so a revision is read as a path too, which resolves inside the directory
+      git runs in, a worktree in the scratchpad included
+    - `blame`: the values of `--contents`, `-S` and `--ignore-revs-file`
+    - `grep`: the value of `-f`, whose first line that is not a valid pattern git prints
+    - `ls-files`: the values of `-X` and `--exclude-from`, which it prints none of, and the file
+      name `--exclude-per-directory` joins to each directory
+    - `diff`, `log`, `show` and `stash`: the value of `-O`, the order file, which git prints
+      none of, read wherever it writes a diff; a FIFO there hangs it. `-O` first in its word is
+      refused outright, as `grep -O` runs a program, so it is read here after another letter
+
+    Outside the working directories is no opinion, which the operator's rules may grant. Each
+    refusal sits beside a control approved under the same setup.
+    """
+
+    assert_no_opinion = RefusesUnlistedGitGlobalOptions.assert_no_opinion
+
+    def test_a_file_git_opens_and_prints(self):
+        for refused, control in (
+            (
+                "git diff --no-index /usr/lib/os-release tracked.txt",
+                "git diff --no-index other.txt tracked.txt",
+            ),
+            ("git diff /usr/lib/os-release tracked.txt", "git diff HEAD -- tracked.txt"),
+            (
+                "git blame --contents /usr/lib/os-release tracked.txt",
+                "git blame --contents other.txt tracked.txt",
+            ),
+            (
+                "git blame -S /usr/lib/os-release tracked.txt",
+                "git blame -S other.txt tracked.txt",
+            ),
+            (
+                "git blame --ignore-revs-file /usr/lib/os-release tracked.txt",
+                "git blame --ignore-revs-file other.txt tracked.txt",
+            ),
+            ("git grep -f /usr/lib/os-release", "git grep -f other.txt"),
+            ("git ls-files -X /usr/lib/os-release", "git ls-files -X other.txt"),
+        ):
+            with self.subTest(refused=refused):
+                self.assert_no_opinion(refused, "reads a file outside the working directories")
+                self.assert_allowed(control, "reads a file in the project")
+
+    def test_the_directories_that_hold_a_credential_store(self):
+        """`git diff --no-index` reads a directory recursively. Layer B refuses a word naming a
+        store in `CREDENTIAL_HOME_PATHS`, not one naming the directory that holds it, so the
+        home directory, and `~/.config` for `~/.config/gh`, are refused by Layer A alone.
+        `HOME` is a scratch directory, since the module refuses `/root`, the home directory of
+        some CI runners, as a store of its own."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_home_") as directory:
+            home = os.path.realpath(directory)
+            with unittest.mock.patch.dict(os.environ, {"HOME": home}):
+                for refused, control in (
+                    ("git diff --no-index ~ .", "git diff --no-index empty empty2"),
+                    ("git diff --no-index ~/.config .", "git diff main..HEAD"),
+                    (f"git diff --no-index {home} .", "git diff HEAD~1 --stat"),
+                ):
+                    with self.subTest(refused=refused):
+                        self.assert_no_opinion(refused, "reads every file under it")
+                        self.assert_allowed(control, "reads the project")
+                tops = sorted({entry.split("/")[0] for entry in hook.CREDENTIAL_HOME_PATHS})
+                for top in tops:
+                    with self.subTest(top=top):
+                        self.assert_refused(f"git diff --no-index ~/{top} .", "a store under it")
+
+    def test_every_spelling_git_reads_a_value_in(self):
+        """A value is read wherever git finds it: after `=`, after an abbreviation of the long
+        option, attached to the short one or at the end of a bundle, and after a `--`, which
+        ends no option for `blame`, `grep` or `ls-files` when an option takes it as its value.
+        Each spelling is approved with a file in the project."""
+        for spelling in (
+            "git diff --no-index -- {} tracked.txt",
+            "git diff -- {} tracked.txt",
+            "git diff --stat --no-index {} tracked.txt",
+            "git blame --contents={} tracked.txt",
+            "git blame --cont {} tracked.txt",
+            "git blame --ignore-revs {} tracked.txt",
+            "git blame -wS {} tracked.txt",
+            "git blame -S{} tracked.txt",
+            "git blame -L 1,2 --contents -- -S {} tracked.txt",
+            "git grep -nf {}",
+            "git grep -5f {}",
+            "git grep -f{}",
+            "git ls-files --exclude-from={}",
+            "git ls-files --exclude-f {}",
+            "git ls-files -oX{}",
+            "git diff -RO{} HEAD~1",
+            "git log -pO{} -1",
+            "git show -RO{}",
+            "git stash show -RO{}",
+            "git stash list -pO{}",
+        ):
+            with self.subTest(spelling=spelling):
+                self.assert_no_opinion(spelling.format("/usr/lib/os-release"), "reads it")
+                self.assert_allowed(spelling.format("docs/a.md"), "a file in the project")
+
+    def test_a_value_that_is_not_a_file(self):
+        """The other half: a letter after one that takes the rest of the word is part of that
+        value, and an option git matches exactly is not the longer one it is a prefix of. Each
+        approval holds a value that is not in the project, which git does not open."""
+        for refused, approved in (
+            ("git grep -if /usr/lib/os-release", "git grep -ie /usr/lib/os-release"),
+            ("git blame -wS /usr/lib tracked.txt", "git blame -wL /usr/,+3 tracked.txt"),
+            ("git ls-files -o --exclude-from=/build", "git ls-files -o --exclude=/build"),
+            ("git log -pO/usr/lib/os-release -1", "git log -pSO/usr/lib/os-release -1"),
+            ("git diff -RO/usr/lib/os-release HEAD~1", "git diff -RGO/usr/lib/os-release HEAD~1"),
+            ("git show -RO/usr/lib/os-release", "git show -RIO/usr/lib/os-release"),
+        ):
+            with self.subTest(refused=refused):
+                self.assert_no_opinion(refused, "reads a file outside the working directories")
+                self.assert_allowed(approved, "a pattern, not a file")
+
+    def test_the_string_diff_searches_for(self):
+        """`-S` and `-G` take the next word when nothing is left of their own: the string or
+        the regex `diff` looks for in the changes, which git never opens. After `-G`, `-I` or
+        `-S`, an `S` is that letter's value, and the next word is an operand git reads again.
+        Each pair as git 2.48.1 ran it, with a file outside the repository as the word: read in
+        the first, not in the second. The last approval is a regex the read scope can't place,
+        which had no opinion before."""
+        for refused, approved in (
+            (
+                "git diff -IS /usr/lib/os-release tracked.txt",
+                "git diff -pS /usr/lib/os-release tracked.txt",
+            ),
+            (
+                "git diff -GS /usr/lib/os-release tracked.txt",
+                "git diff -G /usr/lib/os-release tracked.txt",
+            ),
+            (
+                "git diff -SI /usr/lib/os-release tracked.txt",
+                "git diff -S /usr/lib/os-release tracked.txt",
+            ),
+        ):
+            with self.subTest(refused=refused):
+                self.assert_no_opinion(refused, "reads a file outside the working directories")
+                self.assert_allowed(approved, "the string git searches for")
+        self.assert_allowed('git diff -G "^def $name" HEAD~1', "a regex the shell finishes")
+        self.assert_no_opinion(
+            "git diff -- -S /usr/lib/os-release", "after `--`, every word is a path"
+        )
+
+    def test_a_revision_in_a_scratchpad_worktree(self):
+        """`diff` reads a revision as a path, which lands in the directory git runs in: in a
+        worktree in the scratchpad, as `git worktree add <scratchpad>/base HEAD` makes, from its
+        `-C` directory or from the session's. The read scope places a path there as it does in
+        the project. Each set of approvals sits beside a path that climbs out of the
+        scratchpad, under the same setup."""
+        base = f"{SCRATCH}/base"
+        for revisions in ("HEAD~1", "HEAD^ HEAD", "HEAD:AGENTS.md", "@{u}", "main...HEAD"):
+            with self.subTest(revisions=revisions):
+                self.assert_allowed(f"git -C {base} diff {revisions}", "revisions in a worktree")
+        self.assert_no_opinion(f"git -C {base} diff --no-index ../../x y", "beside the scratchpad")
+        with unittest.mock.patch.object(hook, "_SESSION_CWD", base):
+            self.assert_allowed("git diff HEAD~1", "a revision, from the worktree")
+            self.assert_no_opinion("git diff --no-index ../../x y", "beside the scratchpad")
+
+    def test_a_file_name_joined_to_each_directory(self):
+        """`ls-files --exclude-per-directory` joins its value to each directory it reads, from
+        the top of the working tree, so `../../x` climbs out of every one of them. A value
+        with no directory in it stays inside the working tree. The value the shell supplies is
+        quoted: unquoted, bash may split it, which `_check_command` refuses outright first."""
+        for refused in (
+            "git ls-files -o --exclude-per-directory=../../etc/os-release",
+            "git ls-files -o --exclude-per-directory /etc/os-release",
+            'git ls-files -o --exclude-per-directory=".x$HOME"',
+        ):
+            with self.subTest(refused=refused):
+                self.assert_no_opinion(refused, "may name a file outside the working tree")
+        self.assert_allowed("git ls-files -o --exclude-per-directory=.gitignore", "a file name")
+
+    def test_a_path_from_the_directory_git_changes_to(self):
+        """git resolves a path from its `-C` directory, so the paths are too: from the project,
+        `git -C docs ... ../AGENTS.md` is `AGENTS.md`. With the project inside another read
+        root, the parent of the project is in scope, and `git -C .. ... ../x` reads the `x`
+        beside that root, which the project alone would place inside it."""
+        self.assert_allowed(
+            "git -C docs diff --no-index ../AGENTS.md ../README.md", "files in the project"
+        )
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_root_") as directory:
+            outer = Path(os.path.realpath(directory))
+            project = outer / "project"
+            project.mkdir()
+            with (
+                unittest.mock.patch.object(hook, "REPO_ROOT", project),
+                unittest.mock.patch.object(hook, "_SESSION_CWD", None),
+                with_scratchpad_dir(str(outer)),
+            ):
+                self.assert_no_opinion(
+                    "git -C .. diff --no-index ../x project/y", "the x beside the read root"
+                )
+                self.assert_allowed(
+                    "git -C .. diff --no-index x project/y", "the x inside the read root"
+                )
+
+    def test_a_path_from_a_directory_spelled_from_home(self):
+        """A `-C` directory spelled with `~` is the home directory's, for the paths joined to it
+        too: `git -C ~/project ... ../x` reads the `x` in the home directory, not one in a
+        directory named `~` inside the project."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_home_") as directory:
+            home = Path(os.path.realpath(directory))
+            project = home / "project"
+            project.mkdir()
+            with (
+                unittest.mock.patch.dict(os.environ, {"HOME": str(home)}),
+                unittest.mock.patch.object(hook, "REPO_ROOT", project),
+                unittest.mock.patch.object(hook, "_SESSION_CWD", None),
+            ):
+                self.assert_no_opinion(
+                    "git -C ~/project diff --no-index ../x y", "the x in the home directory"
+                )
+                self.assert_allowed("git -C ~/project diff --no-index x y", "the x in the project")
+
+    def test_a_directory_no_path_can_be_joined_to(self):
+        """A glob or a substitution as the `-C` directory is refused before the paths are read,
+        as a git word the shell finishes (`MatchesTheHostsOwnCaution`,
+        `RefusesWordsAnExpansionSupplies`). `_directory_scope` refuses one all the same, since
+        the read scope clears both, and a path joined to one would be measured from a directory
+        the shell had not chosen yet. It refuses a variable too, which it reads as the
+        credential check does, `_changed_directories`: as each value the command sets, and as
+        the value the shell had before. The control: a directory spelled out."""
+        scope = hook._ReadScope([str(hook.REPO_ROOT)], [str(hook.REPO_ROOT)], {}, {})
+        for command in ("git -C <(echo docs) diff a b", "git -C doc* diff a b"):
+            with self.subTest(command=command):
+                self.assert_refused(command, "the shell finishes the directory")
+                reduced, parts = hook._scan(command)
+                token = reduced.split()[2]
+                with self.assertRaises(hook.NoOpinion):
+                    hook._directory_scope(token, parts, {}, scope)
+        with self.assertRaises(hook.NoOpinion):
+            hook._directory_scope("x$d", [], {"d": ["docs"]}, scope)
+        joined = hook._directory_scope("docs", [], {}, scope)
+        self.assertEqual([str(hook.REPO_ROOT / "docs")], joined.bases)
 
 
 @approvals_budgeted
