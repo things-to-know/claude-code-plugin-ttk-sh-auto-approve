@@ -27,7 +27,7 @@ Thus, every rule here has to hold under both grammars. Decisions for this hook:
   - ``${(e)x}``
   - ``$~x``
   - glob qualifiers
-  - ``=(...)``
+  - ``=(...)``, and ``=ls`` for the path of ``ls``
   - ``echo`` interpreting escapes without ``-e``
   - ``printf '%d'`` evaluating its argument
 
@@ -5723,6 +5723,31 @@ def _resolves_into_scratch(path: str) -> bool:
         return False  # a path that cannot be resolved is not one to vouch for
 
 
+def _zsh_equals_expansion(token: str, parts: list[tuple[str, str]]) -> bool:
+    """Whether zsh replaces part of this word with the path of a command, `=ls` with `/usr/bin/ls`.
+
+    zsh does so for an unquoted `=` that starts a word and has more after it, and in an
+    assignment's value for one that starts the value or follows a `:`, as in `x==ls` and
+    `x=a:=ls`. With `magic_equal_subst`, which a startup file can set, every word with a `=` is
+    read as an assignment is, as `--file==ls` is. A quoted part or an expansion can supply the
+    `:`, or nothing at all: `x=a':'=ls` and `p=; x=$p=ls` each expand. A `=` on its own, as in
+    `test a = b`, is left as it is. ``token`` is a reduced word, so a quoted `=` is in ``parts``,
+    and expands nothing.
+    """
+    if token.startswith("=") and len(token) > 1:
+        return True
+    _, equals, value = token.partition("=")
+    if not equals:
+        return False
+    for index, char in enumerate(value):
+        if char != "=":
+            continue
+        before = _expand(value[:index], parts).rpartition(":")[2]
+        if not before or "$" in before or SUBSTITUTION_MARKER in before:
+            return True
+    return False
+
+
 def _readable_input_target(target: str, parts: list[tuple[str, str]], roots: list[str]) -> bool:
     """Whether ``< target`` names a file the operator wrote out, not one the shell computes.
 
@@ -5814,6 +5839,16 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
             raise NotReadOnly("arithmetic over a value the module did not read")
         if ZSH_PARAMETER_FLAGS.search(text) or ZSH_GLOB_SUBST.search(text):
             raise NotReadOnly("zsh expansion that re-evaluates a value")
+
+    # zsh replaces `=ls` with the path of `ls`, a file on `PATH` that neither layer reads, and
+    # bash leaves it as it is. Read before the redirections are stripped, so that a `<` target
+    # is a word here too.
+    for line in reduced.split("\n"):
+        for token in _tokenize(line):
+            if _zsh_equals_expansion(token, parts):
+                raise NotReadOnly(
+                    f"zsh replaces a word with the path of a command: {_expand(token, parts)}"
+                )
 
     # Read once, for both tiers: the read roots below and the operator's rules further down.
     settings = _settings_permissions()

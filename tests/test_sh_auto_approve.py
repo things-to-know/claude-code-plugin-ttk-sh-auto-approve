@@ -3119,7 +3119,7 @@ class CurlStopsAtTheListedSites(Verdicts, unittest.TestCase):
             self.assert_no_opinion("curl -sSfL 'https://peps.python.org/pep-0008/'")
             self.assert_no_opinion("curl -s --location 'https://peps.python.org/pep-0008/'")
             self.assert_no_opinion(
-                "curl -sL --proto-redir =https 'https://peps.python.org/pep-0008/'"
+                "curl -sL --proto-redir '=https' 'https://peps.python.org/pep-0008/'"
             )
 
     def test_a_file_is_written_only_by_the_redirect(self):
@@ -4412,6 +4412,46 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         with a_project_below_home():
             self.assert_allowed("cat README.md", "the control")
             self.assert_refused_outright("cat ~root/x")
+
+    def test_a_word_zsh_replaces_with_a_commands_path(self):
+        """zsh replaces an unquoted `=name` with the path of the command `name`, so `cat =ls` is
+        `cat /usr/bin/ls`, a file on `PATH` that neither layer reads, and bash reads a file named
+        `=ls` (#61). It does the same in an assignment's value, at its start or after a `:`, both
+        of which a quoted part or an expansion can supply, and with `magic_equal_subst` in any
+        word with a `=`. Refused outright, as zsh's other expansions are. zsh 5.9 read
+        `/usr/bin/ls` for each, as `DifferentialAgainstZsh` checks."""
+        for command in (
+            "cat '=ls'",
+            "grep -c x \\=ls AGENTS.md",
+            "wc -l < '=ls'",
+            "head -c 4 AGENTS.md",
+            "test a = b",  # a `=` on its own
+            "x=a=b; echo $x",
+            "x=a'b'=c; echo $x",
+            "x=a:'='ls; echo $x",
+            "cut -d= -f2 AGENTS.md",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "the control")
+        for command in (
+            "cat =ls",
+            "grep -c x =ls",
+            "head -c 4 =ssh",
+            "wc -l < =ls",
+            "wc -l <=ls",
+            "ls -l =ssh",
+            'cat ="ls"',
+            "for f in =ls; do cat $f; done",
+            "test a == b",
+            "x==ls; cat $x",
+            "x+==ls; cat $x",
+            "x=a:=ls; echo $x",
+            "x=a':'=ls; echo $x",
+            "p=; x=$p=ls; cat $x",
+            "grep --file==ls AGENTS.md",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused_outright(command)
 
     def test_a_read_from_a_directory_the_shell_supplies(self):
         """After `pushd "$d"` the shell can be anywhere, and so can every program after it,
@@ -7076,7 +7116,9 @@ class RefusesGhFlagsThatOpenOrWait(Verdicts, unittest.TestCase):
         self.assert_allowed("gh pr list --head '~' --search '=ls'", "the control")
         self.assert_no_opinion("gh pr list --head ~", "both shells make it $HOME")
         self.assert_no_opinion("gh pr list --search ~+", "both shells make it $PWD")
-        self.assert_no_opinion("gh pr list --search =ls", "zsh makes it the path of ls")
+        self.assert_refused_outright(
+            "gh pr list --search =ls", "zsh makes it the path of ls, for every program (#61)"
+        )
         self.assert_no_opinion(
             "gh pr list --search=~+", "neither shell expands it, but any unquoted `~` counts"
         )
@@ -7144,12 +7186,13 @@ class ReadsGhSearchQueries(Verdicts, unittest.TestCase):
 
     def test_a_word_the_shell_rewrites_is_not_read(self):
         """Both shells rewrite an unquoted `~`, and zsh a word that starts with `=`, so the
-        query sent is not the words the hook read: `~+` sends the working directory to GitHub."""
+        query sent is not the words the hook read: `~+` sends the working directory to GitHub.
+        The `=` is refused outright, for every program (#61)."""
         self.assert_allowed("gh search issues crash '~+' '~' 'x=~' '=ls'", "the control")
         self.assert_no_opinion("gh search issues crash ~+", "both shells make it $PWD")
         self.assert_no_opinion("gh search issues crash ~", "both shells make it $HOME")
         self.assert_no_opinion("gh search issues crash x=~", "bash makes it x=$HOME")
-        self.assert_no_opinion("gh search issues =ls", "zsh makes it the path of ls")
+        self.assert_refused_outright("gh search issues =ls", "zsh makes it the path of ls")
         self.assert_no_opinion("gh search issues -- crash ~+", "after the terminator too")
 
     def test_a_repository_filter_is_owner_slash_repo(self):
@@ -8505,6 +8548,23 @@ class DifferentialAgainstZsh(unittest.TestCase):
                     self.assertFalse(tried, "zsh tried the plant with its own module_path")
                     continue
                 self.assertTrue(tried, "zsh tried no plant: a dead case")
+                self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
+
+    # #61: zsh replaces an unquoted `=ls` with the path of `ls`, and bash reads a file named
+    # `=ls`, which the tree doesn't hold. They change nothing, so each is told by what it prints
+    EQUALS_READS = (
+        "wc -c =ls",
+        "wc -c <=ls",
+        "x==ls; wc -c $x",
+        "p=; x=$p=ls; wc -c $x",
+    )
+
+    def test_a_word_zsh_replaces_with_a_commands_path(self):
+        for command in self.EQUALS_READS:
+            with self.subTest(command=command), scratch_tree() as root:
+                read = run_in_zsh(command, root).stdout
+                self.assertTrue(read.strip(), "zsh read no command's file: a dead case")
+                self.assertEqual("", run_in_bash(command, root).stdout, "bash read a file")
                 self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
 
     def test_no_approved_command_mutates_the_tree_in_zsh(self):
