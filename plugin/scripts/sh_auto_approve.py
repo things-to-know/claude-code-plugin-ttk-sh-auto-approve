@@ -1205,22 +1205,22 @@ def _is_bare_expansion_of(token: str, parts: list[tuple[str, str]], names: froze
 # loop head), so the safe names are collected here and passed down.
 #
 # The list must be literal to count: a `$(...)` body, a `${arr[@]}`, or any word the shell
-# still has to build says nothing about what `name` will hold and yields no exemption. A
-# `name` that any header binds unsafely is removed, so one safe and one unsafe binding of
-# the same name does not leave it exempt.
-def _safe_loop_names(segments: list[list[str]], parts: list[tuple[str, str]]) -> frozenset[str]:
-    safe: set[str] = set()
-    unsafe: set[str] = set()
+# still has to build says nothing about what `name` will hold and yields no exemption. And
+# such headers must be every binding of `name` that `_bindings` counts: an assignment in the
+# body, `for p in a; do p=-i; ...`, or a zsh header that binds it second, `for q p in x -i`,
+# leaves it bound to a value no header spells.
+def _safe_loop_names(
+    segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
+) -> frozenset[str]:
+    safe: dict[str, int] = {}
     for segment in segments:
         if len(segment) < 3 or segment[0] not in WORD_LIST_HEADS or segment[2] != "in":
             continue
         name = _expand(segment[1], parts)
         values = segment[3:]
         if values and all(_value_is_literal_non_flag(word, parts) for word in values):
-            safe.add(name)
-        else:
-            unsafe.add(name)
-    return frozenset(safe - unsafe)
+            safe[name] = safe.get(name, 0) + 1
+    return frozenset(name for name, count in safe.items() if bindings.get(name) == count)
 
 
 # A use of `name` that the shell word-splits into the argument list: `$name`, `${name}`,
@@ -1250,7 +1250,7 @@ def _splice_name(token: str, splice_vars: dict[str, list[str]]) -> str | None:
 
 
 def _literal_assignments(
-    segments: list[list[str]], parts: list[tuple[str, str]]
+    segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
 ) -> dict[str, list[str]]:
     """Variables assigned a fully literal value in a sibling segment, as split words.
 
@@ -1258,32 +1258,37 @@ def _literal_assignments(
     the assignment is in the same command as the `${=_p}` that uses it, the value is right
     here to read. The value counts as literal only when nothing in it is left for the shell
     to decide -- no `$(...)`, no nested `$var`, no glob, no brace -- so what it splits into
-    is fixed and checkable. A name assigned more than once, or once unsafely, is dropped,
-    so an attacker cannot shadow a safe value with a later dangerous one.
+    is fixed and checkable.
+
+    Only an assignment that starts its segment is read, and only when it is the one binding of
+    its name that `_bindings` counts. Any other binding, wherever it stands, drops the name, so
+    an attacker cannot shadow a safe value with a later dangerous one: a second assignment, one
+    after `then` or `{`, a `for` header, a builtin such as `export` or `read`, or `$_`, which
+    every command binds. An append is not read either: `p+=x` adds to the value `p` had,
+    which this module never read.
 
     The split is on the shell's default IFS (space, tab, newline), which is what an
     unquoted expansion undergoes. That is an approximation -- a custom `IFS` would split
-    differently -- but a command that reset `IFS` carries that assignment, or a `for IFS`
-    header, too, and `_strip_structure` refuses both.
+    differently -- but a command that reset `IFS` carries that binding too, and every binding
+    of `IFS` is refused before this runs: an assignment and a `for` header by
+    `_strip_structure`, a builtin's by `_bindings`.
     """
     assigned: dict[str, list[str]] = {}
-    seen_unsafe: set[str] = set()
     for segment in segments:
         for word in segment:
             if not ASSIGNMENT.match(word):
                 break  # assignments come first in a segment; a non-assignment ends them
-            name = word.split("=", 1)[0].rstrip("+")
-            value_token = word[len(word.split("=", 1)[0]) + 1 :]
+            name, _, value_token = word.partition("=")
+            if name.endswith("+") or bindings.get(name) != 1:
+                continue  # an append, or bound elsewhere too: no value here to trust
             expanded_value = _expand(value_token, parts)
             if (
-                _carries_substitution(value_token, parts)
+                _word_the_shell_builds(value_token, parts)
                 # The value as expanded, not the token: bash globs the words of an unquoted
                 # `$q` where it is used, however the assignment quoted them, so `q='*'; find .
                 # $q` hands find every name in the directory. zsh does not, but `${=q}` and
                 # `$q` are read the same here.
                 or _has_wildcard(expanded_value)
-                or _carries_brace_expansion(value_token)
-                or _has_bare_variable(value_token, parts)
                 # Defense in depth: word-splitting does not re-run the parser, so a `;` in
                 # the value is an inert argument rather than a new command -- but a value
                 # that carries one was likely meant as a command, and splicing it is too
@@ -1291,11 +1296,6 @@ def _literal_assignments(
                 # plain flags and operands or it is not spliced.
                 or any(ch in expanded_value for ch in ";|&<>`()$\n")
             ):
-                seen_unsafe.add(name)
-                continue
-            if name in assigned or name in seen_unsafe:
-                seen_unsafe.add(name)  # a second binding: too ambiguous to trust either
-                assigned.pop(name, None)
                 continue
             # Bash expands a leading tilde in an assignment's value, so `x=~/a` holds the
             # home-relative path, not the two characters. Storing the expansion is what lets
@@ -1303,7 +1303,7 @@ def _literal_assignments(
             if value_token.startswith("~"):
                 expanded_value = os.path.expanduser(expanded_value)
             assigned[name] = expanded_value.split()
-    return {n: v for n, v in assigned.items() if n not in seen_unsafe}
+    return assigned
 
 
 def _has_bare_variable(token: str, parts: list[tuple[str, str]]) -> bool:
@@ -1436,36 +1436,53 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
     # the literal it spells, such a value would be measured below the directory it climbs from.
     if _has_wildcard(expanded) and _glob_may_climb(expanded):
         return None
+    # Both shells expand a `~` that starts a word of the list: `for p in ~` binds the home
+    # directory, which the text `~` would place in the project
+    if token.startswith("~"):
+        directory = _tilde_expansion(expanded)
+        return None if directory is None else [directory]
     return [expanded]
 
 
+def _tilde_expansion(text: str) -> str | None:
+    """The directory a word starting with an unquoted `~` names, or None where the shell picks it.
+
+    `~` and `~/x` are in the home directory, and `~user` in that user's. `~+` and `~-` are
+    `$PWD` and `$OLDPWD`, and `~1`, `~+1` and `~-1` entries of the directory stack, which the
+    shell holds: `os.path.expanduser` leaves each as the text it is, a name in the project.
+    """
+    head = text[1:].split("/", 1)[0]
+    if head[:1] in ("+", "-") or head.isdigit():
+        return None
+    return os.path.expanduser(text)
+
+
 def _literal_loop_values(
-    segments: list[list[str]], parts: list[tuple[str, str]]
+    segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
 ) -> dict[str, list[str]]:
     """The values each `for` variable can take, for resolving it inside a path.
 
     Wider than `_safe_loop_names`: a glob or `$(ls)` list resolves here, so `"$f"` can be
     placed inside a directory, but it is never a reason to exempt `"$f"` from the flag check.
-    A name bound by two loops, or by a loop whose list is unresolvable, is left out.
+    A name is left out unless the loop is the one binding of it that `_bindings` counts, and
+    its list is resolvable: `for p in .; do p=~; ...` reads `~`.
     """
     values: dict[str, list[str]] = {}
-    unresolvable: set[str] = set()
     for segment in segments:
         if len(segment) < 3 or segment[0] not in WORD_LIST_HEADS or segment[2] != "in":
             continue
         name = _expand(segment[1], parts)
+        if bindings.get(name) != 1:
+            continue
         shapes: list[str] = []
         for word in segment[3:]:
             shape = _loop_value_shapes(word, parts)
             if shape is None:
-                unresolvable.add(name)
                 break
             shapes.extend(shape)
         else:
-            if name in values:
-                unresolvable.add(name)
             values[name] = shapes
-    return {name: v for name, v in values.items() if name not in unresolvable}
+    return values
 
 
 # A parameter expansion in the unquoted part of a word: `$q`, `${q}`, `${=q}`, `${q:-x}`.
@@ -1477,69 +1494,372 @@ UNQUOTED_EXPANSION = re.compile(r"\$\{?=?([A-Za-z_][A-Za-z0-9_]*)")
 UNSAFE_IN_A_GLUED_VALUE = frozenset(" \t\n*?[]()")
 
 
+def _header(words: list[str], index: int) -> tuple[list[str], int | None]:
+    """The names the `for` at ``words[index]`` binds, and the index of the `do` its body follows.
+
+    The word after `for` is a name whatever it is, `do` included, and zsh binds every word
+    after it up to `in` or `do`: `for q p in a --o` sets `p` to `--o`. After `in` come the
+    loop's words, which are data. Without an `in`, the header loops over the positional
+    parameters, and a `do` ends it in the same segment, so `for p do touch x` runs `touch x`
+    once for each, and zsh's `argv=a` sets one. The index is None for a header whose body is in
+    a later segment.
+    """
+    end = index + 2
+    while end < len(words) and words[end] not in ("in", "do"):
+        end += 1
+    body = end if end < len(words) and words[end] == "do" else None
+    return words[index + 1 : end], body
+
+
+def _refuse_binding(name: str) -> None:
+    """Refuse a binding of a name a later program reads, `_names_the_environment`.
+
+    By an assignment or a builtin: `PATH=.` and `export XDG_CONFIG_HOME=.` each make a later
+    `git status` run a program of the project's. A `for` header's names get the same check in
+    `_check_loop_names`.
+    """
+    if _names_the_environment(name):
+        raise NotReadOnly(f"refused environment variable assignment: {name}")
+
+
+# The words in front of a builtin that still run it as one: `builtin read p` reads into `p`.
+# `command` is one too, which `_check_command_builtin` refuses outright.
+PRECOMMANDS = frozenset({"builtin", "noglob", "nocorrect"})
+
+# The builtins of bash and zsh that bind the names their operands give, as `read p`,
+# `export p=x` and `unset p` do, each with the letters of the options that take the next word
+# as a value: bash's `read -p prompt`.
+NAME_OPERAND_BINDERS = {
+    "declare": "",
+    "export": "",
+    "float": "",
+    "integer": "",
+    "local": "",
+    "readonly": "",
+    "typeset": "",
+    "unset": "",
+    "mapfile": "CcdnOsu",
+    "readarray": "CcdnOsu",
+    "read": "diNnptu",
+    "vared": "fiMmprt",
+}
+
+# The options of bash's `read` whose value, as the next word, zsh's `read` takes for a name:
+# zsh's `-n` takes no value and its `-t` only a number, so `read -t p` reads into `p`. Glued
+# on, as in `-tp`, the letters are more options to zsh. zsh 5.9 has no `-i` or `-N`, and its
+# `-p` reads a coprocess.
+READ_NAME_LETTERS = "nt"
+
+# The builtins that bind the name one option takes, and none of their operands: zsh's `print
+# -v p` and `set -A p`, and bash's `wait -p p`. Each with that option's letter, then the
+# letters of its other options that take the next word. `printf -v p` binds too, which
+# `_check_printf` refuses in every spelling, a value the command sets in place included.
+NAME_OPTION_BINDERS = {"print": ("v", "CfuxX"), "set": ("A", "o"), "wait": ("p", "")}
+
+# The names a builtin binds that none of its words spell: zsh's `read -A` with no name fills
+# `reply`, and `set` and `shift` rebind the positional parameters, which zsh's `argv` holds.
+# Only a name an assignment may bind matters: bash's `REPLY`, `MAPFILE` and `OPTARG`, filled
+# the same way, are refused wherever the command assigns them, so no reader trusts a value.
+IMPLICIT_BINDINGS = {"read": ("reply",), "set": ("argv",), "shift": ("argv",)}
+
+# The builtins that bind names neither table reads: `getopts` its second operand, and `let`
+# each name it assigns
+OTHER_BINDERS = frozenset({"getopts", "let"})
+BINDER_TABLES = (NAME_OPERAND_BINDERS, NAME_OPTION_BINDERS, IMPLICIT_BINDINGS, OTHER_BINDERS)
+
+# The builtins whose `-n` declares a nameref: after `declare -n r=p`, `r=x` binds `p`
+NAMEREF_BINDERS = frozenset({"declare", "local", "typeset"})
+
+# The builtins whose `-m` makes each operand a pattern in zsh: `unset -m 'p*'` unsets each name
+# it matches, and `typeset -m '(p)'=x` binds `p`, a pattern with no wildcard in it
+PATTERN_BINDERS = frozenset(
+    {"declare", "export", "float", "integer", "local", "readonly", "typeset", "unset"}
+)
+
+# A name at the start of a word, as `p=x`, `p+=x` and `p[1]=x` assign to `p`
+NAME_PREFIX = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\+?=|\[)")
+
+# A word that is a name: `p`, or zsh's `read 'p?prompt'`
+NAME_OPERAND = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\?.*)?", re.DOTALL)
+
+# A name in an arithmetic expression, and one a plain `=` assigns, as each of `p=q=1` does. A
+# letter after a digit, a `#` or a `.` is part of a number: `0x1f`, `16#ff`, `1e5`.
+ARITHMETIC_NAME = re.compile(r"(?<![A-Za-z0-9_#.])[A-Za-z_][A-Za-z0-9_]*")
+ARITHMETIC_ASSIGNED = re.compile(r"(?<![A-Za-z0-9_#.])([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)")
+
+
+def _bindings(segments: list[list[str]], parts: list[tuple[str, str]]) -> dict[str, int]:
+    """How many times this command binds each name, counted wherever it does.
+
+    A reader takes a name's values only where the bindings it read are every one counted here:
+    `p=a; { p=b; }` binds `p` twice, and a reader that sees one of them reads a value the shell
+    may not hold. So a word that may bind a name is counted as one:
+
+    - every word shaped as `name=`, wherever it stands: after `then` or `{`, and as an argument
+      such as `make q=1`, which costs only a refusal of a word that uses `q`
+    - every name a `for` header binds, `_header`, wherever the `for` stands
+    - each name a builtin binds: `NAME_OPERAND_BINDERS`, `NAME_OPTION_BINDERS`,
+      `IMPLICIT_BINDINGS`, the second operand of `getopts`, and each name `let` assigns
+    - `_`, which every command binds to its last word: `echo --o` makes `"${_}utput=x"`
+      `--output=x`
+
+    A builtin can bind a name the command doesn't spell, which can be any name, so these are
+    refused outright: a name the shell builds, as in `export $n=x` and `read -t "$n"`, or a
+    pattern names, as in zsh's `unset -m 'p*'` and `typeset -m '(p)'`, a nameref, after which
+    `r=x` binds the name `r` holds, and a `let` that reads a variable, `_let_names`. So is a
+    binding of a name `_refuse_binding` refuses, `READ_NAME_LETTERS` included.
+
+    A builtin is read where it is the program, `_program_index`. A binding that no such builtin
+    spells, by an alias or a function of a startup file, or by `eval` or `source` under a rule,
+    is not counted.
+    """
+    counts: dict[str, int] = {"_": 1}
+    for segment in segments:
+        start = _program_index(segment)
+        program = _expand(segment[start], parts) if start is not None else ""
+        # A builtin's own words are read by `_builtin_names`; anywhere else, a word shaped as
+        # `name=` counts
+        binder = start is not None and _binds(program)
+        end = start + 1 if start is not None and binder else len(segment)
+        names: list[str] = []
+        for index, word in enumerate(segment[:end]):
+            if word in WORD_LIST_HEADS:
+                names += [_expand(name, parts) for name in _header(segment, index)[0]]
+            elif ASSIGNMENT.match(word):
+                names.append(word.split("=", 1)[0].rstrip("+"))
+        if binder:
+            bound, maybe = _builtin_names(program, segment[end:], parts)
+            for name in bound + maybe:
+                _refuse_binding(name)
+            names += bound + maybe + list(IMPLICIT_BINDINGS.get(program, ()))
+        for name in names:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _command_index(words: list[str], *, refuse: bool) -> int | None:
+    """The index of the command in this segment, past the structure in front of it, or None.
+
+    The one walk to it, so that `_strip_structure`, which checks the command there, and
+    `_bindings`, which reads the builtin there, agree on where it starts. With ``refuse``, it
+    refuses what `_strip_structure` does on the way: `case` and `select`, a binding of a name
+    `_refuse_binding` refuses, by an assignment or a `for` header, and an assignment that
+    prefixes a command.
+    """
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in ("case", "select"):
+            if refuse:
+                raise NotReadOnly(f"unsupported shell control structure: {word}")
+            return index
+        if word in WORD_LIST_HEADS:
+            # The values a header binds are data, and its names are bindings, held to the
+            # check an assignment gets: `for PATH in .` is `PATH=.`. A body after its `do` in
+            # this segment is a command, as in `for p do touch x`.
+            names, body = _header(words, index)
+            if refuse:
+                _check_loop_names(names)
+            if body is None:
+                return None
+            index = body
+            continue
+        if word in STRUCTURE:
+            index += 1
+            continue
+        if ASSIGNMENT.match(word):
+            if refuse:
+                # TODO(decision): `while IFS= read -r line; do ...; done` prompts here. An
+                # *empty* `IFS=` prefixed to one command is scoped to that command and can
+                # only reduce word-splitting, so it could be allowed; `read` itself only
+                # assigns variables and could join READ_ONLY. A `read` variable stays
+                # unresolvable, so it still prompts in a flag or file position.
+                _refuse_binding(word.split("=", 1)[0].rstrip("+"))
+                # Refuse prefix environment assignments before command execution
+                if index + 1 < len(words) and not ASSIGNMENT.match(words[index + 1]):
+                    raise NotReadOnly(f"environment variable prefix on command: {word}")
+            index += 1
+            continue
+        return index
+    return None
+
+
+def _program_index(words: list[str]) -> int | None:
+    """The index of the program this segment runs, past `PRECOMMANDS` too, or None.
+
+    `builtin read p` runs `read`, which binds `p`.
+    """
+    index = _command_index(words, refuse=False)
+    while index is not None and words[index] in PRECOMMANDS:
+        index = index + 1 if index + 1 < len(words) else None
+    return index
+
+
+def _binds(program: str) -> bool:
+    """Whether this program is a builtin `_builtin_names` reads the bindings of."""
+    return any(program in table for table in BINDER_TABLES)
+
+
+def _builtin_names(
+    program: str, args: list[str], parts: list[tuple[str, str]]
+) -> tuple[list[str], list[str]]:
+    """The names a binding builtin binds: those it does, and those it may.
+
+    The second are the words zsh's `read` takes for a name where bash's reads an option's
+    value, `READ_NAME_LETTERS`, as in `read -t p`. Options end at the first operand or `--`, as
+    both shells' builtins read them.
+    """
+    if program == "let":
+        return _let_names(args, parts), []
+    if program == "getopts":
+        # `getopts optstring name`, after the `--` that may end its options
+        operands = args[1:] if args and _expand(args[0], parts) == "--" else args
+        return _operand_names(operands[1:2], parts), []
+    if program not in NAME_OPERAND_BINDERS and program not in NAME_OPTION_BINDERS:
+        return [], []  # it binds only what `IMPLICIT_BINDINGS` gives it
+    name_letter, value_letters = NAME_OPTION_BINDERS.get(
+        program, (None, NAME_OPERAND_BINDERS.get(program, ""))
+    )
+    name_letters = READ_NAME_LETTERS if program == "read" else ""
+    bound: list[str] = []
+    maybe: list[str] = []
+    index = 0
+    while index < len(args):
+        token, text = args[index], _expand(args[index], parts)
+        if _word_the_shell_builds(token, parts):
+            # It can be an option: the one that takes a name, as `$o` holding `-v` is to
+            # `print $o p`. A name operand the shell builds is refused below.
+            if name_letter is not None:
+                raise NotReadOnly(f"{program} given an option the shell builds: {text}")
+            break
+        if len(text) < 2 or text[0] not in "-+":
+            break
+        index += 1
+        if text == "--":
+            break
+        if program in NAMEREF_BINDERS and "n" in text[1:]:
+            raise NotReadOnly(f"{program} declares a nameref: {text}")
+        if program in PATTERN_BINDERS and "m" in text[1:]:
+            raise NotReadOnly(f"a builtin binds the variables a pattern names: {text}")
+        for position, letter in enumerate(text[1:], 1):
+            if letter != name_letter and letter not in value_letters:
+                continue
+            # The option's value: the rest of the word, or the next one
+            glued = position < len(text) - 1
+            if glued:
+                value = [text[position + 1 :]]
+            else:
+                value, index = args[index : index + 1], index + 1
+            if letter == name_letter:
+                bound += _operand_names(value, parts)
+            elif letter in name_letters and not glued:
+                maybe += _operand_names(value, parts)
+            break
+    if name_letter is None:
+        bound += _operand_names(args[index:], parts)
+    return bound, maybe
+
+
+def _let_names(args: list[str], parts: list[tuple[str, str]]) -> list[str]:
+    """The names `let` assigns, each with a plain `=`.
+
+    Arithmetic reads a variable's value as an expression of its own, so a `let` that reads a
+    variable binds whatever that value assigns, which can be any name: after `q=PATH=1`, `let
+    q` sets `PATH`, and so do `let i++` and `let "i=$i+1"` after `i=PATH=1`, the shell putting
+    `$i`'s value in first. Such a `let` is refused, as `$((q))` is: one that reads a name, as
+    an operator other than `=` does, or one the shell builds. What is left assigns numbers, as
+    `let i=0` and `let 'a = b = 1'` do.
+    """
+    names = []
+    for token in args:
+        text = _expand(token, parts)
+        if _word_the_shell_builds(token, parts):
+            raise NotReadOnly(f"let given a word the shell builds: {text}")
+        assigned = list(ARITHMETIC_ASSIGNED.finditer(text))
+        starts = {match.start() for match in assigned}
+        if any(match.start() not in starts for match in ARITHMETIC_NAME.finditer(text)):
+            raise NotReadOnly(f"variable inside arithmetic: {text}")
+        names += [match.group(1) for match in assigned]
+    return names
+
+
+def _operand_names(args: list[str], parts: list[tuple[str, str]]) -> list[str]:
+    """The name each of a builtin's name operands binds.
+
+    `p`, `p=x`, `p+=x`, `p[1]=x` and zsh's `'p?prompt'` each bind `p`. One whose name the shell
+    builds, as `$n=x` and `"$n"` are, can bind any name, and is refused. Any other word, such as
+    a number zsh's `typeset -L 10` takes, or `'p*'`, binds none: an operand is a pattern only
+    after zsh's `-m`, which `_builtin_names` refuses.
+    """
+    names = []
+    for token in args:
+        match = NAME_PREFIX.match(token)  # the name spelled out, whatever the value is
+        if match is None and _word_the_shell_builds(token, parts):
+            raise NotReadOnly(
+                f"a builtin binds a variable whose name the shell builds: {_expand(token, parts)}"
+            )
+        text = _expand(token, parts)
+        match = match or NAME_OPERAND.fullmatch(text) or NAME_PREFIX.match(text)
+        if match is not None:
+            names.append(match.group(1))
+    return names
+
+
+def _word_the_shell_builds(token: str, parts: list[tuple[str, str]]) -> bool:
+    """Whether the shell still builds this word.
+
+    An expansion, a substitution, a wildcard it expands or a brace.
+    """
+    return (
+        _has_bare_variable(token, parts)
+        or _carries_substitution(token, parts)
+        or _carries_live_glob(token)
+        or _carries_brace_expansion(token)
+    )
+
+
 def _known_values(
     segments: list[list[str]],
     parts: list[tuple[str, str]],
     splice_vars: dict[str, list[str]],
     loop_values: dict[str, list[str]],
+    bindings: dict[str, int],
 ) -> dict[str, list[str] | None]:
     """Each name this command binds, with the values it can hold, or None where they are unread.
 
-    A name's values are known when every binding of it is one this module read as literal: an
-    assignment that starts its segment and that `_literal_assignments` accepted, and a `for`
-    header that starts its segment and that binds literal words. The value is the one bash
-    stores, before any split: `q=' -o'` holds ` -o`, which `splice_vars` keeps as the one word
-    `-o`.
+    A name's values are known where its one binding is one this module read as literal: an
+    assignment that `_literal_assignments` accepted, or a `for` header that
+    `_literal_loop_values` resolved to no `PATH_COMPONENT`. Each of those holds only a name that
+    `_bindings` counts once, so the binding it read is the name's only one. The value is the
+    one bash stores, before any split: `q=' -o'` holds ` -o`, which `splice_vars` keeps as the
+    one word `-o`.
 
-    Any other binding leaves the name's values unread: a second assignment, an append, an
-    assignment after `do`, `then` or `{`, a header inside a loop's body, a glob list, which a
-    planted file name decides. Every word shaped as `name=` counts as a binding wherever it
-    stands, and so does every word between a `for` and its `in`, as zsh binds each of them:
-    `for q p in a --o` sets `p` to `--o`. An argument such as `make q=1` costs only a refusal of
-    a word that `${q}` starts. `$_` is always unread: each command sets it to its last word, so
-    `echo --o` makes `"${_}utput=x"` `--output=x`.
+    Any other name ``bindings`` holds is unread: one bound twice, by an append, after `do`,
+    `then` or `{`, by a header inside a loop's body or one that binds the name second, by a
+    builtin, or by a glob list, which a planted file name decides. `$_` is always unread: each
+    command sets it to its last word.
 
     A name this command never binds is left out: the residual `_word_the_shell_decides`
     documents.
     """
-    bindings: dict[str, int] = {}
-    read: dict[str, int] = {}
     values: dict[str, list[str]] = {}
     for segment in segments:
-        names: list[str] = []
-        for index, word in enumerate(segment):
-            if word in WORD_LIST_HEADS:
-                for following in segment[index + 1 :]:
-                    if following == "in":
-                        break
-                    names.append(_expand(following, parts))
-            elif ASSIGNMENT.match(word):
-                names.append(word.split("=", 1)[0].rstrip("+"))
-        for name in names:
-            bindings[name] = bindings.get(name, 0) + 1
         if len(segment) >= 3 and segment[0] in WORD_LIST_HEADS and segment[2] == "in":
             name = _expand(segment[1], parts)
             if name in loop_values and not any(PATH_COMPONENT in v for v in loop_values[name]):
-                values.setdefault(name, []).extend(loop_values[name])
-                read[name] = read.get(name, 0) + 1
+                values[name] = loop_values[name]
             continue
         for word in segment:
             if not ASSIGNMENT.match(word):
                 break
             name, _, value_token = word.partition("=")
             # `name` keeps the `+` of an append, which `splice_vars` never holds
-            if name not in splice_vars:
-                continue
-            value = _expand(value_token, parts)
-            if value_token.startswith("~"):
-                value = os.path.expanduser(value)
-            values.setdefault(name, []).append(value)
-            read[name] = read.get(name, 0) + 1
-    known = {
-        name: values[name] if read.get(name) == count else None for name, count in bindings.items()
-    }
-    known["_"] = None
-    return known
+            if name in splice_vars:
+                value = _expand(value_token, parts)
+                if value_token.startswith("~"):
+                    value = os.path.expanduser(value)
+                values[name] = [value]
+    return {name: values.get(name) for name in bindings}
 
 
 def _unclean_expansion(token: str, known_values: dict[str, list[str] | None]) -> str | None:
@@ -1792,38 +2112,14 @@ def _segments(tokens: list[str]) -> list[list[str]]:
 
 
 def _strip_structure(words: list[str]) -> list[str]:
-    """Strip loop control structure.
+    """The simple command in this segment, past the control structure in front of it.
 
-    Rejects dangerous environment variables and prefix assignments, and a `for` header that
-    binds one.
+    Refuses what `_command_index` refuses on the way to it: a binding of a name
+    `_names_the_environment` names, by an assignment or a `for` header, a header `_check_loop_names`
+    refuses, and an assignment that prefixes a command.
     """
-    index = 0
-    while index < len(words):
-        word = words[index]
-        if word in ("case", "select"):
-            raise NotReadOnly(f"unsupported shell control structure: {word}")
-        if word in WORD_LIST_HEADS:
-            return _loop_header_command(words[index + 1 :])
-        if word in STRUCTURE:
-            index += 1
-            continue
-        if ASSIGNMENT.match(word):
-            var_name = word.split("=", 1)[0].rstrip("+")
-            # Refuse dangerous environment variables
-            if _names_the_environment(var_name):
-                # TODO(decision): `while IFS= read -r line; do ...; done` prompts here. An
-                # *empty* `IFS=` prefixed to one command is scoped to that command and can only
-                # reduce word-splitting, so it could be allowed; `read` itself only assigns
-                # variables and could join READ_ONLY. A `read` variable stays unresolvable, so
-                # it still prompts in a flag or file position.
-                raise NotReadOnly(f"refused environment variable assignment: {var_name}")
-            # Refuse prefix environment assignments before command execution
-            if index + 1 < len(words) and not ASSIGNMENT.match(words[index + 1]):
-                raise NotReadOnly(f"environment variable prefix on command: {word}")
-            index += 1
-            continue
-        break
-    return words[index:]
+    start = _command_index(words, refuse=True)
+    return [] if start is None else words[start:]
 
 
 def _names_the_environment(name: str) -> bool:
@@ -1846,33 +2142,22 @@ def _names_the_environment(name: str) -> bool:
 LOOP_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _loop_header_command(words: list[str]) -> list[str]:
-    """The command a `for` header's segment runs, once each name the header binds is checked.
+def _check_loop_names(names: list[str]) -> None:
+    """Refuse a `for` header whose names, as `_header` reads them, hold one the hook refuses.
 
-    ``words`` follow the `for`. Each one up to `in`, `do` or the end of the segment is a name
-    the loop binds, and gets the check an assignment's name gets: zsh binds every one of them,
-    so `for q PATH in a .` sets `PATH` to `.`, as `for PATH in .` does in both shells. The first
-    word is a name even when it is `in`, `do` or another reserved word: zsh's
-    `for in PATH in . .` sets `PATH` to `.` too.
-
-    After `in` come the loop's words, which are data. Without `in`, the loop walks the
-    positional parameters, and both shells take `do` right after the names: in
-    `for p do touch x; done` the segment holds the body's first command, which runs once for
-    each parameter, and zsh's `argv=a` sets one. It is read as any command is. A header that
-    holds any other reserved word is refused, as zsh starts the loop's body there.
+    Each gets the check an assignment's name gets: zsh binds every one of them, so `for q PATH
+    in a .` sets `PATH` to `.`, as `for PATH in .` does in both shells. The first word is a name
+    even when it is `in`, `do` or another reserved word: zsh's `for in PATH in . .` sets `PATH`
+    to `.` too. A header that holds any other reserved word is refused, as zsh starts the
+    loop's body there.
     """
-    for index, word in enumerate(words):
-        if index and word == "in":
-            return []
-        if index and word == "do":
-            return _strip_structure(words[index + 1 :])
+    for index, word in enumerate(names):
         if index and word in ZSH_RESERVED_WORDS:
             raise NotReadOnly(f"a for header holds a word zsh runs as the loop's body: {word}")
         if not LOOP_NAME.match(word):
             raise NotReadOnly("a for header binds a word that is not a plain name")
         if _names_the_environment(word):
             raise NotReadOnly(f"a for loop over a refused environment variable: {word}")
-    return []
 
 
 def _skip_sed_delimited(script: str, index: int, delimiter: str) -> int:
@@ -3374,11 +3659,7 @@ def _check_command(
         # is `timeout 5 rm cat README.md`, and under bash `t='5 rm'; timeout $t cat README.md`
         # is too, with no file needed.
         for word in words[1 : len(words) - len(inner)]:
-            if (
-                _carries_live_glob(word)
-                or _has_bare_variable(word, parts)
-                or _carries_substitution(word, parts)
-            ):
+            if _word_the_shell_builds(word, parts):
                 raise NotReadOnly(
                     f"{program} given a word the shell still builds: {_expand(word, parts)}"
                 )
@@ -3939,23 +4220,32 @@ def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[s
     a refusal at most. A command's output is `UNREAD_VALUE`. A wildcard the shell expands
     refuses the command: it picks the directory, which can be a link out of the project, as
     `cd k*` can.
+
+    Where the program spells no target, the shell picks it, and the target is `UNREAD_VALUE`:
+    `pushd -` goes to `$OLDPWD`, `pushd +1` and `pushd -0` to an entry of the directory stack,
+    and a bare `cd` to `$HOME`. So does a target `_tilde_expansion` doesn't read, as `pushd ~-`.
     """
     targets = []
+    program = _program_index(words)
     for index, word in enumerate(words):
         if _expand(word, parts) not in DIRECTORY_CHANGERS:
             continue
+        spelled = None
         for following in words[index + 1 :]:
             target = _expand(following, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
             if target in DIRECTORY_CHANGER_OPTIONS:
                 continue
-            if target.startswith(("-", "+")):
-                break
-            if following.startswith("~"):
-                target = os.path.expanduser(target)
-            if _carries_live_glob(following):
-                raise NotReadOnly(f"cd to a directory a wildcard picks: {target}")
-            targets.append(target)
+            if not target.startswith(("-", "+")):
+                if following.startswith("~"):
+                    target = _tilde_expansion(target) or UNREAD_VALUE
+                if _carries_live_glob(following):
+                    raise NotReadOnly(f"cd to a directory a wildcard picks: {target}")
+                spelled = target
             break
+        if spelled is not None:
+            targets.append(spelled)
+        elif index == program:
+            targets.append(UNREAD_VALUE)
     return targets
 
 
@@ -4014,13 +4304,18 @@ def _changed_directories(
 MAX_SPELLINGS = 64
 
 
-def _spellings(word: str, values: dict[str, list[str] | None], bases: list[str]) -> list[str]:
+def _spellings(
+    word: str, values: dict[str, list[str] | None], bases: list[str], *, before: bool = True
+) -> list[str]:
     """The texts this word can be, for the credential check.
 
     `$HOME` is the home directory and `$PWD` each working directory. Any other variable is each
     value `_known_values` read for it, and a value this module didn't read, `UNREAD_VALUE`, for
     the one the shell had before; so is a name whose values are unread, every other expansion,
     and a command's output.
+
+    Without ``before``, a variable `_known_values` read values for is those values alone, as
+    the read scope resolves it, `_resolve_variables`, and as `_check_cd` reads a `cd $d`.
     """
     texts = [word.replace(SUBSTITUTION_MARKER, UNREAD_VALUE)]
     for _ in range(8):
@@ -4036,7 +4331,8 @@ def _spellings(word: str, values: dict[str, list[str] | None], bases: list[str])
             elif name == "PWD":
                 choices = bases
             elif name:
-                choices = [*(values.get(name) or []), UNREAD_VALUE]
+                known = values.get(name) or []
+                choices = [*known, UNREAD_VALUE] if before or not known else known
             else:
                 choices = [UNREAD_VALUE]
             expanded += [text[: match.start()] + choice + text[match.end() :] for choice in choices]
@@ -4051,18 +4347,24 @@ class _ShellState:
 
     ``bases`` are the directories the shell may be in, and ``shell_bases`` those and the ones
     `CDPATH` may take it to, `_working_directories`; ``values`` are the ones its variables may
-    hold, as `_known_values` reads them. A substitution's body runs in the shell around it, so
-    it is read against that one's.
+    hold, as `_known_values` reads them; ``bindings`` how many times it binds each name,
+    `_bindings`, with the bindings of the commands around it. A substitution's body runs in the
+    shell around it, so it is read against that one's.
     """
 
-    __slots__ = ("bases", "shell_bases", "values")
+    __slots__ = ("bases", "bindings", "shell_bases", "values")
 
     def __init__(
-        self, bases: list[str], shell_bases: list[str], values: dict[str, list[str] | None]
+        self,
+        bases: list[str],
+        shell_bases: list[str],
+        values: dict[str, list[str] | None],
+        bindings: dict[str, int],
     ) -> None:
         self.bases = bases
         self.shell_bases = shell_bases
         self.values = values
+        self.bindings = bindings
 
 
 def _working_directories(
@@ -4082,7 +4384,11 @@ def _working_directories(
     credential check reads.
 
     A target is read as each of its `_spellings`, so one the shell supplies, such as `"$d"`,
-    gives a directory below `UNREAD_VALUE`, which the read scope never vouches for.
+    gives a directory below `UNREAD_VALUE`, and so does a target the shell picks, as `pushd -`
+    does: `_unvouched_directory` vouches for neither, nor for any program run after it. For the
+    read scope a variable whose values the command sets is those values alone, as
+    `_resolve_variables` reads a path, so after `d=src; pushd $d` a relative word is placed in
+    `src`, and the credential check reads it from the value the shell had before too.
 
     Both shells look a target up in each directory `CDPATH` lists first, unless it starts with
     `/`, `./` or `../`. A startup file the hook can't read sets it, and the credential stores are
@@ -4092,15 +4398,14 @@ def _working_directories(
     if inherited is not None:
         bases, shell_bases = list(inherited.bases), list(inherited.shell_bases)
     else:
-        bases = [str(REPO_ROOT)]
-        if _SESSION_CWD and os.path.isabs(_SESSION_CWD) and bases[0] != _SESSION_CWD:
-            bases.append(_SESSION_CWD)
+        bases = _session_bases()
         shell_bases = list(bases)
     for segment in segments:
         for target in _directory_targets(segment, parts):
             spellings = _spellings(target, values, shell_bases)
+            placed = _spellings(target, values, shell_bases, before=False)
             bases = list(
-                dict.fromkeys(bases + [_joined(base, path) for path in spellings for base in bases])
+                dict.fromkeys(bases + [_joined(base, path) for path in placed for base in bases])
             )
             moved = [
                 _joined(base, path)
@@ -4117,6 +4422,36 @@ def _working_directories(
                     raise NotReadOnly(f"cd into a credential store, through CDPATH: {target}")
             shell_bases += added
     return bases, shell_bases
+
+
+def _session_bases() -> list[str]:
+    """The directories a command starts in: the project, and the session's working directory."""
+    bases = [str(REPO_ROOT)]
+    if _SESSION_CWD and os.path.isabs(_SESSION_CWD) and bases[0] != _SESSION_CWD:
+        bases.append(_SESSION_CWD)
+    return bases
+
+
+def _unvouched_directory(bases: list[str], scope: _ReadScope) -> str | None:
+    """A directory the shell may move to that the read scope doesn't vouch for, or None.
+
+    A program reads where it runs with no operand to say so: `grep -r` with no file reads the
+    whole directory, and `git status` runs the `core.fsmonitor` of the repository it is in. So
+    every program after such a `cd` or `pushd` runs somewhere this module didn't read, as after
+    `pushd ~`, `pushd ..`, `pushd "$d"` and `pushd -`. The directories a command starts in are
+    the session's, which it doesn't judge.
+    """
+    session = _session_bases()
+    for base in bases:
+        if base not in session and (UNREAD_VALUE in base or not _in_scope(base, scope)):
+            return base.replace(UNREAD_VALUE, "$")
+    return None
+
+
+def _check_where_it_runs(unvouched: str | None) -> None:
+    """Leave a program to the rules where it may run in ``unvouched``, `_unvouched_directory`."""
+    if unvouched is not None:
+        raise NoOpinion(f"runs in a directory this module can't vouch for: {unvouched}")
 
 
 def _searches_cdpath(target: str) -> bool:
@@ -4795,18 +5130,29 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
 
     allow, deny = _operator_rules(settings)
 
+    # Every binding of every name, wherever it stands, and those of the commands around this
+    # one: a substitution's body runs in their shell, so `o=-x; echo "$(sort $o; o=-u)"` binds
+    # `o` twice. Each reader below takes a name's values only where the bindings it read are
+    # all of these, so that one it doesn't read, such as `{ p=x; }` after `p=y`, leaves the name
+    # unread rather than read as the other value. `_known_values` reads the body's own, and
+    # the values of the commands around it are added after.
+    own_bindings = _bindings(segments, parts)
+    bindings = dict(own_bindings)
+    for name, count in (inherited.bindings if inherited else {}).items():
+        bindings[name] = bindings.get(name, 0) + count
+
     # Loop variables whose `in` list is all literal non-flag words. Collected across every
     # segment first, because the header that binds a name and the body that uses it are
     # separate segments, and `_strip_structure` discards the header. A bare `"$name"` of
     # one of these is exempt from the flag check inside `_check_command`; nothing else is.
-    safe_names = _safe_loop_names(segments, parts)
+    safe_names = _safe_loop_names(segments, parts, bindings)
 
     # Variables assigned a fully literal value in this command. A `$name`/`${name}`/`${=name}`
     # that uses one is spliced into its words and checked as the flags it is, which is how a
     # `_p='--profile x --region y'` hoisted out of repeated vendor calls stops prompting.
-    splice_vars = _literal_assignments(segments, parts)
-    loop_values = _literal_loop_values(segments, parts)
-    known_values = _known_values(segments, parts, splice_vars, loop_values)
+    splice_vars = _literal_assignments(segments, parts, bindings)
+    loop_values = _literal_loop_values(segments, parts, bindings)
+    known_values = _known_values(segments, parts, splice_vars, loop_values, own_bindings)
     for name, values in (inherited.values if inherited else {}).items():
         if name not in known_values:
             known_values[name] = values
@@ -4818,7 +5164,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # Where a relative word may be resolved from, worked out once for the credential check, the
     # read scope and each substitution's body
     bases, shell_bases = _working_directories(segments, parts, inherited, known_values)
-    state = _ShellState(bases, shell_bases, known_values)
+    state = _ShellState(bases, shell_bases, known_values, bindings)
 
     # Layer B: no word may name a credential store, whatever program it belongs to and
     # whatever tier would otherwise approve it.
@@ -4843,6 +5189,11 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         spells_escape=bool(TERMINAL_CONTROL_SPELLED.search(command)),
     )
 
+    # A move to a directory the read scope doesn't vouch for leaves every program to the rules,
+    # wherever it stands, since a program reads where it runs (#72). What a validator refuses
+    # stays refused: the check comes after it.
+    unvouched = _unvouched_directory(state.bases, scope)
+
     # A substitution body is work that was inspected, so `x=$(grep -c . AGENTS.md)` has
     # something to show for itself even though the assignment it sits in is skipped.
     checked = sum(1 for kind, _ in parts if kind in RUNS_A_COMMAND)
@@ -4862,6 +5213,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
                 scope=scope,
                 known_values=known_values,
             )
+            _check_where_it_runs(unvouched)
         except NoOpinion:
             # The module cannot read this one. It can still be something the operator has
             # already granted in this exact shape, which is the second tier.

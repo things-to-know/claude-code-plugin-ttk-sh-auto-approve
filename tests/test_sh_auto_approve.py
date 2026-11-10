@@ -1222,6 +1222,22 @@ class CorpusIsSafeToExecute(unittest.TestCase):
                     "a planted-program case that could resolve outside the scratch tree",
                 )
 
+    @needs_bash
+    def test_every_planted_path_attack_really_runs_the_plant(self):
+        """Run each one with the classifier out of the picture. A plant that needs a program
+        its own `PATH` no longer finds, as `touch` with a `PATH` of `bin`, writes nothing, and
+        the case would pass whatever the hook decided."""
+        planted = DifferentialWithAPlantedProgram
+        inert: list[str] = []
+        for command in planted.PATH_ATTACKS:
+            with scratch_tree() as root:
+                planted.plant_path_attack_programs(root)
+                before = snapshot(root)
+                run_in_bash(command, root)
+                if not (Path(root) / PAYLOAD_MARKER).exists() or snapshot(root) == before:
+                    inert.append(command)
+        self.assertEqual([], inert, "planted attacks with no effect:\n  " + "\n  ".join(inert))
+
     def test_the_planted_spelling_corpus_cannot_resolve_to_a_system_program(self):
         """`plant_executable` writes the program; the command has to be a name that can
         only find it. A candidate that matches something already on PATH would run the
@@ -1694,6 +1710,22 @@ class RefusesAnythingElse(Verdicts, unittest.TestCase):
             "ls & rm -rf build/",
         ):
             self.assert_refused(command)
+
+    def test_a_body_in_the_segment_of_its_header(self):
+        """A header with no `in` loops over the positional parameters, and needs no `;` before
+        its `do`, so its body shares the header's segment. The word after `for` is a name even
+        when it is `do`. Under `bash -c` with no arguments the body runs no time, and once for
+        each positional parameter otherwise, a startup file's `set --` included: it is a
+        command all the same."""
+        self.assert_allowed('ls; for f in a; do echo "$f"; done', "the control")
+        self.assert_allowed('ls; for f; do echo "$f"; done', "the control: a body after `;`")
+        for command in (
+            "ls; for f do rm -rf build/; done",
+            "ls; for f g do rm -rf build/; done",  # zsh binds both
+            "ls; for do do rm -rf build/; done",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command)
 
     def test_unknown_programs_and_interpreters(self):
         for command in (
@@ -2317,6 +2349,23 @@ class AllowsALoopVariableBoundToLiterals(Verdicts, unittest.TestCase):
         self.assert_refused('jq . "$f"', "nothing binds f")
         self.assert_refused('for g in a.md; do jq . "$f"; done', "the loop binds g, not f")
 
+    def test_a_name_bound_again_is_not_exempt(self):
+        """The headers that spell literal values must be every binding of the name (#71): an
+        assignment in the body or after the loop, or a zsh header that binds it second, gives
+        it a value no header spells."""
+        self.assert_allowed('for p in a; do git log -1 "$p"; done', "the control")
+        self.assert_allowed('for p in a; do git log -1 "$p"; done; for p in b; do true; done')
+        self.assert_allowed('for p in s/one/1/; do sed "$p" AGENTS.md; done', "the control")
+        for command in (
+            'for p in a; do p=--output=PWNED; git log -1 "$p"; done',
+            'for p in a; do true; p=--output=PWNED; git log -1 "$p"; done',
+            'for p in a; do true; done; { p=--output=PWNED; }; git log -1 "$p"',
+            'for p in a; do true; done; for q p in x --output=PWNED; do git log -1 "$p"; done',
+            'for p in s/one/1/; do p=-i; sed "$p" s/one/1/ AGENTS.md; done',
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command)
+
     def test_the_exemption_does_not_cover_a_write_in_the_body(self):
         self.assert_refused(
             'for f in a.md; do sort "$f" -o PWNED; done', "an output flag is still a write"
@@ -2347,8 +2396,9 @@ class SplicesFlagsFromALiteralAssignment(Verdicts, unittest.TestCase):
     * **the value carries no shell metacharacter** -- defense in depth: word-splitting does
       not re-run the parser, so a `;` in the value is an inert argument, but a value that
       carries one was likely meant as a command and is too sharp to auto-approve;
-    * **the name is assigned exactly once** -- a second binding, safe or not, drops it, so a
-      later value cannot shadow an earlier judgement;
+    * **the name is bound exactly once** -- a second binding, safe or not, drops it, so a
+      later value cannot shadow an earlier judgement: an assignment wherever it stands, a
+      `for` header, a builtin such as `read`, and `$_`, which every command binds;
     * **the spliced result still passes** -- the validator runs on the real flags, so a
       value that resolves to a write or a dangerous flag is refused as that.
     """
@@ -2414,9 +2464,74 @@ class SplicesFlagsFromALiteralAssignment(Verdicts, unittest.TestCase):
         )
 
     def test_a_reassigned_name_is_dropped(self):
+        """Any second binding drops the name, wherever it stands and whatever spells it (#49):
+        bash and zsh use the last value the command gives it, which the splice would not read.
+        Each first value is one the hook approves on its own, so a binding the count misses
+        fails here."""
+        self.assert_allowed("p=--oneline; git log -1 $p", "the control")
+        self.assert_allowed("p=--oneline; for q r in a b; do true; done; git log -1 $p")
+        for rebinding in (
+            "p=--output=PWNED",
+            "x=1 p=--output=PWNED",
+            "p+=x",
+            "for p in --output=PWNED; do true; done",
+            "for q p in a --output=PWNED; do true; done",  # zsh binds both
+            "if true; then p=--output=PWNED; fi",
+            "if false; then true; else p=--output=PWNED; fi",
+            "if false; then true; elif p=--output=PWNED; then true; fi",
+            "if p=--output=PWNED; then true; fi",
+            "while p=--output=PWNED; false; do true; done",
+            "{ p=--output=PWNED; }",
+            "for i in 1; do p=--output=PWNED; done",
+            "! p=--output=PWNED",
+            "time p=--output=PWNED",
+        ):
+            command = f"p=--oneline; {rebinding}; git log -1 $p"
+            with self.subTest(command=command):
+                self.assert_refused(command)
+        self.assert_allowed("o=-n; sed $o 's/one/1/' AGENTS.md", "the control")
+        for command in (
+            "o=-n; for o in -i; do true; done; sed $o 's/one/1/' AGENTS.md",
+            "o=-n; if true; then o=-i; fi; sed $o 's/one/1/' AGENTS.md",
+            "n=1; for n in https://evil.example/o/r/pull/1; do true; done; gh pr view $n",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command)
+        self.assert_allowed("_p='--region r'; aws ec2 describe-instances ${=_p}", "the control")
         self.assert_refused(
-            "_p='--region r'; _p='s3 rm x'; aws ${=_p}",
-            "two bindings, so neither value is trusted",
+            "_p='--region r'; _p='s3 rm x'; aws ${=_p}", "zsh's `${=_p}` splices the second"
+        )
+
+    def test_an_append_is_not_a_value(self):
+        """`p+=x` adds `x` to the value `p` had, which the splice never read, even where the
+        append is the name's one binding."""
+        self.assert_allowed("p=--oneline; git log -1 $p", "the control")
+        self.assert_refused("p+=--oneline; git log -1 $p", "p holds what it held, then this")
+
+    def test_a_body_counts_the_bindings_around_it(self):
+        """A substitution's body runs in the shell of the command around it, so a name that
+        command binds is bound in the body too, before the body's own binding of it, which the
+        splice and the loop exemption would read alone. Each refusal wrote `PWNED`, or grepped
+        the home directory, under bash 5.2 and zsh 5.9."""
+        self.assert_allowed('echo "$(o=-u; sort $o AGENTS.md)"', "the control: one binding")
+        self.assert_allowed('o=-u; echo "$(sort -u AGENTS.md)"', "the control: no use of o")
+        for command in (
+            'o=-oPWNED; echo "$(sort $o AGENTS.md; o=-u)"',
+            'o=-oPWNED; echo "$(o+=; sort $o AGENTS.md)"',
+            'p=--output=PWNED; echo "$(git log -1 $p; p=--oneline)"',
+            'p=$(echo -oPWNED); echo "$(sort "$p" AGENTS.md; for p in AGENTS.md; do true; done)"',
+            'p=-oPWNED; echo "$(echo "$(sort $p AGENTS.md; p=-u)")"',  # two bodies deep
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command)
+        with a_project_below_home():
+            self.assert_allowed('echo "$(p=.; grep -rl PRIVATE $p)"', "the control")
+            self.assert_refused('p=~; echo "$(p+=; grep -rl PRIVATE $p)"', "it greps ~")
+
+    def test_every_command_binds_the_underscore(self):
+        """`$_` is the last word of the command before, whatever `_=` assigned."""
+        self.assert_refused(
+            "_=--oneline; echo --output=PWNED; git log -1 $_", "it is `--output=PWNED`"
         )
 
     def test_a_use_with_no_assignment_is_still_refused(self):
@@ -2793,6 +2908,10 @@ class RefusesShellSyntaxTheLexerMisreads(Verdicts, unittest.TestCase):
         segment, and `checked` is still non-zero from the leading read."""
         self.assert_refused("ls; case x in *) rm -rf build/;; esac", "runs the case body")
         self.assert_refused("wc -l AGENTS.md; case $x in a) git push;; esac", "pushes")
+
+    def test_select_is_not_read(self):
+        """`select` binds its name to a word it reads from stdin, and needs no `)` to refuse."""
+        self.assert_refused_outright("select f in a; do ls; done")
 
     def test_a_for_body_after_do_is_a_command(self):
         """`for p do ...` walks the positional parameters, with `do` in the header's segment
@@ -3610,6 +3729,112 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         self.assert_refused('for f in .*; do cat "$f"; done', "may match ..")
         self.assert_refused('for f in ../*; do cat "$f"; done', "starts outside")
 
+    def test_a_path_from_a_value_another_binding_replaces(self):
+        """A variable is placed at the value one binding gives it only when that binding is its
+        only one (#49, #71). Layer B reads the other binding as spelled, and neither `~` nor
+        `/proc/self` names a store, nor `.` after a `cd`."""
+        with a_project_below_home():
+            for command in (
+                "p=.; grep -rl PRIVATE $p",
+                'for p in .; do grep -rl PRIVATE "$p"; done',
+                "p=src; cd $p; grep -rl PRIVATE .",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            for command in (
+                "p=.; { p=~; }; grep -rl PRIVATE $p",
+                'p=.; if true; then p=~; fi; grep -rl PRIVATE "$p"',
+                '_=.; echo ~; grep -rl PRIVATE "$_"',
+                'p=.; { p=/proc/self; }; cat "$p"/environ',
+                "p=src; { p=../../..; }; cd $p; grep -rl PRIVATE .",
+                'for p in .; do p=~; grep -rl PRIVATE "$p"; done',
+                'for p in .; do p=/proc/self; cat "$p"/environ; done',
+                'for p in .; do true; done; for q p in x ~; do grep -rl PRIVATE "$p"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command)
+
+    def test_a_tilde_in_a_for_list(self):
+        """Both shells expand a `~` that starts a word of a `for` list, so `p` holds the home
+        directory, which the text `~` placed in the project. `~-` is `$OLDPWD`, which the shell
+        holds. bash 5.2 and zsh 5.9 each grepped a key from the home directory for `~`, `~/` and
+        `src ~`, and so did bash for `~-`, and for `pushd ~-`, with `OLDPWD` there."""
+        with a_project_below_home():
+            for command in (
+                'for p in src; do grep -rl PRIVATE "$p"; done',
+                "for p in '~'; do grep -rl PRIVATE \"$p\"; done",  # a directory named `~`
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            for command in (
+                "for p in ~; do grep -r -A30 'PRIVATE KEY' \"$p\"; done",
+                'for p in ~/; do grep -rl PRIVATE "$p"; done',
+                'for p in src ~; do grep -rl PRIVATE "$p"; done',
+                'for p in ~-; do grep -rl PRIVATE "$p"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command)
+        with a_project_below_home(), operator_rules(allow=["Bash(pushd *)"]):
+            self.assert_allowed("pushd src; grep -rl PRIVATE .", "the control")
+            self.assert_no_opinion("pushd ~-; grep -rl PRIVATE .")
+
+    def test_a_read_from_a_directory_the_shell_supplies(self):
+        """After `pushd "$d"` the shell can be anywhere, and so can every program after it,
+        however the words it reads are spelled (#72). One `d=src` is the one value `d` holds."""
+        with a_project_below_home(), operator_rules(allow=["Bash(pushd *)"]):
+            for command in (
+                "pushd src; grep -rl PRIVATE .",
+                'd=src; pushd "$d"; grep -rl PRIVATE .',
+                "d=src; pushd $d; grep -rl PRIVATE .",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            self.assert_no_opinion("pushd ~; grep -rl PRIVATE .", "the control: read outside")
+            for command in (
+                'pushd "$(echo ~)"; grep -rl PRIVATE .',
+                'd=x; d=~; pushd "$d"; grep -rl PRIVATE .',
+                'pushd "$d"; grep -rl PRIVATE .',
+                'pushd "$d"; git -C src log -1',
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command)
+
+    def test_a_program_that_reads_where_it_runs(self):
+        """A program with no operand reads the directory it runs in: GNU `grep -r` with no file
+        reads it all, and `git status` runs the `core.fsmonitor` of the repository there. So
+        after a move to a directory the read scope doesn't vouch for, every program is left to
+        the rules. `pushd -` goes to `$OLDPWD`, and `pushd +N` and `pushd -N` to the directory
+        stack, which the shell holds. In bash 5.2 and zsh 5.9, `pushd ~` and `pushd "$d"` with
+        `d` set to a home holding a key grepped the key, and so did `pushd -` in bash with
+        `OLDPWD` set there; `git status` after `pushd` to another repository ran its
+        `core.fsmonitor`."""
+        with a_project_below_home(), operator_rules(allow=["Bash(pushd *)"]):
+            for command in (
+                "pushd src; grep -rl PRIVATE",
+                "pushd src; git status",
+                "echo pushd -; ls",  # a word `pushd` that is no command moves nothing
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            for command in (
+                "pushd ~; grep -rl PRIVATE",
+                'pushd "$d"; grep -rl PRIVATE',
+                "pushd -; grep -rl PRIVATE .",
+                "pushd +1; grep -rl PRIVATE .",
+                "pushd -0; grep -rl PRIVATE .",
+                "pushd ..; git status",
+                "pushd ~; ls",
+                'pushd ~; echo "$(git status)"',
+                "git status; pushd ~",  # the order is not read
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command)
+        with a_project_below_home(), operator_rules(allow=["Bash(pushd *)", "Bash(git *)"]):
+            self.assert_allowed("pushd ~; git status", "a rule approves each program")
+            self.assert_refused_outright(
+                "pushd ~; git log --output=PWNED", "a validator's refusal still stands"
+            )
+
     def test_a_glob_that_climbs_past_its_directory(self):
         """A globbed path is measured from the directory in front of its wildcard, which holds
         only while nothing after the wildcard climbs: `*/..` lands above whatever `*` matched,
@@ -4122,6 +4347,8 @@ class RefusesControlOfTheEnvironmentAndTheProgram(Verdicts, unittest.TestCase):
             ("for in HOME in . .; do git status; done", "rejects it, but zsh sets HOME to ."),
             ("for in IFS in - -; do git log -1; done", "rejects it, but zsh sets IFS to -"),
             ("for do PATH in a .; do ls; done", "rejects it, but zsh sets PATH to ."),
+            ("for i in 1; do for PATH in .; do git status; done; done", "nested in a body too"),
+            ("ls; for PATH do git status; done", "with its body in the header's segment"),
         ):
             with self.subTest(command=command):
                 self.assert_refused(command, why)
@@ -4230,6 +4457,7 @@ class RefusesSessionScopedEnvironmentHandover(Verdicts, unittest.TestCase):
         """Kept as regression guards: these were already refused."""
         self.assert_refused("path=/tmp ls", "the check upper-cases the name")
         self.assert_refused("http_proxy=http://x ls", "any prefix assignment is refused")
+        self.assert_refused_outright("q=1 ls", "an ordinary name as a prefix too")
 
     def test_an_ordinary_loop_variable_is_still_approved(self):
         """The rule is about which names carry meaning to a later command, not about
@@ -6379,6 +6607,124 @@ class OperatorRules(Verdicts, unittest.TestCase):
             self.assert_refused("gh issue delete 1", "no rule covers it")
             self.assert_refused("ls; gh pr merge 1", "no rule covers the second segment")
 
+    BINDING_BUILTINS = (
+        "Bash(builtin *)",
+        "Bash(declare *)",
+        "Bash(export *)",
+        "Bash(getopts *)",
+        "Bash(let *)",
+        "Bash(local *)",
+        "Bash(mapfile *)",
+        "Bash(print *)",
+        "Bash(read *)",
+        "Bash(set *)",
+        "Bash(shift *)",
+        "Bash(typeset *)",
+        "Bash(unset *)",
+        "Bash(wait *)",
+    )
+
+    def test_a_builtin_a_rule_approves_binds_the_names_it_is_given(self):
+        """A rule approves the builtin's segment only. The hook still reads what the rest of
+        the command gets, so each name the builtin binds counts as a binding: the splice no
+        longer reads `p` as `--oneline` after `export p=...` (#49). A word that may be a name
+        to zsh, as `read -t p` is, counts too."""
+        with operator_rules(allow=list(self.BINDING_BUILTINS)):
+            for command in (
+                "p=--oneline; export q=x; git log -1 $p",
+                "p=--oneline; declare -r q=x; git log -1 $p",
+                "p=--oneline; read -r -p 'Continue? ' q; git log -1 $p",
+                "p=--oneline; read -rpContinue q; git log -1 $p",
+                "p=--oneline; read -t 5 q; git log -1 $p",
+                "p=--oneline; typeset -L 10 q; git log -1 $p",
+                "p=--oneline; set -euo pipefail; git log -1 $p",
+                "p=--oneline; let q=0; git log -1 $p",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: q is bound, not p")
+            for binding in (
+                "export p=--output=PWNED",
+                "export 'p=--output=PWNED'",
+                "declare -x p=--output=PWNED",
+                "read p",
+                "echo --output=PWNED | read p",  # zsh runs the last command in this shell
+                "read -a p",
+                "read -t p",
+                "read -n p",  # zsh's `-n` takes no value
+                "builtin read p",
+                "for i in 1; do read p; done",
+                "mapfile -t p",
+                "getopts a: p",
+                "getopts -- a: p",
+                "unset p",
+                "let p=-1",
+                "let 'q = p = 0'",
+                "print -v p -- --output=PWNED",
+                "print -vp -- --output=PWNED",
+                "set -A p --output=PWNED",  # zsh
+                "set +A p --output=PWNED",
+                "wait -n -p p",
+            ):
+                command = f"p=--oneline; {binding}; git log -1 $p"
+                with self.subTest(command=command):
+                    self.assert_refused(command)
+            self.assert_allowed("reply=--oneline; git log -1 $reply", "the control")
+            self.assert_allowed("argv=--oneline; git log -1 $argv", "the control")
+            for command in (
+                # zsh's `read -A` with no name fills `reply`, and `set` and `shift` its `argv`
+                "reply=--oneline; echo --output=PWNED | read -A; git log -1 $reply",
+                "argv=--oneline; set -- --output=PWNED; git log -1 $argv",
+                "argv=--oneline; shift; git log -1 $argv",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command)
+        with a_project_below_home(), operator_rules(allow=list(self.BINDING_BUILTINS)):
+            self.assert_allowed('p=.; declare q=~; grep -rl PRIVATE "$p"', "the control")
+            self.assert_refused('p=.; declare p=~; grep -rl PRIVATE "$p"', "reads ~")
+
+    def test_a_builtin_that_binds_a_name_no_rule_should_reach(self):
+        """Refused outright, so that no rule overturns it: a name the shell builds or a pattern
+        names, which can be any name, a nameref, after which `r=x` binds what `r` names, and a
+        name a later program reads, as an assignment of it is (#70)."""
+        with operator_rules(allow=list(self.BINDING_BUILTINS)):
+            self.assert_allowed("export q=x; git status", "the control")
+            self.assert_allowed('print -r -- "$x"; git status', "the control: past its options")
+            self.assert_allowed("read -t 5 q; git status", "the control: a number is no name")
+            self.assert_allowed("let i=0 'j = 0x1f'; git status", "the control: numbers")
+            for command in (
+                "n=p; export $n=--output=PWNED",
+                "o=-v; print $o p -- --output=PWNED",
+                'export "$n"',
+                'read -r "$n"',
+                'read -t "$n"',  # zsh reads into the name `$n` holds
+                'let "$n=1"',
+                "unset -m 'p*'",
+                "unset -m p",
+                "typeset -m '(p)'=--output=PWNED",  # zsh binds `p`
+                "typeset -m -L 8 '(p)'",
+                "declare -n r=p",
+                "local -n r=p",
+                "typeset -gn r=p",
+                "export PATH=.; git status",
+                "export XDG_CONFIG_HOME=.; git status",  # git reads ./git/config
+                "read IFS",
+                "read -t IFS",
+                "print -v PATH .",
+                # zsh's `read -t` takes no word as a value but a number, and its `-n` none, so
+                # each of these sets `PATH`, and `git status` ran a `./git`
+                "echo . | read -t PATH; git status",
+                "echo . | read -n PATH; git status",
+                # Arithmetic reads a variable's value as an expression, which can assign any
+                # name: each sets `PATH` to a number, and `git status` ran a `./1/git`
+                "q=PATH=1; let q; git status",
+                "i=PATH=1; let i++; git status",
+                "i=PATH=1; let i+=1; git status",
+                'i=PATH=1; let "i=$i+1"; git status',
+                "let 'p**=2'",  # zsh's power assignment reads `p` too
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
+
     def test_a_rule_cannot_overrule_a_finding(self):
         """A validator that read the command and found a write keeps its verdict. This is
         the one place the tier is deliberately stricter than the host, which would run
@@ -6751,6 +7097,15 @@ class DifferentialAgainstBash(unittest.TestCase):
         "x='a[$(touch PWNED)]'; a=(1); echo \"${a[x]}\"",
         "x='a[$(touch PWNED)]'; echo \"${PWD:x}\"",
         "sed -ne 'w PWNED' -e p AGENTS.md",
+        # A second binding of a name the splice or a loop header read, the shell uses: #49 and
+        # #71. `sort -oPWNED` writes, where `sort -u` reads.
+        "o=-u; for o in -oPWNED; do true; done; sort $o AGENTS.md",
+        "o=-u; if true; then o=-oPWNED; fi; sort $o AGENTS.md",
+        'for p in AGENTS.md; do p=-oPWNED; sort "$p" AGENTS.md; done',
+        # A binding by the command around a substitution, which its body runs in
+        'o=-oPWNED; echo "$(sort $o AGENTS.md; o=-u)"',
+        'o=-oPWNED; echo "$(o+=; sort $o AGENTS.md)"',
+        'p=$(echo -oPWNED); echo "$(sort "$p" AGENTS.md; for p in AGENTS.md; do true; done)"',
     ) + (
         # `e` is GNU sed's execute command, and the only entry here that runs a program
         ("cat AGENTS.md | sed '/one/e touch PWNED'",) if HAS_GNU_SED else ()
@@ -6818,6 +7173,14 @@ class DifferentialWithAPlantedProgram(unittest.TestCase):
         "PATH=bin ls",
     )
 
+    # What the planted program does: a builtin, as `touch` is not on a `PATH` of `bin`
+    PLANTED_BODY = f": > {PAYLOAD_MARKER}"
+
+    @classmethod
+    def plant_path_attack_programs(cls, root: str) -> None:
+        plant_executable(root, "ls", cls.PLANTED_BODY)
+        plant_executable(root, "bin/ls", cls.PLANTED_BODY)
+
     # Spellings of a program name that are not a plain word. Run with `.` on PATH and
     # an `ls` planted inside the scratch tree, so each resolves to the plant or to nothing.
     SPELLING_ATTACKS = ("l?", "l*", "$'ls'", '"ls"', "l''s", "\\ls")
@@ -6842,8 +7205,7 @@ class DifferentialWithAPlantedProgram(unittest.TestCase):
             if not hook.is_read_only(command):
                 continue
             with scratch_tree() as root:
-                plant_executable(root, "ls", f"touch {PAYLOAD_MARKER}")
-                plant_executable(root, "bin/ls", f"touch {PAYLOAD_MARKER}")
+                self.plant_path_attack_programs(root)
                 before = snapshot(root)
                 run_in_bash(command, root)
                 if snapshot(root) != before:
@@ -7058,6 +7420,9 @@ class DifferentialAgainstZsh(unittest.TestCase):
         # left to check once the header's segment is discarded
         "argv=a; for p do touch PWNED; done; ls",
         "argv=a; for in do touch PWNED; done; ls",
+        # zsh binds every name a `for` header gives, `p` too, where bash finds a syntax error
+        "o=-u; for q o in x -oPWNED; do true; done; sort $o AGENTS.md",
+        'for p in AGENTS.md; do true; done; for q p in x -oPWNED; do sort "$p" AGENTS.md; done',
     )
 
     def test_every_attack_really_mutates_the_tree_in_zsh(self):
