@@ -47,9 +47,10 @@ A [Claude Code](https://code.claude.com/docs) plugin with 2 hooks:
 > - `permissions.blockReadsOutsideWorkingDirectories`, for paths outside your working directories
 >
 > The hook reads `additionalDirectories` only from the project's `.claude/settings.json` and
-> `.claude/settings.local.json`. It drops an entry that is or contains your home directory, or
-> that is, contains or sits inside a credential store; each entry it keeps widens what it may
-> read.
+> `.claude/settings.local.json`, and only where Claude Code applies them: in a workspace you
+> trusted, from a setting source the session loaded. It drops an entry that is or contains your
+> home directory, or that is, contains or sits inside a credential store; each entry it keeps
+> widens what it may read.
 
 ## Install
 

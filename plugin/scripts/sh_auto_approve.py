@@ -37,7 +37,8 @@ A command is approved when every simple command in it clears one of two tiers:
         module did not read; or
     2. the module has no reading of it at all, and the operator's own rules in
         ``.claude/settings.json`` and ``.claude/settings.local.json`` already allow that
-        exact command text.
+        exact command text, in a session where Claude Code applies those files
+        (``_sources_in_force``).
 
 Tier 1 accepts two writes that the command does not choose, both by a ``git ls-remote`` or
 ``git remote show`` that reaches its remote: git hands the credential back to the credential
@@ -117,7 +118,7 @@ import shlex
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from stat import S_ISREG
+from stat import S_ISDIR, S_ISREG
 from typing import NoReturn
 
 # Maximum command length inspected before defaulting to user prompt (matches host caution)
@@ -151,6 +152,35 @@ SETTINGS_FILES = (".claude/settings.json", ".claude/settings.local.json")
 # it was supposed to approve. A hand-written one is a few KB, so the cap is some tens of times
 # that and still small enough to read on every call.
 SETTINGS_SIZE_CAP = 256 * 1024
+
+# Claude Code applies a project's settings file only in a session that loaded the file's setting
+# source, and only in a workspace it has a trust record for (`_sources_in_force`). The source of
+# each file, by the name `--setting-sources` gives it, and every source that flag names:
+SETTING_SOURCE_OF = {".claude/settings.json": "project", ".claude/settings.local.json": "local"}
+SETTING_SOURCES = frozenset({"user", "project", "local"})
+SETTING_SOURCES_FLAG = "--setting-sources"
+
+# Claude Code's process id, which it sets for the processes it starts. This hook is one, so its
+# parent process is Claude Code, whose command line holds `--setting-sources`.
+CLAUDE_PID_ENV = "CLAUDE_PID"
+
+# While the first is set, Claude Code counts no trust record; while the second is, it keeps its
+# global config, where the trust records are, in a file of another name
+IGNORE_TRUST_ENV = "CLAUDE_CODE_IGNORE_PERSISTED_TRUST"
+CUSTOM_OAUTH_ENV = "CLAUDE_CODE_CUSTOM_OAUTH_URL"
+
+# Claude Code's global config is `.claude.json` in this directory, or else in the home directory.
+# It grows with every project a session ran in: one with 30 projects is about 160 KB.
+CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
+GLOBAL_CONFIG_SIZE_CAP = 32 * 1024 * 1024
+
+# The `.git` file of a worktree, and the `commondir` and `gitdir` files git writes for one, hold a
+# single path, in which a control character is not one git wrote
+GIT_POINTER_SIZE_CAP = 4096
+GIT_POINTER_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+# How long `ps` may take to print Claude Code's command line on macOS, where there is no /proc
+PARENT_COMMAND_LINE_TIMEOUT = 5.0
 
 # Base programs that only ever read. Must be invoked by bare name (no slashes).
 READ_ONLY = {
@@ -415,6 +445,12 @@ _SESSION_CWD: str | None = None
 # The `scratchpad_dir` of the hook payload. Set by `main()`; the scratchpad in reach is that
 # directory, and none is while it is unset. See `_scratch_directory`.
 _SCRATCHPAD_DIR: str | None = None
+
+# The setting sources the session loaded. `main()` sets it to None, so the first call that needs
+# it reads them from Claude Code's command line (`_session_setting_sources`). In process, as
+# `tools/explain.py` runs the module, it is every source, as in a session started without
+# `--setting-sources`.
+_SETTING_SOURCES: frozenset[str] | None = SETTING_SOURCES
 
 # Variable assignment matching
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
@@ -3919,7 +3955,8 @@ def _operator_rules(
     host requires every sub-command of a compound to match a rule independently, which is
     exactly what the caller does with these -- so recognizing them here does not widen
     what the operator granted, it stops a pipeline losing the grant because one filter in
-    the middle of it has no rule of its own.
+    the middle of it has no rule of its own. It holds only for a rule Claude Code applies,
+    which is why ``_settings_permissions`` drops the allow rules of a file it doesn't.
 
     Nothing is cached: the file is small, it is read once per Bash call, and a rule the
     operator saved a moment ago through "yes, and don't ask again" applies immediately.
@@ -3958,16 +3995,21 @@ def _settings_permissions() -> tuple[list[dict], bool]:
     A file that is missing is the ordinary case and means nothing. A file that exists and
     cannot be used -- wrong kind, too large, unreadable, not JSON, no ``permissions`` --
     makes the second value false, and each caller decides what that costs it.
+
+    Of a project file Claude Code doesn't apply in this session (``_sources_in_force``), only
+    the deny rules are kept: they can only cost a prompt. The files ``SETTINGS_ENV`` names
+    instead stand for files Claude Code applies.
     """
     override = os.environ.get(SETTINGS_ENV)
     if override is None:
-        paths = [REPO_ROOT / name for name in SETTINGS_FILES]
+        files = [(REPO_ROOT / name, SETTING_SOURCE_OF[name]) for name in SETTINGS_FILES]
     else:
-        paths = [Path(piece) for piece in override.split(os.pathsep) if piece]
+        files = [(Path(piece), None) for piece in override.split(os.pathsep) if piece]
 
     found: list[dict] = []
     usable = True
-    for path in paths:
+    in_force: frozenset[str] | None = None
+    for path, source in files:
         try:
             info = path.stat()  # follows a link, and raises for one that dangles
         except OSError:
@@ -3984,16 +4026,214 @@ def _settings_permissions() -> tuple[list[dict], bool]:
         except (OSError, ValueError, KeyError, TypeError, RecursionError):
             usable = False  # it is there and it cannot be read; see the docstring
             continue
-        if isinstance(permissions, dict):
-            found.append(permissions)
+        if not isinstance(permissions, dict):
+            continue
+        if source is not None:
+            if in_force is None:
+                in_force = _sources_in_force()
+            if source not in in_force:
+                permissions = {"deny": permissions.get("deny")}
+        found.append(permissions)
     return found, usable
+
+
+def _sources_in_force() -> frozenset[str]:
+    """The project's setting sources whose allow rules and directories Claude Code applies.
+
+    ``project`` is ``.claude/settings.json``, and ``local`` ``.claude/settings.local.json``.
+    Claude Code applies them in a session that loaded their source, which ``--setting-sources``
+    may leave out, and in a workspace it has a trust record for. Without one it ignores both
+    and says so on stderr: "Ignoring 1 permissions.allow entry from .claude/settings.json: this
+    workspace has not been trusted". An interactive session asks for that trust before it runs
+    any hook, but ``claude -p`` and the SDK run hooks in a workspace that has none, so a
+    repository's own file would otherwise get its commands approved here and nowhere else.
+
+    The source of truth is Claude Code 2.1.322's own code: it applies both files once its
+    global config holds a trust record for the workspace's key (``_trust_key``). It applies the
+    local file without one too, where git doesn't track it and ``.claude`` is no link, while a
+    folder above holds a record. This module asks for the record in that case as well, which
+    costs a prompt there and nothing else.
+    """
+    if not _workspace_trusted():
+        return frozenset()
+    return _session_setting_sources() & frozenset(SETTING_SOURCE_OF.values())
+
+
+def _session_setting_sources() -> frozenset[str]:
+    """The setting sources the session loaded, read once from Claude Code's command line.
+
+    None at all where the command line cannot be read: what it would have said is unknown.
+    """
+    global _SETTING_SOURCES  # noqa: PLW0603 - one process per call
+    if _SETTING_SOURCES is None:
+        argv = _claude_code_argv()
+        _SETTING_SOURCES = frozenset() if argv is None else _setting_sources(argv)
+    return _SETTING_SOURCES
+
+
+def _setting_sources(argv: list[str]) -> frozenset[str]:
+    """The setting sources a Claude Code command line loads.
+
+    Every source without ``--setting-sources``, the ones it lists with it, spelled as
+    ``--setting-sources user,project`` or ``--setting-sources=user,project``. Each time the
+    flag appears narrows the set, though the last one counts: a prompt that spells the flag
+    costs a prompt, never a source the session left out.
+    """
+    sources = set(SETTING_SOURCES)
+    for index, word in enumerate(argv):
+        if word == SETTING_SOURCES_FLAG:
+            value = argv[index + 1] if index + 1 < len(argv) else ""
+        elif word.startswith(SETTING_SOURCES_FLAG + "="):
+            value = word[len(SETTING_SOURCES_FLAG) + 1 :]
+        else:
+            continue
+        sources &= {piece.strip() for piece in value.split(",")}
+    return frozenset(sources)
+
+
+def _claude_code_argv() -> list[str] | None:
+    """The command line of this process's parent, Claude Code, or None where it cannot be read.
+
+    ``hooks/hooks.json`` runs the hook in exec form, with no shell between, as Claude Code
+    2.1.322 does. Claude Code names its own process in ``CLAUDE_PID``, and a parent that is
+    another is not read: its command line would say nothing of the session's sources.
+    """
+    parent = os.getppid()
+    claimed = os.environ.get(CLAUDE_PID_ENV)
+    if parent <= 1 or (claimed is not None and claimed != str(parent)):
+        return None
+    if sys.platform == "linux":
+        try:
+            with open(f"/proc/{parent}/cmdline", "rb") as stream:
+                raw = stream.read()
+        except OSError:
+            return None
+        # Each argument ends in a NUL, so an empty one, as in `--setting-sources ''`, stays one
+        return [arg.decode("utf-8", "surrogateescape") for arg in raw.split(b"\0")[:-1]] or None
+
+    # macOS has no /proc. `ps` joins the arguments with spaces, which only ever adds a word.
+    import subprocess  # noqa: PLC0415 - as in `_run_git_uncached`, only where it is needed
+
+    try:
+        result = subprocess.run(  # noqa: S603 - the system's own `ps`, and arguments written here
+            ["/bin/ps", "-ww", "-o", "args=", "-p", str(parent)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=PARENT_COMMAND_LINE_TIMEOUT,
+            check=False,
+        )
+        text = result.stdout.decode("utf-8", "surrogateescape")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return text.split() if result.returncode == 0 and text.strip() else None
+
+
+def _workspace_trusted() -> bool:
+    """Whether Claude Code's global config holds a trust record for the workspace of the project.
+
+    The record is ``projects[<key>].hasTrustDialogAccepted: true`` in ``.claude.json``, an
+    internal format: whatever doesn't read as one is no trust. So is a key Claude Code never
+    records, the home directory's, and every key while ``IGNORE_TRUST_ENV`` is set. Where a
+    legacy ``.config.json`` is left, Claude Code may read that file instead, and this module
+    doesn't guess which.
+    """
+    if os.environ.get(IGNORE_TRUST_ENV) or os.environ.get(CUSTOM_OAUTH_ENV):
+        return False
+    key = _trust_key(Path(REPO_ROOT))
+    config_dir = os.environ.get(CONFIG_DIR_ENV) or None
+    if (
+        key is None
+        or key == os.path.realpath(_home())
+        or (config_dir is not None and not os.path.isabs(config_dir))
+    ):
+        return False
+    legacy_dirs = {config_dir or os.path.join(_home(), ".claude"), os.path.join(_home(), ".claude")}
+    if any(os.path.lexists(os.path.join(d, ".config.json")) for d in legacy_dirs):
+        return False
+    path = Path(config_dir or _home(), ".claude.json")
+    try:
+        info = path.stat()
+        if not S_ISREG(info.st_mode) or info.st_size > GLOBAL_CONFIG_SIZE_CAP:
+            return False
+        record = json.loads(path.read_text(encoding="utf-8"))["projects"][key]
+        return record["hasTrustDialogAccepted"] is True
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        return False
+
+
+def _trust_key(project: Path) -> str | None:
+    """The key Claude Code records the trust of a session started in ``project`` under.
+
+    The root of the git worktree around it, or the main worktree's for a linked worktree
+    (``_main_worktree``), or else ``project`` itself, as Claude Code 2.1.322 works it out. A
+    ``.git`` that is a link or that cannot be looked at leaves the key unknown, and None.
+    """
+    for directory in (project, *project.parents):
+        try:
+            mode = (directory / ".git").lstat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        if S_ISDIR(mode):
+            return str(directory)
+        if S_ISREG(mode):
+            return _main_worktree(directory)
+        return None
+    return str(project)
+
+
+def _main_worktree(root: Path) -> str | None:
+    """The key for the trust of the worktree at ``root``, whose ``.git`` is a file.
+
+    A linked worktree git made is keyed by its main worktree: ``root/.git`` names a git dir
+    under ``<main>/.git/worktrees/``, whose ``commondir`` leads back to ``<main>/.git`` and whose
+    own ``gitdir`` names ``root/.git``. A submodule's git dir has no ``commondir``, and Claude
+    Code keys it by ``root``. Anything else is None, rather than a guess at which of the two
+    Claude Code settles on.
+    """
+    line = _git_pointer(root / ".git")
+    if line is None or not line.startswith("gitdir:"):
+        return None
+    gitdir = os.path.normpath(os.path.join(root, line[len("gitdir:") :].strip()))
+    if not os.path.isdir(gitdir):
+        return None
+    if not os.path.lexists(os.path.join(gitdir, "commondir")):
+        return str(root)
+    common_line = _git_pointer(Path(gitdir, "commondir"))
+    back_line = _git_pointer(Path(gitdir, "gitdir"))
+    if common_line is None or back_line is None:
+        return None
+    common = os.path.normpath(os.path.join(gitdir, common_line))
+    main = os.path.dirname(common)
+    if (
+        os.path.basename(common) != ".git"
+        or os.path.dirname(gitdir) != os.path.join(common, "worktrees")
+        or os.path.normpath(os.path.join(gitdir, back_line)) != os.path.join(root, ".git")
+        or os.path.realpath(main) != main
+    ):
+        return None
+    return main
+
+
+def _git_pointer(path: Path) -> str | None:
+    """The one line of a small regular file that holds a path, as git writes them, or None."""
+    try:
+        info = path.lstat()
+        if not S_ISREG(info.st_mode) or info.st_size > GIT_POINTER_SIZE_CAP:
+            return None
+        line = path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return None
+    return line if line and not GIT_POINTER_CONTROL.search(line) else None
 
 
 def _read_roots(settings: tuple[list[dict], bool] | None = None) -> list[str]:
     """The directories a reader may read inside: the project and its ``additionalDirectories``.
 
-    The entries come from the same two files as the operator's rules: a directory there is
-    one the operator already made a working directory. Claude Code also reads the user's own
+    The entries come from the same two files as the operator's rules, and only from a file
+    Claude Code applies (``_settings_permissions``): a directory there is one the operator
+    already made a working directory. Claude Code also reads the user's own
     settings file, which this module leaves alone as it does for the rules, and one added for
     the session with ``/add-dir`` is in no file and not in the hook's payload, so this module
     cannot see either.
@@ -5272,7 +5512,10 @@ def main() -> int:
             return 0
         # Claude Code's shell keeps its working directory between calls, so a relative path
         # is read from wherever the session last stood. The payload says where that is.
-        global _SESSION_CWD, _SCRATCHPAD_DIR, REPO_ROOT  # noqa: PLW0603 - one process per call
+        # The session's, set once: there is one process per call
+        global _SESSION_CWD, _SCRATCHPAD_DIR, _SETTING_SOURCES, REPO_ROOT  # noqa: PLW0603
+        # Read from Claude Code's command line when a project file needs them
+        _SETTING_SOURCES = None
         cwd = payload.get("cwd")
         _SESSION_CWD = os.path.realpath(cwd) if isinstance(cwd, str) and cwd else None
         # This session's scratchpad; see `_scratch_directory`
