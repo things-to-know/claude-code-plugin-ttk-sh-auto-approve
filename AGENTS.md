@@ -279,6 +279,11 @@ other change: where a fix rewrote content that was correct, revert it and adjust
 - Conventional commits
 - The subject line comes first and stands alone: `type(scope): Summary`, as in `git log`.
 - Add a body only when the subject isn't enough, but not too verbose.
+- A commit stands for one distinct change: a fix a review asks for goes into the commit it
+  fixes, not into a commit per finding
+  - A fix to a gap older than the branch is a distinct change, with a commit of its own
+  - Rebasing a PR, fold a commit that only fixes a review of an earlier one, or say in the PR
+    why it stays
 
 ## Release
 
