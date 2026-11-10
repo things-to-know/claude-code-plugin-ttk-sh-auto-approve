@@ -1353,9 +1353,13 @@ def _literal_assignments(
                 continue
             # Bash expands a leading tilde in an assignment's value, so `x=~/a` holds the
             # home-relative path, not the two characters. Storing the expansion is what lets
-            # the read scope see where `"$x"` really points.
+            # the read scope see where `"$x"` really points. `x=~-` holds `$OLDPWD`, which
+            # the shell holds: no value here to read.
             if value_token.startswith("~"):
-                expanded_value = os.path.expanduser(expanded_value)
+                directory = _tilde_expansion(expanded_value)
+                if directory is None:
+                    continue
+                expanded_value = directory
             assigned[name] = expanded_value.split()
     return assigned
 
@@ -1501,14 +1505,28 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
 def _tilde_expansion(text: str) -> str | None:
     """The directory a word starting with an unquoted `~` names, or None where the shell picks it.
 
-    `~` and `~/x` are in the home directory, and `~user` in that user's. `~+` and `~-` are
-    `$PWD` and `$OLDPWD`, and `~1`, `~+1` and `~-1` entries of the directory stack, which the
-    shell holds: `os.path.expanduser` leaves each as the text it is, a name in the project.
+    `~` and `~/x` are in the home directory. Any other prefix is a value the shell holds:
+    `~+` and `~-` are `$PWD` and `$OLDPWD`, and `~1`, `~+1` and `~-1` entries of the directory
+    stack. zsh reads `~name` as a named directory before a user's home: one a startup file's
+    `hash -d` names, or a parameter whose value starts with `/`, as `~HOME` and `~OLDPWD` are.
+    `os.path.expanduser` leaves each of these as the text it is, a name in the project, unless a
+    user has the name, whose home directory bash reads.
     """
-    head = text[1:].split("/", 1)[0]
-    if head[:1] in ("+", "-") or head.isdigit():
+    if text[1:].split("/", 1)[0]:
         return None
     return os.path.expanduser(text)
+
+
+def _tilde_word(text: str) -> str:
+    """``text``, which starts with an unquoted `~`, with its prefix read by `_tilde_expansion`.
+
+    Where the shell picks the directory, it is `UNREAD_VALUE`, and the rest of the word below it.
+    """
+    directory = _tilde_expansion(text)
+    if directory is not None:
+        return directory
+    _, slash, rest = text.partition("/")
+    return UNREAD_VALUE + slash + rest
 
 
 def _literal_loop_values(
@@ -1911,7 +1929,7 @@ def _known_values(
             if name in splice_vars:
                 value = _expand(value_token, parts)
                 if value_token.startswith("~"):
-                    value = os.path.expanduser(value)
+                    value = _tilde_word(value)
                 values[name] = [value]
     return {name: values.get(name) for name in bindings}
 
@@ -4710,9 +4728,12 @@ def _is_under(path: str, root: str) -> bool:
 
 
 def _expand_home(text: str, *, tilde: bool) -> str:
-    """Replace a leading `~`, `~user`, `$HOME` or `${HOME}` with the directory it names."""
+    """Replace a leading `~`, `$HOME` or `${HOME}` with the directory it names.
+
+    Any other tilde prefix, as `~-` and `~name`, is `UNREAD_VALUE`: `_tilde_word`.
+    """
     if tilde and text.startswith("~"):
-        return os.path.expanduser(text)
+        return _tilde_word(text)
     for spelling in ("${HOME}", "$HOME"):
         if text.startswith(spelling):
             return _home() + text[len(spelling) :]
@@ -4756,6 +4777,14 @@ def _names_a_credential_unguarded(
         tilde = True
     if not text:
         return False
+    # `_expand_home` reads `~name` as `UNREAD_VALUE`, which zsh can take from a named directory;
+    # bash takes the home directory of the user `name`, when there is one, read here
+    if tilde and text.startswith("~") and _tilde_expansion(text) is None:
+        user_home = os.path.expanduser(text)
+        if user_home != text and _names_a_credential_unguarded(
+            user_home, tilde=False, bases=bases, live_glob=live_glob
+        ):
+            return True
     text = _expand_home(text, tilde=tilde)
     if UNREAD_VALUE in text:
         unread = [text]
@@ -4938,13 +4967,13 @@ def _directory_word(token: str, parts: list[tuple[str, str]]) -> str:
     """The directory ``token``, a word of its own, names for a program that changes to it.
 
     A command's output, and a wildcard the shell expands, which picks the directory, are
-    `UNREAD_VALUE`. A leading `~` is the home directory. A variable stays as spelled, for
+    `UNREAD_VALUE`. A leading `~` is read by `_tilde_word`. A variable stays as spelled, for
     `_spellings`.
     """
     if _carries_live_glob(token):
         return UNREAD_VALUE
     text = _expand(token, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
-    return os.path.expanduser(text) if token.startswith("~") else text
+    return _tilde_word(text) if token.startswith("~") else text
 
 
 def _changed_directories(
@@ -5297,7 +5326,10 @@ def _read_scope_problem(
     if SUBSTITUTION_MARKER in text:
         return "a path produced by a command"
     if token.startswith("~"):
-        text = os.path.expanduser(text)
+        directory = _tilde_expansion(text)
+        if directory is None:
+            return f"a path in a directory the shell picks: {text}"
+        text = directory
     candidates = _resolve_variables(text, scope)
     if candidates is None:
         return "a path this module cannot resolve"
@@ -5710,7 +5742,10 @@ def _readable_input_target(target: str, parts: list[tuple[str, str]], roots: lis
     # The read scope applies to `<` as it does to an operand: a target outside the working
     # directories is left in place, and `_segments` refuses it as an unaccounted `<`.
     if target.startswith("~"):
-        expanded = os.path.expanduser(expanded)
+        directory = _tilde_expansion(expanded)
+        if directory is None:
+            return False
+        expanded = directory
     if expanded.startswith("/"):
         return _in_scope(expanded, _ReadScope(roots, [str(REPO_ROOT)], {}, {}))
     return ".." not in Path(expanded).parts

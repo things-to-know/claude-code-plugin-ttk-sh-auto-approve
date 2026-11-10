@@ -4362,6 +4362,57 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             self.assert_allowed("pushd src; grep -rl PRIVATE .", "the control")
             self.assert_no_opinion("pushd ~-; grep -rl PRIVATE .")
 
+    def test_a_tilde_prefix_the_shell_holds(self):
+        """`~-` is `$OLDPWD`, `~+` `$PWD` and `~1` an entry of the directory stack, and zsh reads
+        `~name` as a named directory before a user's home, `~HOME` and `~OLDPWD` included (#83).
+        `os.path.expanduser` left each as a name in the project. With `OLDPWD` the home, bash 5.2
+        printed the key for `cat ~-/.ssh/id_rsa` and listed it for `grep -rl PRIVATE ~-` and
+        `p=~-; grep -rl PRIVATE "$p"`, and zsh 5.9 did the same for `~HOME`. zsh's `dirstack`
+        array is the directory stack, so a command fills it with no `pushd`: zsh 5.9 printed the
+        key for `dirstack=~; cat ~1/.ssh/id_rsa`."""
+        with a_project_below_home():
+            for command in (
+                "grep -rl PRIVATE src",
+                "cat ~/a/b/proj/README.md",
+                'p=~/a/b/proj/src; grep -rl PRIVATE "$p"',
+                "cat '~-/x'",  # a directory named `~-`
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            for command in (
+                "cat ~-/.ssh/id_rsa",
+                "cat ~HOME/.ssh/id_rsa",
+                "cat ~1/../.ssh/id_rsa",
+                "wc -l < ~-/.ssh/id_rsa",
+                "x=~OLDPWD/.ssh/id_rsa; cat $x",
+                "dirstack=~; cat ~1/.ssh/id_rsa",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
+            for command in (
+                "grep -rl PRIVATE ~-",
+                "grep -rl PRIVATE ~HOME",
+                'p=~-; grep -rl PRIVATE "$p"',
+                "p=~OLDPWD; grep -rl PRIVATE $p",
+                "cat ~+/README.md",
+                "cat ~-1/README.md",
+                "git -C ~- log -1",
+                "dirstack=~; grep -rl PRIVATE ~1",
+                "for dirstack in ~; do grep -rl PRIVATE ~1; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command)
+            self.assert_allowed("wc -l < README.md", "the control")
+            self.assert_refused("wc -l < ~-/README.md")
+
+    @unittest.skipUnless(Path("~root").expanduser() == Path("/root"), "needs root's home at /root")
+    def test_a_user_home_bash_reads(self):
+        """bash reads `~root` as root's home, a credential store, which zsh reads only when no
+        named directory has the name. Layer B reads both."""
+        with a_project_below_home():
+            self.assert_allowed("cat README.md", "the control")
+            self.assert_refused_outright("cat ~root/x")
+
     def test_a_read_from_a_directory_the_shell_supplies(self):
         """After `pushd "$d"` the shell can be anywhere, and so can every program after it,
         however the words it reads are spelled (#72). One `d=src` is the one value `d` holds."""
