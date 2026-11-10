@@ -1226,8 +1226,8 @@ def _literal_assignments(
 
     The split is on the shell's default IFS (space, tab, newline), which is what an
     unquoted expansion undergoes. That is an approximation -- a custom `IFS` would split
-    differently -- but a command that reset `IFS` carries that assignment too, and an
-    `IFS=` assignment is refused by `_strip_structure` before this runs.
+    differently -- but a command that reset `IFS` carries that assignment, or a `for IFS`
+    header, too, and `_strip_structure` refuses both.
     """
     assigned: dict[str, list[str]] = {}
     seen_unsafe: set[str] = set()
@@ -1757,7 +1757,8 @@ def _segments(tokens: list[str]) -> list[list[str]]:
 def _strip_structure(words: list[str]) -> list[str]:
     """Strip loop control structure.
 
-    Rejects dangerous environment variables and prefix assignments.
+    Rejects dangerous environment variables and prefix assignments, and a `for` header that
+    binds one.
     """
     index = 0
     while index < len(words):
@@ -1765,18 +1766,15 @@ def _strip_structure(words: list[str]) -> list[str]:
         if word in ("case", "select"):
             raise NotReadOnly(f"unsupported shell control structure: {word}")
         if word in WORD_LIST_HEADS:
-            return []  # 'for' loop variable declarations are harmless data
+            _check_loop_names(words[index + 1 :])
+            return []  # the loop's words are data
         if word in STRUCTURE:
             index += 1
             continue
         if ASSIGNMENT.match(word):
             var_name = word.split("=", 1)[0].rstrip("+")
             # Refuse dangerous environment variables
-            if (
-                var_name.upper() in DANGEROUS_ENV_VARS
-                or var_name.startswith(("LD_", "GIT_", "BASH_", "AWS_", "CLOUDSDK_"))
-                or var_name != var_name.lower()
-            ):
+            if _names_the_environment(var_name):
                 # TODO(decision): `while IFS= read -r line; do ...; done` prompts here. An
                 # *empty* `IFS=` prefixed to one command is scoped to that command and can only
                 # reduce word-splitting, so it could be allowed; `read` itself only assigns
@@ -1790,6 +1788,44 @@ def _strip_structure(words: list[str]) -> list[str]:
             continue
         break
     return words[index:]
+
+
+def _names_the_environment(name: str) -> bool:
+    """Whether a later command, or the shell itself, reads ``name``'s value as configuration.
+
+    `PATH` picks the program a word runs, `HOME` where git and the vendor CLIs read their
+    config, `IFS` how every later expansion splits, which a command may set by assigning the
+    name or by looping over it. The check upper-cases the name, so zsh's `path`, tied to `PATH`,
+    is one too.
+    """
+    return (
+        name.upper() in DANGEROUS_ENV_VARS
+        or name.startswith(("LD_", "GIT_", "BASH_", "AWS_", "CLOUDSDK_"))
+        or name != name.lower()
+    )
+
+
+# A word a `for` header binds. Both shells reject any other there, a quoted name among them, so
+# a word this doesn't match is no name the hook reads
+LOOP_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _check_loop_names(words: list[str]) -> None:
+    """Refuse a `for` header that binds a name an assignment may not.
+
+    ``words`` follow the `for`. Each one up to `in`, or to the end of the segment, where the
+    loop walks the positional parameters, is a name the loop binds: zsh binds every one of
+    them, so `for q PATH in a .` sets `PATH` to `.`, as `for PATH in .` does in both shells.
+    The first word is a name even when it is `in`: zsh's `for in PATH in . .` sets `PATH` to
+    `.` too.
+    """
+    for index, word in enumerate(words):
+        if index and word == "in":
+            return
+        if not LOOP_NAME.match(word):
+            raise NotReadOnly("a for header binds a word that is not a plain name")
+        if _names_the_environment(word):
+            raise NotReadOnly(f"a for loop over a refused environment variable: {word}")
 
 
 def _skip_sed_delimited(script: str, index: int, delimiter: str) -> int:

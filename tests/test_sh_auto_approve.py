@@ -1177,6 +1177,8 @@ class CorpusIsSafeToExecute(unittest.TestCase):
         planted = DifferentialWithAPlantedProgram
         yield from ((c, "planted path") for c in planted.PATH_ATTACKS)
         yield from ((c, "planted spelling") for c in planted.SPELLING_ATTACKS)
+        yield from ((c, "planted loop") for c in planted.LOOP_ATTACKS)
+        yield from ((c, "planted loop") for c in DifferentialAgainstZsh.LOOP_ATTACKS)
         for _, chain in DifferentialAcrossOneSession.CHAINS:
             yield from ((c, "session") for c in chain)
         yield from ((c, "hygiene") for c in PUNCTUATION_BASH_REJECTS.values())
@@ -4063,6 +4065,38 @@ class RefusesControlOfTheEnvironmentAndTheProgram(Verdicts, unittest.TestCase):
         self.assert_refused("ls; PATH=/tmp:/usr/bin", "repoints PATH for the session")
         self.assert_refused("ls; BASH_ENV=/tmp/x", "repoints BASH_ENV for the session")
 
+    def test_a_for_header_binds_its_names_as_an_assignment_does(self):
+        """#70: the header's segment is skipped like an assignment's, and sets each name it
+        binds for the body and for every later command. zsh binds every word up to `in`, and the
+        first is a name in both shells even when it is `in` or `do`."""
+        self.assert_allowed("for p in .; do git status; done", "the control: an ordinary name")
+        self.assert_allowed("for q r in a .; do git status; done", "the control: zsh's 2 names")
+        self.assert_allowed("for p; do ls; done", "the control: the positional parameters")
+        self.assert_allowed('for in in a b; do echo "$in"; done', "the control: `in` as the name")
+        for command, why in (
+            ("for PATH in .; do git status; done", "runs ./git"),
+            ("for HOME in .; do git status; done", "runs the core.fsmonitor ./.gitconfig names"),
+            ("for IFS in -; do git log -1; done", "splits every later expansion on -"),
+            ("for GIT_DIR in x; do git status; done", "repoints git's repository"),
+            ("for LD_PRELOAD in x.so; do ls; done", "loads x.so into ls"),
+            ("for PATH; do ls; done", "binds PATH to each positional parameter"),
+            ("for q PATH in a .; do git status; done", "rejects it, but zsh runs ./git"),
+            ("for path in .; do git status; done", "runs git, but zsh, whose path is PATH, ./git"),
+            ("for in PATH in . .; do git status; done", "rejects it, but zsh runs ./git"),
+            ("for in PATH in .; do ls; done", "rejects it, but zsh's empty PATH finds ./ls"),
+            ("for in HOME in . .; do git status; done", "rejects it, but zsh sets HOME to ."),
+            ("for in IFS in - -; do git log -1; done", "rejects it, but zsh sets IFS to -"),
+            ("for do PATH in a .; do ls; done", "rejects it, but zsh sets PATH to ."),
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command, why)
+
+    def test_a_for_header_word_that_is_not_a_plain_name(self):
+        """Both shells reject a quoted or escaped name as a syntax error, so nothing runs; the
+        hook reads no name there either."""
+        self.assert_refused('for "PATH" in .; do git status; done')
+        self.assert_refused("for P\\ATH in .; do git status; done")
+
     def test_a_basename_is_not_an_identity(self):
         """Any executable renamed to an allowlisted name is approved from anywhere on
         disk, and a `Bash(cat *)` deny rule does not match the absolute-path spelling
@@ -6753,6 +6787,20 @@ class DifferentialWithAPlantedProgram(unittest.TestCase):
     # an `ls` planted inside the scratch tree, so each resolves to the plant or to nothing.
     SPELLING_ATTACKS = ("l?", "l*", "$'ls'", '"ls"', "l''s", "\\ls")
 
+    # A loop that sets PATH to where an `ls` is planted (#70). With PATH there, the plant finds
+    # no `touch`, so it writes the payload with a redirection.
+    LOOP_ATTACKS = ("for PATH in .; do ls; done", "for PATH in bin; do ls; done")
+
+    def test_a_loop_over_path(self):
+        for command in self.LOOP_ATTACKS:
+            with self.subTest(command=command), scratch_tree() as root:
+                plant_executable(root, "ls", f": > {PAYLOAD_MARKER}")
+                plant_executable(root, "bin/ls", f": > {PAYLOAD_MARKER}")
+                before = snapshot(root)
+                run_in_bash(command, root)
+                self.assertNotEqual(before, snapshot(root), "bash ran no plant: a dead case")
+                self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
+
     def test_an_allowlisted_name_is_not_an_allowlisted_program(self):
         escaped: list[str] = []
         for command in self.PATH_ATTACKS:
@@ -6987,6 +7035,27 @@ class DifferentialAgainstZsh(unittest.TestCase):
     def test_no_attack_is_approved(self):
         for command in self.ATTACKS:
             with self.subTest(command=command):
+                self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
+
+    # #70, in the spellings only zsh runs: a header that binds `PATH` in second place, after a
+    # first name that may be `in` or `do`, and `path`, which zsh ties to `PATH`. An empty `PATH`
+    # finds `./ls` too
+    LOOP_ATTACKS = (
+        "for q PATH in a .; do ls; done",
+        "for path in .; do ls; done",
+        "for in PATH in . .; do ls; done",
+        "for in PATH in .; do ls; done",
+        "for do PATH in a .; do ls; done",
+    )
+
+    def test_a_loop_over_path_in_zsh(self):
+        """The plant writes as in `DifferentialWithAPlantedProgram.test_a_loop_over_path`."""
+        for command in self.LOOP_ATTACKS:
+            with self.subTest(command=command), scratch_tree() as root:
+                plant_executable(root, "ls", f": > {PAYLOAD_MARKER}")
+                before = snapshot(root)
+                run_in_zsh(command, root)
+                self.assertNotEqual(before, snapshot(root), "zsh ran no plant: a dead case")
                 self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
 
     def test_no_approved_command_mutates_the_tree_in_zsh(self):
