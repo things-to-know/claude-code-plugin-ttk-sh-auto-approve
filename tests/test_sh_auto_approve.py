@@ -4453,6 +4453,47 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_refused_outright(command)
 
+    def test_an_input_redirection_through_a_link_or_after_a_move(self):
+        """A `<` target is read as an operand is: from each directory the shell may be in, and
+        through the links on disk (#77). It was measured by its text, so `cat < sub/out/hostname`
+        read `outside/hostname` through the link `sub/out`, and so did `wc -l < hostname` after
+        `pushd ../outside`, which bash 5.2 and zsh 5.9 each read. Refused outright, as an
+        absolute target outside is: a rule matches the command with the redirection stripped,
+        so `Bash(wc *)` would approve it."""
+        with a_project_below_home() as project:
+            outside = project.parent / "outside"
+            outside.mkdir()
+            (outside / "hostname").write_text("one\n")
+            (project / "sub").mkdir()
+            (project / "sub" / "x.txt").write_text("one\n")
+            (project / "sub" / "out").symlink_to(outside)
+            for command in (
+                "cat < README.md",
+                "cat < sub/x.txt",
+                "cd src && wc -l < lib/x.txt",
+                "cd src && x=$(wc -l < lib/x.txt); echo $x",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            self.assert_no_opinion("cat sub/out/hostname", "the control: read as an operand")
+            for command in (
+                "cat < sub/out/hostname",
+                "cd sub && wc -l < out/hostname",
+                "cd sub && x=$(wc -l < out/hostname); echo $x",
+                "cat < src/../README.md",  # a `..` is refused as it was, wherever it leads
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
+            with operator_rules(allow=["Bash(pushd *)", "Bash(wc *)"]):
+                self.assert_allowed("pushd sub && wc -l < x.txt", "the control")
+                self.assert_allowed("pushd ../outside && wc -l hostname", "the rule's to grant")
+                for command in (
+                    "pushd ../outside && wc -l < hostname",
+                    'pushd "$d" && wc -l < x.txt',
+                ):
+                    with self.subTest(command=command):
+                        self.assert_refused_outright(command)
+
     def test_a_read_from_a_directory_the_shell_supplies(self):
         """After `pushd "$d"` the shell can be anywhere, and so can every program after it,
         however the words it reads are spelled (#72). One `d=src` is the one value `d` holds."""

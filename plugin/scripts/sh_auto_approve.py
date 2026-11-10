@@ -5748,32 +5748,52 @@ def _zsh_equals_expansion(token: str, parts: list[tuple[str, str]]) -> bool:
     return False
 
 
-def _readable_input_target(target: str, parts: list[tuple[str, str]], roots: list[str]) -> bool:
-    """Whether ``< target`` names a file the operator wrote out, not one the shell computes.
+def _input_target(target: str, parts: list[tuple[str, str]]) -> str | None:
+    """The file ``< target`` reads, when the operator wrote it out, not the shell; else None.
 
     The pseudo-device check in ``_classify`` reads literal text, so a target assembled at
     runtime -- ``"$x$y"``, ``"/dev/"'tcp/h/80'``, a glob -- is exactly what it cannot see.
-    Such a target is left in place for ``_segments`` to refuse as an unaccounted ``<``.
+    Such a target, a relative one with a ``..``, and one below a directory the shell picks, as
+    ``~-/x``, is left in place for ``_segments`` to refuse as an unaccounted ``<``. Whether
+    the file is in the working directories is `_check_input_targets`'s, once they are known.
     """
     if re.search(r"[$*?\[\]{}`\\]", PLACEHOLDER.sub("", target)):
-        return False
+        return None
     for index in PLACEHOLDER.findall(target):
         kind, value = parts[int(index)]
         if kind == SUBSTITUTION or (kind == DOUBLE_QUOTED and "$" in value):
-            return False
+            return None
     expanded = PLACEHOLDER.sub(lambda match: parts[int(match.group(1))][1], target)
     if NETWORK_DEVICE.search(expanded) is not None:
-        return False
-    # The read scope applies to `<` as it does to an operand: a target outside the working
-    # directories is left in place, and `_segments` refuses it as an unaccounted `<`.
+        return None
     if target.startswith("~"):
         directory = _tilde_expansion(expanded)
         if directory is None:
-            return False
+            return None
         expanded = directory
-    if expanded.startswith("/"):
-        return _in_scope(expanded, _ReadScope(roots, [str(REPO_ROOT)], {}, {}))
-    return ".." not in Path(expanded).parts
+    if not expanded.startswith("/") and ".." in Path(expanded).parts:
+        return None
+    return expanded
+
+
+def _check_input_targets(targets: list[str], scope: _ReadScope) -> None:
+    """Refuse the command where a file a ``<`` reads, `_input_target`, is outside ``scope``.
+
+    The read scope applies to ``<`` as it does to an operand: an absolute file is measured as
+    it is, and a relative one from each directory the shell may be in, through the links on
+    disk, so ``sub/out/x`` is outside where ``sub/out`` leads out (#77). A directory below a
+    value this module didn't read is none to place it in. Refused outright, as a target left
+    in place is: an allow rule matches the command with the redirection stripped.
+    """
+    for target in targets:
+        paths = (
+            [target]
+            if target.startswith("/")
+            else [os.path.join(base, target) for base in scope.bases]
+        )
+        for path in paths:
+            if UNREAD_VALUE in path or not _in_scope(path, scope):
+                raise NotReadOnly(f"< reads outside the working directories: {target}")
 
 
 def _classify(command: str, depth: int = 0) -> None:
@@ -5864,12 +5884,17 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
             lambda match: " " if _resolves_into_scratch(match["target"]) else match.group(0),
             stripped,
         )
-    stripped = FILE_INPUT_REDIRECT.sub(
-        lambda match: (
-            " " if _readable_input_target(match.group(1), parts, roots) else match.group(0)
-        ),
-        stripped,
-    )
+    # Each `<` target stripped here is checked once the working directories are known
+    input_targets: list[str] = []
+
+    def strip_input(match: re.Match) -> str:
+        target = _input_target(match.group(1), parts)
+        if target is None:
+            return match.group(0)
+        input_targets.append(target)
+        return " "
+
+    stripped = FILE_INPUT_REDIRECT.sub(strip_input, stripped)
 
     # A newline separates commands exactly as `;` does, but shlex counts it as
     # whitespace and glues `ls\nrm` into one word, so the split happens here. A newline
@@ -5928,16 +5953,6 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # whatever tier would otherwise approve it.
     _refuse_credential_paths(reduced, parts, state)
 
-    # A substitution runs a command wherever it sits, so each body is classified by these
-    # same rules before the word it produces is looked at, in this command's shell state.
-    # Everything above refuses outright or not at all, and the segments below can have no
-    # opinion, so a body's refusal still comes first. The shell runs a process substitution
-    # without waiting for it, as it runs a job behind `&`: `true <(curl x)` returns at once.
-    detached = _ShellState(bases, shell_bases, known_values, bindings, backgrounds=True)
-    for kind, value in parts:
-        if kind in RUNS_A_COMMAND:
-            _classify_with(value, depth + 1, detached if kind == PROCESS_SUBSTITUTION else state)
-
     # Where readers may read. A relative path must be in scope from each working directory: a
     # `cd` inside a pipeline does not move the shell that runs the next command, so the module
     # does not guess which one applies.
@@ -5950,6 +5965,17 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         settings=settings,
         backgrounds=backgrounds,
     )
+    _check_input_targets(input_targets, scope)
+
+    # A substitution runs a command wherever it sits, so each body is classified by these
+    # same rules before the word it produces is looked at, in this command's shell state.
+    # Everything above refuses outright or not at all, and the segments below can have no
+    # opinion, so a body's refusal still comes first. The shell runs a process substitution
+    # without waiting for it, as it runs a job behind `&`: `true <(curl x)` returns at once.
+    detached = _ShellState(bases, shell_bases, known_values, bindings, backgrounds=True)
+    for kind, value in parts:
+        if kind in RUNS_A_COMMAND:
+            _classify_with(value, depth + 1, detached if kind == PROCESS_SUBSTITUTION else state)
 
     # A move to a directory the read scope doesn't vouch for leaves every program to the rules,
     # wherever it stands, since a program reads where it runs (#72). What a validator refuses
