@@ -3775,6 +3775,49 @@ class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase
             self.assert_allowed("cat src/lib/x.tx?", "the control")
             self.assert_refused_outright("cat k/id_rs?", "k is ~/.ssh")
 
+    def test_a_value_the_shell_supplies(self):
+        """`$PWD` is each working directory, and a variable the command assigns or loops over
+        is each value it gives. Any other value, a command's output included, can be any
+        directory, so the text after it is read below `~` and `/`."""
+        with a_project_below_home(), operator_rules(allow=["Bash(cat *)"]):
+            for command in (
+                "cat $PWD/README.md",
+                'cat "$d"/*.md',
+                "d=src; cat $d/lib/x.txt",
+                'cat "$(git rev-parse --show-toplevel)"/README.md',
+                'cat "$d"/config.json',
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: the rule approves this")
+            for command in (
+                "cat $PWD/../../../.ssh/id_rsa",
+                'cat "$PWD"/../../../.ssh/id_rsa',
+                'cat "$PWD"/k/id_rsa',
+                "cat $OLDPWD/.ssh/id_rsa",
+                "cat $(echo ../../..)/.ssh/id_rsa",
+                'cat "$d"/etc/shadow',
+                "d=..; cat $d/$d/$d/.ssh/id_rsa",
+                'd=..; cat "$d"/../../.ssh/id_rsa',
+                "d=../../../.ss; cat ${d}h/id_rsa",
+                "for d in ..; do cat $d/$d/$d/.ssh/id_rsa; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
+
+    def test_a_working_directory_the_shell_supplies(self):
+        """`pushd "$d"` can be anywhere, so a relative word after it is read below `~` and `/`,
+        and a wildcard picks the directory `cd k*` or `pushd k*` moves to, which can be the link
+        `k`. `main` refuses `cd k*` since #50, as a glob for a program with a validator, and
+        `pushd` has none."""
+        with a_project_below_home():
+            self.assert_allowed("cd src && cat lib/x.txt", "the control")
+            self.assert_refused_outright("cd k* && cat id_rsa", "k* can be k, which is ~/.ssh")
+            with operator_rules(allow=["Bash(cat *)", "Bash(pushd *)"]):
+                self.assert_allowed('pushd "$d" && cat README.md', "the control")
+                self.assert_refused_outright('pushd "$d" && cat .ssh/id_rsa', "$d can be ~")
+                self.assert_allowed("pushd src && cat lib/x.txt", "the control")
+                self.assert_refused_outright("pushd k* && cat id_rsa", "k* can be k")
+
 
 @approvals_budgeted
 class RefusesEgressThroughAnApprovedProgram(Verdicts, unittest.TestCase):
