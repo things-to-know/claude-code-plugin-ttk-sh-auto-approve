@@ -1179,6 +1179,7 @@ class CorpusIsSafeToExecute(unittest.TestCase):
         yield from ((c, "planted spelling") for c in planted.SPELLING_ATTACKS)
         yield from ((c, "planted loop") for c in planted.LOOP_ATTACKS)
         yield from ((c, "planted loop") for c in DifferentialAgainstZsh.LOOP_ATTACKS)
+        yield from ((c, "short loop") for c in DifferentialAgainstZsh.SHORT_LOOP_ATTACKS)
         for _, chain in DifferentialAcrossOneSession.CHAINS:
             yield from ((c, "session") for c in chain)
         yield from ((c, "hygiene") for c in PUNCTUATION_BASH_REJECTS.values())
@@ -2792,6 +2793,40 @@ class RefusesShellSyntaxTheLexerMisreads(Verdicts, unittest.TestCase):
         segment, and `checked` is still non-zero from the leading read."""
         self.assert_refused("ls; case x in *) rm -rf build/;; esac", "runs the case body")
         self.assert_refused("wc -l AGENTS.md; case $x in a) git push;; esac", "pushes")
+
+    def test_a_for_body_after_do_is_a_command(self):
+        """`for p do ...` walks the positional parameters, with `do` in the header's segment
+        and no `;` before it, so the body's first command rode along in the segment that was
+        discarded as the header. zsh's `argv=a` sets a parameter, so the body runs once."""
+        self.assert_allowed("argv=a; for p do ls; done; ls", "the control: the body reads")
+        self.assert_allowed("for p q do wc -l AGENTS.md; done", "the control: zsh's 2 names")
+        for command in (
+            "argv=a; for p do touch PWNED; done; ls",
+            # Every word a plain lower-case name, as a header's are
+            "argv=a; for p do touch x; done; ls",
+            "argv=a; for p do rm -rf build/; done; ls",
+            "argv=a; for p q do touch PWNED; done; ls",
+            "argv=a; for p do PATH=. ls; done; ls",
+            # `in` in first place is the loop's name, and `do` still starts the body
+            "argv=a; for in do touch x; done; ls",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command, "runs no body, but zsh's argv=a sets a parameter")
+
+    def test_a_reserved_word_in_a_for_header_starts_its_body_under_zsh(self):
+        """zsh's SHORT_LOOPS, on by default, ends a header's names at any reserved word after
+        the first, and starts the loop's body with it. Every word but the reserved one is a
+        plain lower-case name, as a header's are."""
+        self.assert_allowed('for time in a; do echo "$time"; done', "the control: the name")
+        for command in (
+            "argv=a; for p time touch x; ls",
+            "argv=a; for p if touch x; then ls; fi",
+            "argv=a; for p until touch x; do ls; done",
+            "argv=a; for p nocorrect rm readme; ls",
+            "argv=a; for p coproc touch x; ls",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command, "rejects it, but zsh runs the reserved word's command")
 
 
 class RefusesPunctuationThatBashWouldReject(Verdicts, unittest.TestCase):
@@ -7019,6 +7054,10 @@ class DifferentialAgainstZsh(unittest.TestCase):
         "x='$(touch PWNED)'; echo \"${(e)x}\"",
         "x='path[$(touch PWNED)]'; printf '%d\\n' \"$x\"",
         "x='path[$(touch PWNED)]'; echo $((x))",
+        # `argv` is zsh's positional parameters, which `for p do` walks. The `ls` is a segment
+        # left to check once the header's segment is discarded
+        "argv=a; for p do touch PWNED; done; ls",
+        "argv=a; for in do touch PWNED; done; ls",
     )
 
     def test_every_attack_really_mutates_the_tree_in_zsh(self):
@@ -7056,6 +7095,22 @@ class DifferentialAgainstZsh(unittest.TestCase):
                 before = snapshot(root)
                 run_in_zsh(command, root)
                 self.assertNotEqual(before, snapshot(root), "zsh ran no plant: a dead case")
+                self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
+
+    # A reserved word after a header's first name starts a short loop's body. Not in `ATTACKS`:
+    # a header's words are plain lower-case names, and an upper-case one, such as the payload
+    # marker, is refused on its own, so the payload here is `pwned`
+    SHORT_LOOP_ATTACKS = (
+        "argv=a; for p time touch pwned; ls",
+        "argv=a; for p if touch pwned; then ls; fi",
+    )
+
+    def test_a_reserved_word_in_a_loop_header_in_zsh(self):
+        for command in self.SHORT_LOOP_ATTACKS:
+            with self.subTest(command=command), scratch_tree() as root:
+                before = snapshot(root)
+                run_in_zsh(command, root)
+                self.assertNotEqual(before, snapshot(root), "zsh ran no body: a dead case")
                 self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
 
     def test_no_approved_command_mutates_the_tree_in_zsh(self):

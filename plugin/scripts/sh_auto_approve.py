@@ -220,6 +220,43 @@ STRUCTURE = {
 # Head keywords that introduce a loop variable list
 WORD_LIST_HEADS = {"for"}
 
+# zsh 5.9's reserved words, as its `$reswords` lists them. After a `for` header's first name,
+# zsh ends the names at one and, under SHORT_LOOPS, on by default, starts the loop's body with
+# it: `for p time touch x` runs `time touch x` once for each positional parameter
+ZSH_RESERVED_WORDS = {
+    "!",
+    "[[",
+    "{",
+    "}",
+    "case",
+    "coproc",
+    "declare",
+    "do",
+    "done",
+    "elif",
+    "else",
+    "end",
+    "esac",
+    "export",
+    "fi",
+    "float",
+    "for",
+    "foreach",
+    "function",
+    "if",
+    "integer",
+    "local",
+    "nocorrect",
+    "readonly",
+    "repeat",
+    "select",
+    "then",
+    "time",
+    "typeset",
+    "until",
+    "while",
+}
+
 # Exactly recognized shell separators
 SEPARATORS = {";", "|", "&&", "||", "&", "|&", "\n"}
 
@@ -1766,8 +1803,7 @@ def _strip_structure(words: list[str]) -> list[str]:
         if word in ("case", "select"):
             raise NotReadOnly(f"unsupported shell control structure: {word}")
         if word in WORD_LIST_HEADS:
-            _check_loop_names(words[index + 1 :])
-            return []  # the loop's words are data
+            return _loop_header_command(words[index + 1 :])
         if word in STRUCTURE:
             index += 1
             continue
@@ -1810,22 +1846,33 @@ def _names_the_environment(name: str) -> bool:
 LOOP_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _check_loop_names(words: list[str]) -> None:
-    """Refuse a `for` header that binds a name an assignment may not.
+def _loop_header_command(words: list[str]) -> list[str]:
+    """The command a `for` header's segment runs, once each name the header binds is checked.
 
-    ``words`` follow the `for`. Each one up to `in`, or to the end of the segment, where the
-    loop walks the positional parameters, is a name the loop binds: zsh binds every one of
-    them, so `for q PATH in a .` sets `PATH` to `.`, as `for PATH in .` does in both shells.
-    The first word is a name even when it is `in`: zsh's `for in PATH in . .` sets `PATH` to
-    `.` too.
+    ``words`` follow the `for`. Each one up to `in`, `do` or the end of the segment is a name
+    the loop binds, and gets the check an assignment's name gets: zsh binds every one of them,
+    so `for q PATH in a .` sets `PATH` to `.`, as `for PATH in .` does in both shells. The first
+    word is a name even when it is `in`, `do` or another reserved word: zsh's
+    `for in PATH in . .` sets `PATH` to `.` too.
+
+    After `in` come the loop's words, which are data. Without `in`, the loop walks the
+    positional parameters, and both shells take `do` right after the names: in
+    `for p do touch x; done` the segment holds the body's first command, which runs once for
+    each parameter, and zsh's `argv=a` sets one. It is read as any command is. A header that
+    holds any other reserved word is refused, as zsh starts the loop's body there.
     """
     for index, word in enumerate(words):
         if index and word == "in":
-            return
+            return []
+        if index and word == "do":
+            return _strip_structure(words[index + 1 :])
+        if index and word in ZSH_RESERVED_WORDS:
+            raise NotReadOnly(f"a for header holds a word zsh runs as the loop's body: {word}")
         if not LOOP_NAME.match(word):
             raise NotReadOnly("a for header binds a word that is not a plain name")
         if _names_the_environment(word):
             raise NotReadOnly(f"a for loop over a refused environment variable: {word}")
+    return []
 
 
 def _skip_sed_delimited(script: str, index: int, delimiter: str) -> int:
