@@ -71,6 +71,8 @@ convention = "pep257"
     "SLF001",
     "T201",
 ]
+# Tests a tool loads by path, never imported as a package
+"tests/fixtures/*.py" = ["INP001"]
 # A development tool: it reads the hook's private functions and prints its verdicts
 "tools/*.py" = [
     "SLF001",

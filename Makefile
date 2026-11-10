@@ -85,6 +85,10 @@ SETTINGS ?=
 NO_RULES ?=
 HOOK ?= plugin/scripts/sh_auto_approve.py
 
+# The git revision whose hook `verdict-diff` compares the working copy's with. Empty: where HEAD
+# left `origin/main`, fetched first, as a pull request's diff compares
+BASE ?=
+
 PY_FILES = $(shell git ls-files '*.py')
 MD_FILES = $(shell git ls-files '*.md')
 SH_FILES = $(shell git ls-files '*.sh')
@@ -270,6 +274,12 @@ explain: ## Print the hook's verdict and reason for each command on stdin, or in
 		$(if ${TRANSCRIPT},--transcript="${TRANSCRIPT}") ${CWD_ARGS} \
 		$(if ${SCRATCHPAD_DIR},--scratchpad-dir="${SCRATCHPAD_DIR}") \
 		$(if ${SETTINGS},--settings="${SETTINGS}") $(if ${NO_RULES},--no-rules)
+
+.PHONY: verdict-diff
+verdict-diff: ## List the test commands whose verdict differs from the hook at BASE
+	$(if ${BASE},,git fetch --quiet origin main)
+	base="$(or ${BASE},$$(git merge-base HEAD origin/main))" && \
+		${PYTHON} -I -B tools/verdict_diff.py --base "$$base"
 
 .PHONY: validate
 validate: ## Run `claude plugin validate` (needs `claude` on PATH)

@@ -25,6 +25,8 @@ insists on its own filename, symlink to this file rather than copying it.
   session (see [Develop](#develop))
 - `tools/synthetic_transcript.py` made `tests/fixtures/transcript.jsonl` out of a real
   transcript, every value replaced; its docstring says what it keeps
+- `tools/verdict_diff.py` lists the commands the hook's tests ask whose verdict differs between
+  an earlier hook and the working copy's, each asked in its test's context
 - `pyproject.toml` and `uv.lock` pin the dev tools (`coverage`, `ruff`), which `uv` installs
   into `.venv`; neither ships
 
@@ -147,6 +149,15 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
 - Before saying the hook approves, refuses or has no opinion on a command, run the command
   through `make explain` and quote the verdict it prints: reading the code is not a verdict
   - e.g. `printf '%s\n' 'grep -rf /etc/os-release .' | make explain`
+- A hook change ends with `make verdict-diff`, and its pull request lists every verdict that
+  changed
+  - A refactor changes none
+    - It compares only what the tests ask `_classify` in their own process: not how `main`
+      builds the context, such as `_project_root`, nor what the `HookProtocol` tests send the
+      hook as a separate process
+    - A test that fails or errors asks nothing after its failure, and it names each on stderr
+  - It compares with the hook where `HEAD` left `origin/main`, which it fetches first;
+    `BASE=<revision>` compares with another
 - Triage a command that prompted by replaying it in its session's context, never a guessed one:
   - Find the session's transcript by its id: `ls ~/.claude/projects/*/<session-id>.jsonl`. It
     moves when the session is resumed elsewhere, and every directory there starts with `-`, so
