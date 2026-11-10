@@ -3754,6 +3754,30 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
                 with self.subTest(command=command):
                     self.assert_refused(command)
 
+    def test_a_tilde_in_a_for_list(self):
+        """Both shells expand a `~` that starts a word of a `for` list, so `p` holds the home
+        directory, which the text `~` placed in the project. `~-` is `$OLDPWD`, which the shell
+        holds. bash 5.2 and zsh 5.9 each grepped a key from the home directory for `~`, `~/` and
+        `src ~`, and so did bash for `~-`, and for `pushd ~-`, with `OLDPWD` there."""
+        with a_project_below_home():
+            for command in (
+                'for p in src; do grep -rl PRIVATE "$p"; done',
+                "for p in '~'; do grep -rl PRIVATE \"$p\"; done",  # a directory named `~`
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            for command in (
+                "for p in ~; do grep -r -A30 'PRIVATE KEY' \"$p\"; done",
+                'for p in ~/; do grep -rl PRIVATE "$p"; done',
+                'for p in src ~; do grep -rl PRIVATE "$p"; done',
+                'for p in ~-; do grep -rl PRIVATE "$p"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command)
+        with a_project_below_home(), operator_rules(allow=["Bash(pushd *)"]):
+            self.assert_allowed("pushd src; grep -rl PRIVATE .", "the control")
+            self.assert_no_opinion("pushd ~-; grep -rl PRIVATE .")
+
     def test_a_read_from_a_directory_the_shell_supplies(self):
         """After `pushd "$d"` the shell can be anywhere, and so can every program after it,
         however the words it reads are spelled (#72). One `d=src` is the one value `d` holds."""

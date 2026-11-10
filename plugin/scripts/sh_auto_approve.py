@@ -1436,7 +1436,25 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
     # the literal it spells, such a value would be measured below the directory it climbs from.
     if _has_wildcard(expanded) and _glob_may_climb(expanded):
         return None
+    # Both shells expand a `~` that starts a word of the list: `for p in ~` binds the home
+    # directory, which the text `~` would place in the project
+    if token.startswith("~"):
+        directory = _tilde_expansion(expanded)
+        return None if directory is None else [directory]
     return [expanded]
+
+
+def _tilde_expansion(text: str) -> str | None:
+    """The directory a word starting with an unquoted `~` names, or None where the shell picks it.
+
+    `~` and `~/x` are in the home directory, and `~user` in that user's. `~+` and `~-` are
+    `$PWD` and `$OLDPWD`, and `~1`, `~+1` and `~-1` entries of the directory stack, which the
+    shell holds: `os.path.expanduser` leaves each as the text it is, a name in the project.
+    """
+    head = text[1:].split("/", 1)[0]
+    if head[:1] in ("+", "-") or head.isdigit():
+        return None
+    return os.path.expanduser(text)
 
 
 def _literal_loop_values(
@@ -4205,7 +4223,7 @@ def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[s
 
     Where the program spells no target, the shell picks it, and the target is `UNREAD_VALUE`:
     `pushd -` goes to `$OLDPWD`, `pushd +1` and `pushd -0` to an entry of the directory stack,
-    and a bare `cd` to `$HOME`.
+    and a bare `cd` to `$HOME`. So does a target `_tilde_expansion` doesn't read, as `pushd ~-`.
     """
     targets = []
     program = _program_index(words)
@@ -4219,7 +4237,7 @@ def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[s
                 continue
             if not target.startswith(("-", "+")):
                 if following.startswith("~"):
-                    target = os.path.expanduser(target)
+                    target = _tilde_expansion(target) or UNREAD_VALUE
                 if _carries_live_glob(following):
                     raise NotReadOnly(f"cd to a directory a wildcard picks: {target}")
                 spelled = target
