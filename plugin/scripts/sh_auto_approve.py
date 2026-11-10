@@ -75,7 +75,8 @@ Hardened against:
 - A writing flag the shell supplies: bundled behind another short option (``sed -ni``,
     ``sort -uo``), or produced by an expansion in the word itself
 - An assignment with no ``=`` to find: ``printf -v``, and ``${name:=value}``
-- Flag-expanding unquoted globs and non-terminating commands
+- An unquoted glob given to a program with a validator, which can expand into a flag, a
+    program text or an extra operand, and non-terminating commands
 
 Quoting is resolved before the command reaches the lexer, by ``_scan``. That is not a
 detail: ``posix=True`` strips quotes and returns a token identical to an unquoted one, so
@@ -107,7 +108,9 @@ tool call. Test it by hand from the repository root with the payload Claude Code
 
 from __future__ import annotations
 
+import itertools
 import json
+import math
 import os
 import re
 import shlex
@@ -1362,6 +1365,210 @@ def _literal_loop_values(
     return {name: v for name, v in values.items() if name not in unresolvable}
 
 
+# A parameter expansion in the unquoted part of a word: `$q`, `${q}`, `${=q}`, `${q:-x}`.
+UNQUOTED_EXPANSION = re.compile(r"\$\{?=?([A-Za-z_][A-Za-z0-9_]*)")
+
+# What a clean value may not hold: a separator, which splits it into words, and a pattern
+# character, which can close a pattern with the text around the use: `q=']'; sort [-${q}o` is
+# `[-]o`. A parenthesis is one under bash's `extglob`.
+UNSAFE_IN_A_GLUED_VALUE = frozenset(" \t\n*?[]()")
+
+
+def _known_values(
+    segments: list[list[str]],
+    parts: list[tuple[str, str]],
+    splice_vars: dict[str, list[str]],
+    loop_values: dict[str, list[str]],
+) -> dict[str, list[str] | None]:
+    """Each name this command binds, with the values it can hold, or None where they are unread.
+
+    A name's values are known when every binding of it is one this module read as literal: an
+    assignment that starts its segment and that `_literal_assignments` accepted, and a `for`
+    header that starts its segment and that binds literal words. The value is the one bash
+    stores, before any split: `q=' -o'` holds ` -o`, which `splice_vars` keeps as the one word
+    `-o`.
+
+    Any other binding leaves the name's values unread: a second assignment, an append, an
+    assignment after `do`, `then` or `{`, a header inside a loop's body, a glob list, which a
+    planted file name decides. Every word shaped as `name=` counts as a binding wherever it
+    stands, and so does every word between a `for` and its `in`, as zsh binds each of them:
+    `for q p in a --o` sets `p` to `--o`. An argument such as `make q=1` costs only a refusal of
+    a word that `${q}` starts. `$_` is always unread: each command sets it to its last word, so
+    `echo --o` makes `"${_}utput=x"` `--output=x`.
+
+    A name this command never binds is left out: the residual `_word_the_shell_decides`
+    documents.
+    """
+    bindings: dict[str, int] = {}
+    read: dict[str, int] = {}
+    values: dict[str, list[str]] = {}
+    for segment in segments:
+        names: list[str] = []
+        for index, word in enumerate(segment):
+            if word in WORD_LIST_HEADS:
+                for following in segment[index + 1 :]:
+                    if following == "in":
+                        break
+                    names.append(_expand(following, parts))
+            elif ASSIGNMENT.match(word):
+                names.append(word.split("=", 1)[0].rstrip("+"))
+        for name in names:
+            bindings[name] = bindings.get(name, 0) + 1
+        if len(segment) >= 3 and segment[0] in WORD_LIST_HEADS and segment[2] == "in":
+            name = _expand(segment[1], parts)
+            if name in loop_values and not any(PATH_COMPONENT in v for v in loop_values[name]):
+                values.setdefault(name, []).extend(loop_values[name])
+                read[name] = read.get(name, 0) + 1
+            continue
+        for word in segment:
+            if not ASSIGNMENT.match(word):
+                break
+            name, _, value_token = word.partition("=")
+            # `name` keeps the `+` of an append, which `splice_vars` never holds
+            if name not in splice_vars:
+                continue
+            value = _expand(value_token, parts)
+            if value_token.startswith("~"):
+                value = os.path.expanduser(value)
+            values.setdefault(name, []).append(value)
+            read[name] = read.get(name, 0) + 1
+    known = {
+        name: values[name] if read.get(name) == count else None for name, count in bindings.items()
+    }
+    known["_"] = None
+    return known
+
+
+def _unclean_expansion(token: str, known_values: dict[str, list[str] | None]) -> str | None:
+    """The first expansion in the unquoted part of ``token`` that bash may split or glob.
+
+    bash splits and globs what an unquoted expansion expands to, where it is used, so
+    `q='*'; awk x$q` is `awk x*`, and `q='a -o out'; sort x$q` is `sort xa -o out`. A name is
+    clean when `known_values` holds its values and every value holds none of
+    `UNSAFE_IN_A_GLUED_VALUE`, which an empty value doesn't. The expansion comes back as
+    `$name`.
+    """
+    for match in UNQUOTED_EXPANSION.finditer(PLACEHOLDER.sub("", token)):
+        values = known_values.get(match.group(1))
+        if values is None or any(UNSAFE_IN_A_GLUED_VALUE & set(v) for v in values):
+            return f"${match.group(1)}"
+    return None
+
+
+# Stand-ins, in a word's shapes, for an expansion whose value this module did not read: a plain
+# name the command never binds, and anything else, which can produce any text, the command's own
+# included: a name it binds to values unread, `${q:-x}`, `${q#x}`, `$1`, a command substitution.
+UNREAD_VALUE = "\x02"
+OPERATOR_VALUE = "\x03"
+
+# An expansion in unquoted or double-quoted text: a plain `$q` or `${q}`, or any other `$` form.
+TEXT_EXPANSION = re.compile(
+    r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*)|(\{[^}]*\}|.?))"
+)
+
+# The most shapes one word, or one argument list, is read as: each is a combination of the
+# values its names hold. Past it, the word is one this module cannot read.
+MAX_WORD_SHAPES = 64
+TOO_MANY_SHAPES = "too many combinations of the values this command sets to read"
+
+
+def _word_shapes(
+    token: str, parts: list[tuple[str, str]], known_values: dict[str, list[str] | None]
+) -> list[str] | None:
+    r"""The words this token can be, each value the command sets put in its expansion's place.
+
+    `known_values` gives a name's values. A name it lacks is `UNREAD_VALUE`; one whose values it
+    holds as None, any other `$` form and a command substitution are `OPERATOR_VALUE`. Single
+    quotes and a backslash keep their text. None for a word with more than `MAX_WORD_SHAPES`
+    shapes.
+
+    `_scan` has already taken the backslash out of `\$`, `` \` ``, `\"` and `\\` inside double
+    quotes, so a backslash left in such a part is one bash keeps too: `"${q}u\t"` is `-ou\t`
+    with `q=-o`. A `$` that a backslash made literal is read as an expansion here, as `_scan` no
+    longer tells the two apart; that only adds shapes, and the validator also reads the word as
+    spelled.
+    """
+    shapes = [""]
+
+    def add(texts: list[str]) -> None:
+        nonlocal shapes
+        shapes = [shape + text for shape in shapes for text in texts]
+
+    def expand(text: str) -> bool:
+        index = 0
+        for match in TEXT_EXPANSION.finditer(text):
+            add([text[index : match.start()]])
+            name = match.group(1) or match.group(2)
+            if name is None:
+                add(["$"] if match.group(3) == "" else [OPERATOR_VALUE])
+            elif name not in known_values:
+                add([UNREAD_VALUE])
+            else:
+                values = known_values[name]
+                add([OPERATOR_VALUE] if values is None else values or [""])
+            index = match.end()
+        add([text[index:]])
+        return len(shapes) <= MAX_WORD_SHAPES
+
+    index = 0
+    for match in PLACEHOLDER.finditer(token):
+        if not expand(token[index : match.start()]):
+            return None
+        kind, value = parts[int(match.group(1))]
+        if kind in RUNS_A_COMMAND:
+            add([OPERATOR_VALUE])
+        elif kind == DOUBLE_QUOTED:
+            if not expand(value):
+                return None
+        else:
+            add([value])
+        index = match.end()
+    return shapes if expand(token[index:]) else None
+
+
+def _flag_an_expansion_spells(shape: str) -> bool:
+    """Whether a value this module did not read can make this shape a flag, or name the flag.
+
+    An operator that starts the word can supply the `-` itself: `${q:--o}ut`, and so can a name
+    the command binds to values unread: `q=a; q=-o; sort "${q}ut"`. A value that stands in a
+    flag's name, before any `=`, supplies its letters: `-${q}`, `--${q}`. A plain name the
+    command never binds that starts the word stays the residual `_word_the_shell_decides`
+    documents, and one after an `=`, as in `--project="${p}"`, is the value of a flag the
+    command spells.
+    """
+    if shape.startswith(OPERATOR_VALUE):
+        return True
+    name = shape.split("=", 1)[0]
+    return name.startswith("-") and (UNREAD_VALUE in name or OPERATOR_VALUE in name)
+
+
+def _arg_variants(
+    args: list[str],
+    arg_tokens: list[str],
+    spliced: list[bool],
+    parts: list[tuple[str, str]],
+    known_values: dict[str, list[str] | None],
+) -> list[list[str]]:
+    """The argument lists the program can get once each value the command sets is in place.
+
+    `args` holds `-${q}ut` as spelled; with `q=o` the program gets `-out`. Every combination of
+    the values a name holds is one list; a word with a value this module did not read stays as
+    spelled, which `_flag_an_expansion_spells` has already judged. `args` itself is left out.
+    """
+    choices: list[list[str]] = []
+    for arg, token, was_spliced in zip(args, arg_tokens, spliced, strict=True):
+        shapes = (
+            [arg] if was_spliced or "$" not in arg else _word_shapes(token, parts, known_values)
+        )
+        if shapes is None:
+            raise NoOpinion(TOO_MANY_SHAPES)
+        read = [s for s in shapes if UNREAD_VALUE not in s and OPERATOR_VALUE not in s]
+        choices.append(read or [arg])
+    if math.prod(len(choice) for choice in choices) > MAX_WORD_SHAPES:
+        raise NoOpinion(TOO_MANY_SHAPES)
+    return [list(variant) for variant in itertools.product(*choices) if list(variant) != args]
+
+
 def _value_is_literal_non_flag(token: str, parts: list[tuple[str, str]]) -> bool:
     """A single loop-list value that the operator wrote out and that is not a flag.
 
@@ -1652,7 +1859,7 @@ def _bundled_shorts(arg: str) -> str:
     return "".join(letters)
 
 
-def _check_sed(args: list[str], live_globs: list[bool]) -> None:
+def _check_sed(args: list[str]) -> None:
     """Validate sed: every script is read, and operands are files it may only read.
 
     Reading a file is what sed is for, so refusing every operand -- which left `sed` usable
@@ -1661,14 +1868,12 @@ def _check_sed(args: list[str], live_globs: list[bool]) -> None:
     here: `-i` and `-f` are refused by name, and every script reaches `_scan_sed_script`,
     including the second one in `-e A -e B`, which the old operand count silently skipped.
     """
-    for index, arg in enumerate(args):
+    for arg in args:
         if arg.startswith(("-i", "--in-place", "-f", "--file")) or arg in ("-f", "--file"):
             raise NotReadOnly(f"sed file/in-place argument: {arg}")
         bundled = _bundled_shorts(arg)
         if "i" in bundled or "f" in bundled:
             raise NotReadOnly(f"sed file/in-place flag bundled into: {arg}")
-        if live_globs[index]:
-            raise NotReadOnly("unquoted glob operand in sed")
 
     # Every value-taking option consumes its value wherever it sits, so that no word sed
     # reads as a script can be mistaken here for a file. `sed -ne 'w PWNED' -e p f` is the
@@ -1741,13 +1946,11 @@ def _check_awk(args: list[str]) -> None:
             raise NotReadOnly("awk external access function")
 
 
-def _check_git(args: list[str], live_globs: list[bool]) -> None:
-    """Validate ``git`` subcommands, ensuring read-only behavior and safe options."""
-    # A wildcard the shell expands can supply a flag: `git log [-]-output=x` is `git log
-    # --output=x` once a file of that name is there. The check on `*` and `?` below reads the
-    # expanded words, so it misses a bracket expression and refuses a quoted `'*'` too.
-    if any(live_globs):
-        raise NotReadOnly("git with an unquoted glob")
+def _check_git(args: list[str]) -> None:
+    """Validate ``git`` subcommands, ensuring read-only behavior and safe options.
+
+    A wildcard the shell expands is refused before this runs, in `_check_command`.
+    """
     # Flags that write a file or run a program, wherever they are: after the subcommand they are
     # its own (`git diff --output=x`), and before it `--exec-path=<dir>` is git's. The global
     # options that set config or move the repository are refused by `_git_global_options`,
@@ -2527,15 +2730,13 @@ def _gh_word_is_built(word: str) -> bool:
     return "$" in word or SUBSTITUTION_MARKER in word or PLACEHOLDER_MARK in word
 
 
-def _check_find(args: list[str], live_globs: list[bool]) -> None:
+def _check_find(args: list[str]) -> None:
     """Validate find: prevent root traversal, execution, deletion, and file writing.
 
     A wildcard inside `-name '*.md'` is an argument find matches for itself and the shell
     never touches. Refusing it cost every `-name` and `-path` pattern and bought nothing, so
-    only a wildcard the shell will expand is refused here.
+    only a wildcard the shell will expand is refused, in `_check_command`.
     """
-    if any(live_globs):
-        raise NotReadOnly("unquoted glob operand in find")
     if "/" in args:
         raise NotReadOnly("find root directory traversal")
     for index, arg in enumerate(args):
@@ -2582,14 +2783,12 @@ def _check_jq(args: list[str]) -> None:
             raise NotReadOnly("jq loads a module from a file")
 
 
-def _check_sort(args: list[str], live_globs: list[bool]) -> None:
-    """Validate sort: prevent output redirection and glob expansion.
+def _check_sort(args: list[str]) -> None:
+    """Validate sort: prevent output redirection.
 
-    The glob rule is the one in `_check_find`: an unquoted wildcard can expand into `-o`
-    and turn a read into a write, and a quoted one cannot.
+    An unquoted wildcard, which can expand into `-o` and turn a read into a write, is refused
+    before this runs, in `_check_command`. A quoted one cannot.
     """
-    if any(live_globs):
-        raise NotReadOnly("unquoted glob operand in sort")
     for arg in args:
         if (
             arg in ("-o", "--output")
@@ -2816,10 +3015,6 @@ WRAPPERS = {
 MAX_WRAPPER_DEPTH = 4
 
 # Explicit dispatch table mapping programs to their dedicated validator functions
-# Validators that need to know which words carry a wildcard the shell will expand, and
-# so take the parallel `live_globs` list as a second argument.
-GLOB_AWARE = frozenset({"find", "git", "sed", "sort"})
-
 PROGRAM_VALIDATORS = {
     "aws": _check_aws,
     "awk": _check_awk,
@@ -2861,6 +3056,7 @@ def _check_command(
     safe_names: frozenset[str] = frozenset(),
     splice_vars: dict[str, list[str]] | None = None,
     scope: _ReadScope | None = None,
+    known_values: dict[str, list[str] | None] | None = None,
 ) -> None:
     """Inspect simple command name and argument list with strict fail-closed dispatch.
 
@@ -2890,6 +3086,7 @@ def _check_command(
     # runs on the full list is what actually clears them. An argument that is not a splice
     # keeps its token, so quoting and placeholders are preserved for every other check.
     splice_vars = splice_vars or {}
+    known_values = known_values or {}
     args: list[str] = []
     arg_tokens: list[str] = []
     live_globs: list[bool] = []
@@ -2955,9 +3152,21 @@ def _check_command(
     # The wrapper sees the pre-splice tokens, since its own argument parsing happens before
     # the inner program's; the inner `_check_command` splices again with the same vars.
     if program in WRAPPERS:
-        _check_command(
-            WRAPPERS[program](words[1:]), parts, depth + 1, safe_names, splice_vars, scope
-        )
+        inner = WRAPPERS[program](words[1:])
+        # The wrapper's own words are read by position, so one the shell splits or globs
+        # moves the command it runs: beside files `5` and `rm`, `timeout [5r]* cat README.md`
+        # is `timeout 5 rm cat README.md`, and under bash `t='5 rm'; timeout $t cat README.md`
+        # is too, with no file needed.
+        for word in words[1 : len(words) - len(inner)]:
+            if (
+                _carries_live_glob(word)
+                or _has_bare_variable(word, parts)
+                or _carries_substitution(word, parts)
+            ):
+                raise NotReadOnly(
+                    f"{program} given a word the shell still builds: {_expand(word, parts)}"
+                )
+        _check_command(inner, parts, depth + 1, safe_names, splice_vars, scope, known_values)
         return
 
     # Every flag test below reads a word that is already complete. One that begins with
@@ -2987,6 +3196,14 @@ def _check_command(
             raise NotReadOnly(
                 f"an argument to {program} begins with an expansion: {_expand(word, parts)}"
             )
+        shapes = _word_shapes(word, parts, known_values)
+        if shapes is None:
+            raise NoOpinion(TOO_MANY_SHAPES)
+        if any(_flag_an_expansion_spells(shape) for shape in shapes):
+            raise NotReadOnly(
+                f"an argument to {program} is a flag a value it never read spells: "
+                f"{_expand(word, parts)}"
+            )
 
     # What these two print, a terminal interprets; see `TERMINAL_CONTROL_BYTE`. Read here,
     # past any wrapper, so `echo '=== EC ==='` beside a `sed` that strips colors stays approved.
@@ -3001,12 +3218,47 @@ def _check_command(
         ):
             raise NotReadOnly(f"{program} expands a value in a command that spells an escape")
 
+    # A wildcard the shell expands is a word, or several, that no validator reads: it gets the
+    # spelling, and the program gets what the directory held. Beside a file named `-f`, `awk
+    # [-]f x` is `awk -f x`; beside one named `x;BEGIN{system(...)}`, `awk x*` runs it as its
+    # program; and `uniq *.txt` writes over the second file it matches. Every program with a
+    # validator turns on its words, as `EXPANSION_UNSAFE` says, and so is refused one, the `-C`
+    # directory of `git` included. A quoted wildcard is the program's own to match.
+    # For `printf` only the first word can be an option, so it is the one read, as above:
+    # beside a file named `-v`, `printf [-]v PATH .` sets `PATH`.
+    # bash splits and globs a value where an unquoted `$q` glued to text uses it, so
+    # `q='*'; awk x$q` is `awk x*`: such a use is refused too, unless `known_values` holds a
+    # value for the name that bash can neither split nor glob.
+    if program == "printf":
+        globbed = list(zip(arg_tokens[:1], live_globs[:1], spliced[:1], strict=True))
+    elif program in EXPANSION_UNSAFE:
+        globbed = list(zip(arg_tokens, live_globs, spliced, strict=True))
+    else:
+        globbed = []
+    for word, live, was_spliced in globbed:
+        if live:
+            raise NotReadOnly(f"unquoted glob operand in {program}")
+        expansion = None if was_spliced else _unclean_expansion(word, known_values)
+        if expansion is not None:
+            raise NotReadOnly(
+                f"bash may split or glob {expansion} where {program} gets it: "
+                f"{_expand(word, parts)}"
+            )
+
     # Fail-closed dispatch: either a dedicated validator, a purely read-only program, or reject
     if program in PROGRAM_VALIDATORS:
-        if program in GLOB_AWARE:
-            PROGRAM_VALIDATORS[program](args, live_globs)
-        else:
-            PROGRAM_VALIDATORS[program](args)
+        PROGRAM_VALIDATORS[program](args)
+        # The validator read each word as spelled. With the values the command sets in place,
+        # a word can be another flag: `q=o; sort -${q}ut in` is `sort -out in`, and
+        # `q=''; r=-o; sort ${q}${r}ut in` is too. Each list the program can get is read again.
+        if program in EXPANSION_UNSAFE or program == "printf":
+            for variant in _arg_variants(args, arg_tokens, spliced, parts, known_values):
+                try:
+                    PROGRAM_VALIDATORS[program](variant)
+                except NotReadOnly as error:
+                    raise type(error)(
+                        f"{error}, with the values this command sets: {' '.join(variant)}"
+                    ) from None
     elif program not in READ_ONLY:
         raise NoOpinion(f"unrecognized program: {program}")
 
@@ -3822,6 +4074,16 @@ def _readable_input_target(target: str, parts: list[tuple[str, str]], roots: lis
 
 def _classify(command: str, depth: int = 0) -> None:
     """Raise ``NotReadOnly`` with the reason, or return having found none."""
+    _classify_with(command, depth, {})
+
+
+def _classify_with(command: str, depth: int, inherited: dict[str, list[str] | None]) -> None:
+    """`_classify`, for a command that inherits the variables of the commands around it.
+
+    A substitution's body sees what the command around it binds: in
+    `q=--; echo "$(git log "${q}output=x")"` it is `git log --output=x`. ``inherited`` holds
+    those names, with their values as `_known_values` reads them.
+    """
     if depth > MAX_SUBSTITUTION_DEPTH:
         raise NotReadOnly("substitution nested too deeply")
 
@@ -3843,12 +4105,6 @@ def _classify(command: str, depth: int = 0) -> None:
         raise NotReadOnly("terminal control byte in command")
 
     reduced, parts = _scan(command)
-
-    # A substitution runs a command wherever it sits, so each body is classified by these
-    # same rules before the word it produces is looked at.
-    for kind, value in parts:
-        if kind in RUNS_A_COMMAND:
-            _classify(value, depth + 1)
 
     # Layer B: no word may name a credential store, whatever program it belongs to and
     # whatever tier would otherwise approve it.
@@ -3922,6 +4178,23 @@ def _classify(command: str, depth: int = 0) -> None:
     # that uses one is spliced into its words and checked as the flags it is, which is how a
     # `_p='--profile x --region y'` hoisted out of repeated vendor calls stops prompting.
     splice_vars = _literal_assignments(segments, parts)
+    loop_values = _literal_loop_values(segments, parts)
+    known_values = _known_values(segments, parts, splice_vars, loop_values)
+    for name, values in inherited.items():
+        if name not in known_values:
+            known_values[name] = values
+        elif values is None or known_values[name] is None:
+            known_values[name] = None
+        else:
+            known_values[name] = [*values, *known_values[name]]
+
+    # A substitution runs a command wherever it sits, so each body is classified by these
+    # same rules before the word it produces is looked at, with the variables this command
+    # binds. Everything above refuses outright or not at all, and the segments below can have
+    # no opinion, so a body's refusal still comes first.
+    for kind, value in parts:
+        if kind in RUNS_A_COMMAND:
+            _classify_with(value, depth + 1, known_values)
 
     # Where readers may read. Relative paths are resolved against the project and against
     # every `cd` target in the command, and must be in scope from all of them: a `cd` inside a
@@ -3939,7 +4212,7 @@ def _classify(command: str, depth: int = 0) -> None:
         roots=roots,
         bases=bases,
         splice_vars=splice_vars,
-        loop_values=_literal_loop_values(segments, parts),
+        loop_values=loop_values,
         spells_escape=bool(TERMINAL_CONTROL_SPELLED.search(command)),
     )
 
@@ -3955,7 +4228,12 @@ def _classify(command: str, depth: int = 0) -> None:
             raise NotReadOnly(f"a deny rule matches: {text}")
         try:
             _check_command(
-                words, parts, safe_names=safe_names, splice_vars=splice_vars, scope=scope
+                words,
+                parts,
+                safe_names=safe_names,
+                splice_vars=splice_vars,
+                scope=scope,
+                known_values=known_values,
             )
         except NoOpinion:
             # The module cannot read this one. It can still be something the operator has
