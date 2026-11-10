@@ -59,7 +59,8 @@ from a command that prompted in a real session.
           RefusesWordsAnExpansionSupplies
      8  Redirection, sockets, and egress
           RefusesDescriptorAndSocketRedirection, RefusesRedirectionAttachedToACompound,
-          RefusesReadsOutsideTheWorkingDirectories, RefusesEgressThroughAnApprovedProgram
+          RefusesReadsOutsideTheWorkingDirectories, RefusesACredentialStoreAWildcardOrABaseReaches,
+          RefusesEgressThroughAnApprovedProgram
      9  Program identity, environment, and session state
           RefusesControlOfTheEnvironmentAndTheProgram, StripsTheWrapperTheHostStrips,
           RefusesBuiltinsThatRunAProgram, RefusesSessionScopedEnvironmentHandover,
@@ -3655,6 +3656,206 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assert_allowed(command)
+
+
+@contextlib.contextmanager
+def a_project_below_home(cwd: str = ""):
+    """A home holding `.ssh/id_rsa`, and the project three levels below it, at `~/a/b/proj`,
+    holding `README.md`, `src/lib/x.txt` and the link `k` to `~/.ssh`. `HOME`, the project and
+    the session's working directory, `cwd` inside the project, point there."""
+    home = Path(os.path.realpath(tempfile.mkdtemp(prefix="readonly_hook_home_")))
+    try:
+        (home / ".ssh").mkdir()
+        (home / ".ssh" / "id_rsa").write_text("not a key\n")
+        project = home / "a" / "b" / "proj"
+        (project / "src" / "lib").mkdir(parents=True)
+        (project / "README.md").write_text("one\n")
+        (project / "src" / "lib" / "x.txt").write_text("one\n")
+        (project / "k").symlink_to(home / ".ssh")
+        with (
+            unittest.mock.patch.dict(os.environ, {"HOME": str(home)}),
+            unittest.mock.patch.object(hook, "REPO_ROOT", project),
+            unittest.mock.patch.object(hook, "_SESSION_CWD", str(project / cwd)),
+        ):
+            yield project
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase):
+    """Layer B read a word with a wildcard by its literal part alone, and gave up on a relative
+    one, so a word the shell expands into a credential store got past it (#43). Each is refused
+    outright now, so no allow rule overturns it, beside a control approved under the same setup.
+
+    Not covered here: what a wildcard matches, such as `k*` in `cat k*/id_rsa` through the link
+    `k` to `~/.ssh`, which is #54.
+    """
+
+    def test_a_dot_dot_after_the_wildcard(self):
+        """It climbs from whatever the wildcard matched, which can be a link: anywhere."""
+        with a_project_below_home():
+            self.assert_allowed("cat src/*/x.txt", "the control")
+            self.assert_allowed("sed 's|.*/../||' README.md", "the control: a quoted pattern")
+            for command in (
+                "cat ~/a/*/../../.ssh/id_rsa",
+                "grep -r PRIVATE ~/a/*/../../.ssh",
+                "cat src/*/../../../../../.ssh/id_rsa",
+                "cat src/*/../README.md",  # the cost, recorded
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
+            with operator_rules(allow=["Bash(cat *)", "Bash(grep *)"]):
+                self.assert_allowed("cat ../../a.txt", "the control: the rule approves this")
+                self.assert_refused("cat ~/a/*/../../.ssh/id_rsa", "the rule says yes")
+
+    def test_a_relative_literal_part(self):
+        with a_project_below_home():
+            self.assert_allowed("cat READM?.md", "the control")
+            for command in (
+                "cat ../../../.ss?/id_rsa",
+                "cat ../../../.ssh/id_rs?",
+                "grep -r PRIVATE ../../../.ss?",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
+
+    def test_a_component_that_can_match_dot_dot(self):
+        """`.*` matches `..` in a bash older than 5.2, so it is read as `..` too."""
+        with a_project_below_home():
+            self.assert_no_opinion("ls -la .*", "the control: the read scope's, not refused")
+            self.assert_refused_outright("cat ../../.*/.ssh/id_rsa", "can be ../../../.ssh")
+
+    def test_a_relative_path_from_the_working_directory_or_a_cd(self):
+        """Resolved from every base the read scope uses: the project, the session's working
+        directory and each `cd` target."""
+        with a_project_below_home(cwd="src"):
+            self.assert_allowed("cat lib/x.txt", "the control: in the project from each base")
+            self.assert_refused_outright("cat ../../../../.ssh/id_rsa", "~/.ssh, from src")
+        with a_project_below_home():
+            self.assert_allowed("cd src && cat lib/x.txt", "the control")
+            self.assert_refused_outright("cd src && cat ../../../../.ssh/id_rsa")
+
+    def test_each_way_to_change_the_working_directory(self):
+        """A `cd` with an option, a `cd` after another, a `pushd` and a substitution's body each
+        resolve a relative word from where the shell is by then."""
+        with a_project_below_home():
+            self.assert_allowed("cd -P src && cat lib/x.txt", "the control")
+            self.assert_allowed("cd src && cd lib && cat x.txt", "the control")
+            for command in (
+                "cd -P src && cat ../../../../.ssh/id_rsa",
+                "cd -L src && cat ../../../../.ssh/id_rsa",
+                "cd -- src && cat ../../../../.ssh/id_rsa",
+                "cd src && cd lib && cat ../../../../../.ssh/id_rsa",
+                "pushd src && cat ../../../../.ssh/id_rsa",
+                "cd src && x=$(cat ../../../../.ssh/id_rsa)",
+                'cd src && echo "$(cat ../../../../.ssh/id_rsa)"',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
+
+    def test_a_link_below_a_cd_with_an_option(self):
+        """The read scope read `cd -P src` as no `cd` at all, so it placed `lib2` in the
+        project and approved reading through it, with no rule."""
+        with a_project_below_home() as project:
+            (project / "src" / "lib2").symlink_to(project.parents[2] / ".ssh")
+            self.assert_allowed("cd -P src && cat lib/x.txt", "the control")
+            self.assert_refused_outright("cd -P src && cat lib2/id_rsa", "src/lib2 is ~/.ssh")
+
+    def test_more_working_directories_than_it_reads(self):
+        """Each `cd` doubles the directories a relative word may be resolved from, and one that
+        `CDPATH` may look up adds the home directory's. Past the cap the command is refused
+        outright, rather than read from the first ones only."""
+        self.assertEqual(2**6, hook.MAX_WORKING_DIRECTORIES)
+        with a_project_below_home(), operator_rules(allow=["Bash(cat *)"]):
+            within = " && ".join(f"cd ./d{level}" for level in range(6))
+            self.assert_allowed(f"{within} && cat README.md", "the control: 64 directories")
+            self.assert_refused_outright(f"{within} && cd ./d6 && cat README.md", "128 of them")
+
+    def test_a_literal_part_through_a_link(self):
+        with a_project_below_home():
+            self.assert_allowed("cat src/lib/x.tx?", "the control")
+            self.assert_refused_outright("cat k/id_rs?", "k is ~/.ssh")
+
+    def test_a_wildcard_in_proc(self):
+        """A process's environment is a name in its directory in `/proc`, which a wildcard
+        anywhere in `/proc` can reach, and so is each of its threads'."""
+        with operator_rules(allow=["Bash(cat *)"]):
+            self.assert_allowed("cat /proc/cpuinfo", "the control: the rule approves this")
+            for command in (
+                "cat /proc/self/env*",
+                "cat /proc/*/environ",
+                "cat /proc/self/task/1/environ",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
+
+    def test_a_value_the_shell_supplies(self):
+        """`$PWD` is each working directory, and a variable the command assigns or loops over
+        is each value it gives. Any other value, a command's output included, can be any
+        directory, so the text after it is read below `~` and `/`."""
+        with a_project_below_home(), operator_rules(allow=["Bash(cat *)"]):
+            for command in (
+                "cat $PWD/README.md",
+                'cat "$d"/*.md',
+                "d=src; cat $d/lib/x.txt",
+                'cat "$(git rev-parse --show-toplevel)"/README.md',
+                'cat "$d"/config.json',
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: the rule approves this")
+            for command in (
+                "cat $PWD/../../../.ssh/id_rsa",
+                'cat "$PWD"/../../../.ssh/id_rsa',
+                'cat "$PWD"/k/id_rsa',
+                "cat $OLDPWD/.ssh/id_rsa",
+                "cat $(echo ../../..)/.ssh/id_rsa",
+                'cat "$d"/etc/shadow',
+                "d=..; cat $d/$d/$d/.ssh/id_rsa",
+                'd=..; cat "$d"/../../.ssh/id_rsa',
+                "d=../../../.ss; cat ${d}h/id_rsa",
+                "for d in ..; do cat $d/$d/$d/.ssh/id_rsa; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
+
+    def test_a_working_directory_the_shell_supplies(self):
+        """`pushd "$d"` can be anywhere, so a relative word after it is read below `~` and `/`,
+        and a wildcard picks the directory `cd k*` or `pushd k*` moves to, which can be the link
+        `k`. `main` refuses `cd k*` since #50, as a glob for a program with a validator, and
+        `pushd` has none."""
+        with a_project_below_home():
+            self.assert_allowed("cd src && cat lib/x.txt", "the control")
+            self.assert_refused_outright("cd k* && cat id_rsa", "k* can be k, which is ~/.ssh")
+            with operator_rules(allow=["Bash(cat *)", "Bash(pushd *)"]):
+                self.assert_allowed('pushd "$d" && cat README.md', "the control")
+                self.assert_refused_outright('pushd "$d" && cat .ssh/id_rsa', "$d can be ~")
+                self.assert_allowed("pushd src && cat lib/x.txt", "the control")
+                self.assert_refused_outright("pushd k* && cat id_rsa", "k* can be k")
+
+    def test_a_directory_a_program_or_cdpath_moves_to(self):
+        """`git -C`, `tar -C` and `env --chdir` resolve a relative word from the directory they
+        name. Both shells look `cd .ssh` up in `CDPATH` first, which a startup file can set to
+        `~`, so `cd .ssh` is refused, and a relative word after `cd .config` is read from
+        `~/.config` too."""
+        with a_project_below_home():
+            for command in (
+                "git -C src diff --no-index lib/x.txt /dev/null",
+                "grep -C 3 one README.md",
+                "cd src && cat lib/x.txt",
+                "cd .config && ls",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            for command in (
+                "git -C src diff --no-index ../../../../.ssh/id_rsa /dev/null",
+                "git -C ../../.. diff --no-index .ssh/id_rsa /dev/null",
+                "tar -C ../../.. -cf - .ssh",
+                "env --chdir=../../.. cat .ssh/id_rsa",
+                "cd .ssh && ls",
+                "cd .config && cat gh/hosts.yml",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
 
 
 @approvals_budgeted

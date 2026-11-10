@@ -352,9 +352,11 @@ CREDENTIAL_HOME_PATHS = (
 # Absolute. `/root` is another user's home; the rest hold system credentials.
 CREDENTIAL_SYSTEM_PATHS = ("/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/root")
 
-# A process's environment and memory. `/proc/self/environ` is the hook's own environment,
-# which is where the session's tokens live.
-PROCESS_SECRETS = re.compile(r"^/proc/(?:self|thread-self|\d+)/(?:environ|mem|cmdline|auxv)\b")
+# A process's environment and memory, or one of its threads'. `/proc/self/environ` is the hook's
+# own environment, which is where the session's tokens live.
+PROCESS_SECRETS = re.compile(
+    r"^/proc/(?:self|thread-self|\d+)/(?:task/\d+/)?(?:environ|mem|cmdline|auxv)\b"
+)
 
 # Paths that read nothing from disk.
 DEVICE_READS = frozenset({"/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr"})
@@ -1231,21 +1233,22 @@ PATH_COMPONENT = "\x02entry\x02"
 LISTING_BODY = re.compile(r"^\s*ls(?:\s+-1)?(?:\s+[A-Za-z0-9_./-]+)*\s*$")
 
 
-def _glob_may_climb(path: str) -> bool:
+def _glob_may_climb(path: str, *, dot_components: bool = True) -> bool:
     """Whether a path the shell globs can land above the directory in front of its wildcard.
 
     The read scope places a globbed path in that directory, which holds only while nothing
     from the wildcard on climbs out of it. A `..` after the wildcard, as in `*/../../x`, climbs
     from whatever the wildcard matched. A component that starts with `.` and carries a
     wildcard, as `.*` and `.?` do, matches `..` itself in a bash older than 5.2, or in one
-    with `globskipdots` off.
+    with `globskipdots` off; without `dot_components`, only a `..` counts.
     """
     special = PATH_SPECIAL.search(path)
     if special is None:
         return False
     start = path.rfind("/", 0, special.start()) + 1
     return any(
-        component == ".." or _may_match_dot_dot(component) for component in path[start:].split("/")
+        component == ".." or (dot_components and _may_match_dot_dot(component))
+        for component in path[start:].split("/")
     )
 
 
@@ -1458,6 +1461,8 @@ def _unclean_expansion(token: str, known_values: dict[str, list[str] | None]) ->
 # Stand-ins, in a word's shapes, for an expansion whose value this module did not read: a plain
 # name the command never binds, and anything else, which can produce any text, the command's own
 # included: a name it binds to values unread, `${q:-x}`, `${q#x}`, `$1`, a command substitution.
+# The credential check reads every such value, and a working directory it can't resolve, as
+# `UNREAD_VALUE`: any directory, see `_below_an_unread_value`.
 UNREAD_VALUE = "\x02"
 OPERATOR_VALUE = "\x03"
 
@@ -3508,24 +3513,36 @@ def _expand_home(text: str, *, tilde: bool) -> str:
     return text
 
 
-def _names_a_credential(text: str, *, tilde: bool = True) -> bool:
+def _names_a_credential(text: str, *, tilde: bool, bases: list[str], live_glob: bool) -> bool:
     try:
-        return _names_a_credential_unguarded(text, tilde=tilde)
+        return _names_a_credential_unguarded(text, tilde=tilde, bases=bases, live_glob=live_glob)
     except (OSError, ValueError):
         return True  # cannot be resolved, and this is the layer that refuses outright
 
 
-def _names_a_credential_unguarded(text: str, *, tilde: bool = True) -> bool:
+def _names_a_credential_unguarded(
+    text: str, *, tilde: bool, bases: list[str], live_glob: bool
+) -> bool:
     """Whether this word reaches a credential store, however it is spelled.
 
     A word whose final text the shell still decides -- a glob, an expansion -- is judged by
     the literal part in front of the first special character: `~/.a*/cred*` and `/e*/shadow`
     could each expand into a credential store, so they are refused, while `/usr/share/*` could
-    not and is left to the read scope. A relative path is resolved against the project, so
-    a symlink inside it that points at `~/.ssh` is caught by its target.
+    not and is left to the read scope. That literal part is resolved as a literal path is.
+
+    A relative path, or literal part, is resolved from each of `bases`, the directories the
+    command can run in, and through any symbolic link, so a link inside the project that
+    points at `~/.ssh` is caught by its target. What a wildcard matches is not read: a
+    wildcard that matches such a link is not caught (#54). A value this module didn't read,
+    `UNREAD_VALUE`, in the word or as a base, is read by `_below_an_unread_value`.
+
+    With `live_glob`, the shell expands a wildcard in the word, and a component that can
+    match `..`, as `.*` does in a bash older than 5.2, is read as `..` too: `../.*/.ssh/x` can
+    be `../../.ssh/x`. A `..` after the wildcard is refused before this, in
+    `_refuse_credential_paths`.
     """
     text = REDIRECTION_PREFIX.sub("", text)
-    if "=" in text and not text.startswith(("/", "~", "$")):
+    if "=" in text and not text.startswith(("/", "~", "$", UNREAD_VALUE)):
         # An assignment's or a `--flag=`'s right-hand side. Bash expands a tilde after the
         # `=` of an assignment, so `x=~/.aws/credentials` puts the real path in `x`; a
         # `--flag=~/x` is not expanded, and treating it as if it were costs a prompt at most.
@@ -3534,48 +3551,337 @@ def _names_a_credential_unguarded(text: str, *, tilde: bool = True) -> bool:
     if not text:
         return False
     text = _expand_home(text, tilde=tilde)
+    if UNREAD_VALUE in text:
+        unread = [text]
+    elif text.startswith("/"):
+        unread = []
+    else:
+        unread = [os.path.join(base, text) for base in bases if UNREAD_VALUE in base]
+    if any(_below_an_unread_value(spelled, live_glob=live_glob) for spelled in unread):
+        return True
+    # Below, an unread value is an expansion: the text in front of it is the literal part
+    text = text.replace(UNREAD_VALUE, "$")
+    bases = [base for base in bases if UNREAD_VALUE not in base]
     roots = _credential_roots()
+    spellings = [text] if text.startswith("/") else [os.path.join(base, text) for base in bases]
 
     special = PATH_SPECIAL.search(text)
-    if special is not None:
-        prefix = text[: special.start()]
-        if not prefix.startswith("/"):
-            return False  # relative and undecided: read scope's question, not this one's
-        prefix = os.path.normpath(prefix) if prefix.endswith("/") is False else prefix
-        return (
-            any(root.startswith(prefix) or _is_under(prefix, root) for root in roots)
-            or PROCESS_SECRETS.match(prefix) is not None
-        )
+    if special is None:
+        for absolute in spellings:
+            for candidate in {os.path.normpath(absolute), os.path.realpath(absolute)}:
+                if PROCESS_SECRETS.match(candidate):
+                    return True
+                if any(_is_under(candidate, root) for root in roots):
+                    return True
+        return False
 
-    absolute = text if text.startswith("/") else os.path.join(str(REPO_ROOT), text)
-    for candidate in {os.path.normpath(absolute), os.path.realpath(absolute)}:
-        if PROCESS_SECRETS.match(candidate):
+    if live_glob:
+        components = text.split("/")
+        climbing = [
+            index
+            for index, component in enumerate(components)
+            if component != ".." and _may_match_dot_dot(component)
+        ]
+        # Each such component carries a wildcard or an expansion, so with two, the second
+        # read as `..` climbs from whatever the first matched, as a `..` after a wildcard does
+        if len(climbing) > 1:
             return True
-        if any(_is_under(candidate, root) for root in roots):
-            return True
+        if climbing:
+            variant = "/".join(
+                ".." if index == climbing[0] else component
+                for index, component in enumerate(components)
+            )
+            if _glob_may_climb(variant, dot_components=False) or _names_a_credential_unguarded(
+                variant, tilde=False, bases=bases, live_glob=False
+            ):
+                return True
+
+    relative_directory, _, relative_partial = text[: special.start()].rpartition("/")
+    if not text.startswith("/") and not relative_partial and relative_directory in ("", "."):
+        # The wildcard or expansion reads the base itself, as `*` and `"$f"` do: the read
+        # scope's question. No base is in a credential store, `_working_directories` sees to
+        # that, and a link in one is read by neither layer, as for `grep -R x .`
+        return False
+    for absolute in spellings:
+        prefix = absolute[: len(absolute) - len(text) + special.start()]
+        directory, _, partial = prefix.rpartition("/")
+        for resolved in {os.path.normpath(directory or "/"), os.path.realpath(directory or "/")}:
+            # `dir/` keeps its slash, so a root that starts with it is one the wildcard can
+            # reach; `dir/.ss` is a root's own name in part. A `.` or `..` is a directory
+            # too, as in `/..*`, which is `/` and every name under it.
+            if partial in (".", ".."):
+                candidate = os.path.normpath(os.path.join(resolved, partial)).rstrip("/") + "/"
+            else:
+                candidate = resolved.rstrip("/") + "/" + partial
+            # A process's secrets are a name below its directory, which a wildcard anywhere
+            # in `/proc` can reach: `/proc/*/environ` and `/proc/self/env*` are each of them
+            if (
+                any(root.startswith(candidate) or _is_under(candidate, root) for root in roots)
+                or "/proc/".startswith(candidate)
+                or _is_under(candidate, "/proc")
+            ):
+                return True
     return False
 
 
-def _refuse_credential_paths(reduced: str, parts: list[tuple[str, str]]) -> None:
+def _below_an_unread_value(path: str, *, live_glob: bool) -> bool:
+    """Whether the text after the last value this module didn't read names a credential store.
+
+    That value, an expansion, a command's output or a working directory, can be any directory,
+    so the text after it is read below the home directory, and without a wildcard below `/`:
+    after `$(pwd)`, `/.ssh/id_rsa` names a store, and `/etc/shadow` names one. Each `..` in
+    front of it is a directory deeper in the value. Two things are left to the read scope: text
+    glued to the value, which finishes a name the value starts, as `h` in `${d}h` does, and a
+    wildcard right after it, which reads the value's own directory, as `"$d"/*` does.
+    """
+    tail = path.rpartition(UNREAD_VALUE)[2]
+    if not tail.startswith("/"):
+        tail = tail.partition("/")[2]
+    components = os.path.normpath(tail.strip("/") or ".").split("/")
+    while components and components[0] in (".", ".."):
+        components.pop(0)
+    rest = "/".join(components)
+    special = PATH_SPECIAL.search(rest)
+    if not rest or (special is not None and special.start() == 0):
+        return False
+    below_home = f"{_home().rstrip('/')}/{rest}"
+    return _names_a_credential_unguarded(
+        below_home, tilde=False, bases=[], live_glob=live_glob
+    ) or (
+        special is None
+        and _names_a_credential_unguarded(f"/{rest}", tilde=False, bases=[], live_glob=False)
+    )
+
+
+# More directories than this that a relative word may be resolved from, and the command is
+# refused: each costs a resolution of every word in it, and the credential check, which refuses
+# outright, has to read the word from all of them
+MAX_WORKING_DIRECTORIES = 64
+
+# The programs that change the shell's working directory, and the options that leave their
+# target the next word. `_check_cd` refuses any other option, and `pushd` has no opinion.
+DIRECTORY_CHANGERS = frozenset({"cd", "pushd"})
+DIRECTORY_CHANGER_OPTIONS = frozenset({"-L", "-P", "-e", "-@", "-n", "--"})
+
+
+def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[str]:
+    """The target of each `cd` and `pushd` in this segment, wherever it stands.
+
+    The first word after it that isn't one of its options, as `_check_cd` reads it. A word
+    `cd` that is no command, as in `echo cd x`, adds a target the shell never uses, which costs
+    a refusal at most. A command's output is `UNREAD_VALUE`. A wildcard the shell expands
+    refuses the command: it picks the directory, which can be a link out of the project, as
+    `cd k*` can.
+    """
+    targets = []
+    for index, word in enumerate(words):
+        if _expand(word, parts) not in DIRECTORY_CHANGERS:
+            continue
+        for following in words[index + 1 :]:
+            target = _expand(following, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
+            if target in DIRECTORY_CHANGER_OPTIONS:
+                continue
+            if target.startswith(("-", "+")):
+                break
+            if following.startswith("~"):
+                target = os.path.expanduser(target)
+            if _carries_live_glob(following):
+                raise NotReadOnly(f"cd to a directory a wildcard picks: {target}")
+            targets.append(target)
+            break
+    return targets
+
+
+# The options that run a program in another directory, which it resolves a relative word from:
+# `git -C`, `make -C`, `tar -C` and `--directory`, `env -C` and `--chdir`
+DIRECTORY_OPTIONS = frozenset({"-C", "--directory", "--chdir"})
+
+
+def _program_directories(tokens: list[str], parts: list[tuple[str, str]]) -> list[str]:
+    """The directory each `DIRECTORY_OPTIONS` option in these tokens names.
+
+    Whatever program it belongs to: `grep -C 3` adds `3`, which costs a refusal at most.
+    """
+    directories = []
+    for index, token in enumerate(tokens):
+        word = _expand(token, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
+        name, equals, value = word.partition("=")
+        following = tokens[index + 1 : index + 2]
+        if equals and name in DIRECTORY_OPTIONS:
+            directories.append(value)
+        elif word.startswith("-C") and word != "-C":
+            directories.append(word[2:])
+        elif word in DIRECTORY_OPTIONS and following and not set(following[0]) <= PUNCTUATION_CHARS:
+            value = _expand(following[0], parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
+            if _carries_live_glob(following[0]):
+                value = UNREAD_VALUE
+            directories.append(os.path.expanduser(value) if following[0][0] == "~" else value)
+    return directories
+
+
+# The most spellings of a word the credential check reads; past it, the variables still in it
+# are read as values it didn't read, which each of them could be anyway
+MAX_SPELLINGS = 64
+
+
+def _spellings(word: str, values: dict[str, list[str] | None], bases: list[str]) -> list[str]:
+    """The texts this word can be, for the credential check.
+
+    `$HOME` is the home directory and `$PWD` each working directory. Any other variable is each
+    value `_known_values` read for it, and a value this module didn't read, `UNREAD_VALUE`, for
+    the one the shell had before; so is a name whose values are unread, every other expansion,
+    and a command's output.
+    """
+    texts = [word.replace(SUBSTITUTION_MARKER, UNREAD_VALUE)]
+    for _ in range(8):
+        expanded: list[str] = []
+        for text in texts:
+            match = TEXT_EXPANSION.search(text)
+            if match is None:
+                expanded.append(text)
+                continue
+            name = match.group(1) or match.group(2)
+            if name == "HOME":
+                choices = [_home()]
+            elif name == "PWD":
+                choices = bases
+            elif name:
+                choices = [*(values.get(name) or []), UNREAD_VALUE]
+            else:
+                choices = [UNREAD_VALUE]
+            expanded += [text[: match.start()] + choice + text[match.end() :] for choice in choices]
+        if len(expanded) > MAX_SPELLINGS or expanded == texts:
+            break
+        texts = expanded
+    return list(dict.fromkeys(TEXT_EXPANSION.sub(UNREAD_VALUE, text) for text in texts))
+
+
+class _ShellState:
+    """What the words of a command are read against.
+
+    ``bases`` are the directories the shell may be in, and ``shell_bases`` those and the ones
+    `CDPATH` may take it to, `_working_directories`; ``values`` are the ones its variables may
+    hold, as `_known_values` reads them. A substitution's body runs in the shell around it, so
+    it is read against that one's.
+    """
+
+    __slots__ = ("bases", "shell_bases", "values")
+
+    def __init__(
+        self, bases: list[str], shell_bases: list[str], values: dict[str, list[str] | None]
+    ) -> None:
+        self.bases = bases
+        self.shell_bases = shell_bases
+        self.values = values
+
+
+def _working_directories(
+    segments: list[list[str]],
+    parts: list[tuple[str, str]],
+    inherited: _ShellState | None,
+    values: dict[str, list[str] | None],
+) -> tuple[list[str], list[str]]:
+    """Every directory a relative word in this command may be resolved from, and with `CDPATH`.
+
+    The project and the session's working directory, or for a substitution's body the
+    directories of the command it sits in, then each `cd` or `pushd` target from each of those,
+    in turn: after `cd a && cd b`, `a`, `b` and `a/b` too. That is more than the shell uses,
+    since a `cd` in a pipeline or after `||` may never move it, and the read scope and the
+    credential check read a relative word from each, which costs a no-opinion or a refusal.
+    The second list adds the directories `CDPATH` may take the shell to, which only the
+    credential check reads.
+
+    A target is read as each of its `_spellings`, so one the shell supplies, such as `"$d"`,
+    gives a directory below `UNREAD_VALUE`, which the read scope never vouches for.
+
+    Both shells look a target up in each directory `CDPATH` lists first, unless it starts with
+    `/`, `./` or `../`. A startup file the hook can't read sets it, and the credential stores are
+    in the home directory, so for the credential check each such target is read from there too.
+    A directory that is in a store, as `cd .ssh` can be, refuses the command outright.
+    """
+    if inherited is not None:
+        bases, shell_bases = list(inherited.bases), list(inherited.shell_bases)
+    else:
+        bases = [str(REPO_ROOT)]
+        if _SESSION_CWD and os.path.isabs(_SESSION_CWD) and bases[0] != _SESSION_CWD:
+            bases.append(_SESSION_CWD)
+        shell_bases = list(bases)
+    for segment in segments:
+        for target in _directory_targets(segment, parts):
+            spellings = _spellings(target, values, shell_bases)
+            bases = list(
+                dict.fromkeys(bases + [_joined(base, path) for path in spellings for base in bases])
+            )
+            moved = [
+                _joined(base, path)
+                for path in spellings
+                for base in shell_bases + ([_home()] if _searches_cdpath(path) else [])
+            ]
+            added = [base for base in dict.fromkeys(moved) if base not in shell_bases]
+            if len(shell_bases) + len(added) > MAX_WORKING_DIRECTORIES:
+                raise NotReadOnly(f"more working directories than this module reads: {target}")
+            for base in added:
+                if UNREAD_VALUE not in base and _names_a_credential(
+                    base, tilde=False, bases=[], live_glob=False
+                ):
+                    raise NotReadOnly(f"cd into a credential store, through CDPATH: {target}")
+            shell_bases += added
+    return bases, shell_bases
+
+
+def _searches_cdpath(target: str) -> bool:
+    """Whether `cd` looks ``target`` up in `CDPATH`: unless it starts with `/`, `./` or `../`."""
+    return not target.startswith(("/", "./", "../", UNREAD_VALUE)) and target not in (".", "..")
+
+
+def _joined(base: str, path: str) -> str:
+    """``path`` from ``base``, normalized.
+
+    Not where it holds a value this module didn't read, whose `..` climbs out of the value
+    rather than cancel it.
+    """
+    joined = os.path.join(base, path)
+    return joined if UNREAD_VALUE in joined else os.path.normpath(joined)
+
+
+def _refuse_credential_paths(
+    reduced: str, parts: list[tuple[str, str]], state: _ShellState
+) -> None:
     """Layer B: refuse the command if any word in it names a credential store.
 
-    Runs on the reduced command before redirections are stripped, so a `< ~/.ssh/id_rsa`
-    target is a word here like any other. Every word of every segment is checked, whichever
-    program it belongs to, because the operator tier never sees what a word *opens*.
+    Reads the reduced command, its redirections included, so a `< ~/.ssh/id_rsa` target is a
+    word here like any other. Every word of every segment is checked, whichever program it
+    belongs to, because the operator tier never sees what a word *opens*. A relative word is
+    read from each directory the shell may be in, `CDPATH` included, and each one a program's
+    `DIRECTORY_OPTIONS` names; and each word as each of its `_spellings`.
+
+    A wildcard the shell expands, followed by a `..`, can land anywhere, credential stores
+    included, and is refused for that. Only a live wildcard counts: a quoted one is the
+    program's pattern, as in `sed 's|.*/../||'`.
     """
-    for line in reduced.split("\n"):
-        try:
-            tokens = _tokenize(line)
-        except ValueError:
-            continue  # the main pass will refuse what cannot be tokenized
+    lines = [_tokenize(line) for line in reduced.split("\n")]
+    bases = list(state.shell_bases)
+    for tokens in lines:
+        for directory in _program_directories(tokens, parts):
+            for spelled in _spellings(directory, state.values, state.shell_bases):
+                bases += [_joined(base, spelled) for base in state.shell_bases]
+    bases = list(dict.fromkeys(bases))
+    if len(bases) > MAX_WORKING_DIRECTORIES:
+        raise NotReadOnly("more working directories than this module reads, with each -C")
+    for tokens in lines:
         for token in tokens:
             if set(token) <= PUNCTUATION_CHARS:
                 continue
+            word = _expand(token, parts)
+            live_glob = _carries_live_glob(token)
+            if live_glob and _glob_may_climb(word, dot_components=False):
+                raise NotReadOnly(f"a glob that climbs past its wildcard can land anywhere: {word}")
             # A tilde is expanded only at the start of an unquoted word, so a quoted
             # `'~/x'` is the literal path it spells. A placeholder start means quoted.
             tilde = token.startswith("~") or bool(REDIRECTION_PREFIX.match(token))
-            if _names_a_credential(_expand(token, parts), tilde=tilde):
-                raise NotReadOnly(f"names a credential store: {_expand(token, parts)}")
+            for spelled in _spellings(word, state.values, state.shell_bases):
+                if _names_a_credential(spelled, tilde=tilde, bases=bases, live_glob=live_glob):
+                    raise NotReadOnly(f"names a credential store: {word}")
 
 
 class _ReadScope:
@@ -4073,15 +4379,16 @@ def _readable_input_target(target: str, parts: list[tuple[str, str]], roots: lis
 
 def _classify(command: str, depth: int = 0) -> None:
     """Raise ``NotReadOnly`` with the reason, or return having found none."""
-    _classify_with(command, depth, {})
+    _classify_with(command, depth, None)
 
 
-def _classify_with(command: str, depth: int, inherited: dict[str, list[str] | None]) -> None:
-    """`_classify`, for a command that inherits the variables of the commands around it.
+def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> None:
+    """`_classify`, for a command that inherits the shell state of the command around it.
 
-    A substitution's body sees what the command around it binds: in
-    `q=--; echo "$(git log "${q}output=x")"` it is `git log --output=x`. ``inherited`` holds
-    those names, with their values as `_known_values` reads them.
+    A substitution's body runs where the command around it does, and sees what that command
+    binds: in `q=--; echo "$(git log "${q}output=x")"` it is `git log --output=x`, and in
+    `cd src && x=$(cat ../x)` it reads `src/../x`. ``inherited`` is that command's
+    `_ShellState`, or None for a whole command.
     """
     if depth > MAX_SUBSTITUTION_DEPTH:
         raise NotReadOnly("substitution nested too deeply")
@@ -4104,10 +4411,6 @@ def _classify_with(command: str, depth: int, inherited: dict[str, list[str] | No
         raise NotReadOnly("terminal control byte in command")
 
     reduced, parts = _scan(command)
-
-    # Layer B: no word may name a credential store, whatever program it belongs to and
-    # whatever tier would otherwise approve it.
-    _refuse_credential_paths(reduced, parts)
 
     # `/dev/tcp/host/port` opens a socket with no program involved, so it is refused
     # wherever it appears -- as an operand, behind `<`, and inside a quoted word -- rather
@@ -4179,7 +4482,7 @@ def _classify_with(command: str, depth: int, inherited: dict[str, list[str] | No
     splice_vars = _literal_assignments(segments, parts)
     loop_values = _literal_loop_values(segments, parts)
     known_values = _known_values(segments, parts, splice_vars, loop_values)
-    for name, values in inherited.items():
+    for name, values in (inherited.values if inherited else {}).items():
         if name not in known_values:
             known_values[name] = values
         elif values is None or known_values[name] is None:
@@ -4187,29 +4490,29 @@ def _classify_with(command: str, depth: int, inherited: dict[str, list[str] | No
         else:
             known_values[name] = [*values, *known_values[name]]
 
+    # Where a relative word may be resolved from, worked out once for the credential check, the
+    # read scope and each substitution's body
+    bases, shell_bases = _working_directories(segments, parts, inherited, known_values)
+    state = _ShellState(bases, shell_bases, known_values)
+
+    # Layer B: no word may name a credential store, whatever program it belongs to and
+    # whatever tier would otherwise approve it.
+    _refuse_credential_paths(reduced, parts, state)
+
     # A substitution runs a command wherever it sits, so each body is classified by these
-    # same rules before the word it produces is looked at, with the variables this command
-    # binds. Everything above refuses outright or not at all, and the segments below can have
-    # no opinion, so a body's refusal still comes first.
+    # same rules before the word it produces is looked at, in this command's shell state.
+    # Everything above refuses outright or not at all, and the segments below can have no
+    # opinion, so a body's refusal still comes first.
     for kind, value in parts:
         if kind in RUNS_A_COMMAND:
-            _classify_with(value, depth + 1, known_values)
+            _classify_with(value, depth + 1, state)
 
-    # Where readers may read. Relative paths are resolved against the project and against
-    # every `cd` target in the command, and must be in scope from all of them: a `cd` inside a
-    # subshell or a pipeline does not move the shell that runs the next command, so the module
+    # Where readers may read. A relative path must be in scope from each working directory: a
+    # `cd` inside a pipeline does not move the shell that runs the next command, so the module
     # does not guess which one applies.
-    bases = [str(REPO_ROOT)]
-    for segment in segments:
-        if segment and _expand(segment[0], parts) == "cd" and len(segment) == 2:
-            target = _expand(segment[1], parts)
-            if "$" not in target and not target.startswith(("~", "-")):
-                bases.append(os.path.normpath(os.path.join(str(REPO_ROOT), target)))
-    if _SESSION_CWD and os.path.isabs(_SESSION_CWD):
-        bases.append(_SESSION_CWD)
     scope = _ReadScope(
         roots=roots,
-        bases=bases,
+        bases=state.bases,
         splice_vars=splice_vars,
         loop_values=loop_values,
         spells_escape=bool(TERMINAL_CONTROL_SPELLED.search(command)),
