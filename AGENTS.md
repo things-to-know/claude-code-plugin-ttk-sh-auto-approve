@@ -198,6 +198,8 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
     - `claude -p` and the SDK run hooks in a workspace never trusted; an interactive session asks
       for trust first
     - The hook reads `--setting-sources` from Claude Code's command line, its parent process's
+    - `make explain` reads this machine's trust records; `SETTING_SOURCES=user` explains a
+      session started with `--setting-sources user`
   - `NO_RULES=1` and `SETTINGS=<file>` replace those 2 files, `additionalDirectories` included
   - `NO_RULES=1`: whether the hook approves the rule's command without the rule
     - If it does, the rule is redundant wherever the hook runs. It stays silent below
