@@ -51,7 +51,9 @@ useful if ``cut``, ``printf``, ``sort`` and ``tr`` are reachable inside it. It r
 ``gh api`` GETs, and flag by flag the ``gh`` subcommands ``GH_READ_SPECS`` lists:
 ``pr view|list|diff|checks``, ``run list|view``, ``issue view|list``, ``repo view`` and
 ``search issues|prs``. It refuses a ``--jq`` that reads the environment on every ``gh``
-subcommand.
+subcommand. It also reads a ``curl`` GET of one URL on a site the project's
+``WebFetch(domain:HOST)`` allow rules list (``_check_curl``): the one approval that makes a
+network call.
 
 Tier 2 grants nothing new: each of those commands is one Claude Code would run with no
 prompt if it stood on its own, and the host already requires every sub-command of a
@@ -536,6 +538,11 @@ LITERAL = "literal"
 DOUBLE_QUOTED = "double-quoted"
 SUBSTITUTION = "substitution"
 PROCESS_SUBSTITUTION = "process-substitution"
+# An arithmetic expansion, which `_skip_arithmetic` lets through only when it names no variable
+# and expands nothing. It stands in as `0`, as a literal would, but is a kind of its own so that
+# a validator reading each word whole can tell that the shell computes this one: see
+# `_rewritten_words`.
+ARITHMETIC = "arithmetic"
 
 # Both substitution kinds run a command; `RUNS_A_COMMAND` is what must be recursed into,
 # refused in a program-name position, and counted as work that was inspected.
@@ -1065,8 +1072,11 @@ def _scan_double_quoted(text: str, index: int, emit: Callable[[str, str], None])
         if char == "`":
             raise NotReadOnly("backtick command substitution")
         if text.startswith("$((", index):
-            index = _skip_arithmetic(text, index + 3)
-            buffer.append("0")
+            end = _skip_arithmetic(text, index + 3)
+            emit(DOUBLE_QUOTED, "".join(buffer))
+            buffer.clear()
+            emit(ARITHMETIC, "0")
+            index = end
             continue
         if text.startswith("$(", index):
             end = _skip_substitution(text, index + 2)
@@ -1127,7 +1137,7 @@ def _scan(command: str) -> tuple[str, list[tuple[str, str]]]:
             raise NotReadOnly("ANSI-C or locale quoting")
         if command.startswith("$((", index):
             end = _skip_arithmetic(command, index + 3)
-            emit(LITERAL, "0")
+            emit(ARITHMETIC, "0")
             index = end
             continue
         if command.startswith("$(", index):
@@ -1180,6 +1190,11 @@ def _has_wildcard(text: str) -> bool:
         return True
     start = text.find("[")
     return start >= 0 and text.find("]", start + 1) >= 0
+
+
+def _carries_arithmetic(token: str, parts: list[tuple[str, str]]) -> bool:
+    """Whether any part of this word is an arithmetic expansion, which reads as `0` here."""
+    return any(parts[int(index)][0] == ARITHMETIC for index in PLACEHOLDER.findall(token))
 
 
 def _carries_live_glob(token: str) -> bool:
@@ -3136,6 +3151,26 @@ def _check_gh_jq(args: list[str], rewritten: list[bool]) -> None:
                 _check_gh_filter(args[following], rewritten=own and rewritten[following])
 
 
+def _rewritten_words(
+    tokens: list[str], live_globs: list[bool], parts: list[tuple[str, str]]
+) -> list[bool]:
+    """Word by word, whether the shell rewrites or computes it before the program runs.
+
+    For the validators that read every word whole and leave the rest to the operator's rules,
+    ``gh`` and ``curl``: an unquoted wildcard, a tilde or zsh's ``=cmd``, a variable, a command
+    substitution, or an arithmetic expansion, which ``_expand`` shows as ``0`` and the shell
+    computes, so that ``https://docs$((1)).example.com/`` names another host than it reads as.
+    """
+    return [
+        glob
+        or _carries_tilde_or_equals(token)
+        or _has_bare_variable(token, parts)
+        or _carries_substitution(token, parts)
+        or _carries_arithmetic(token, parts)
+        for glob, token in zip(live_globs, tokens, strict=True)
+    ]
+
+
 def _carries_tilde_or_equals(token: str) -> bool:
     """Whether bash or zsh rewrites this word through a tilde, or zsh through ``=cmd``.
 
@@ -3229,7 +3264,7 @@ def _check_gh_read(args: list[str], rewritten: list[bool]) -> None:
             continue
         if rest_rewritten[value_at]:
             _gh_give_up(rest, rest_rewritten, start, f"gh given a word the shell rewrites: {value}")
-        if _gh_word_is_built(value):
+        if _word_is_built(value):
             _gh_give_up(
                 rest,
                 rest_rewritten,
@@ -3243,7 +3278,7 @@ def _check_gh_read(args: list[str], rewritten: list[bool]) -> None:
     if max_positionals != GH_SEARCH_QUERY and len(positionals) > max_positionals:
         raise NoOpinion(f"gh {args[0]} {args[1]} with more operands than it takes")
     for operand in positionals:
-        if _gh_word_is_built(operand):
+        if _word_is_built(operand):
             raise NoOpinion(f"gh given a word that is expanded or substituted: {operand}")
         if max_positionals == GH_SEARCH_QUERY:
             continue  # a word of the query, which only filters what the API returns
@@ -3262,9 +3297,378 @@ def _gh_give_up(words: list[str], rewritten: list[bool], start: int, reason: str
     raise NoOpinion(reason)
 
 
-def _gh_word_is_built(word: str) -> bool:
-    """Whether the shell is still building this word, which then is not one this module read."""
+def _word_is_built(word: str) -> bool:
+    """Whether this word, as ``_expand`` gives it, still shows the shell building it.
+
+    The text check that goes with ``_rewritten_words``, for ``gh`` and ``curl``: a ``$`` even in
+    a quoted word, and what a substitution leaves.
+    """
     return "$" in word or SUBSTITUTION_MARKER in word or PLACEHOLDER_MARK in word
+
+
+# --------------------------------------------------------------------------------------
+# curl
+#
+# The one approval that makes a network call: a GET of one URL, on a site the project lists,
+# with every word of the command read. The list is the project's own `WebFetch(domain:HOST)`
+# allow rules (`_curl_sites`), so a site is listed for `curl` where the project's settings already
+# let Claude fetch it. Anything else -- a flag these tables leave out, a second URL, a host the
+# list does not name -- is `NoOpinion`, as for `gh`: the operator's Bash rules decide, as they did
+# before `curl` had a validator.
+# --------------------------------------------------------------------------------------
+
+# Flags that change what curl prints, or how long it waits, and nothing else. A long option is
+# matched exactly: curl also takes any unambiguous prefix (`--sil` is `--silent`), and only the
+# whole name is sure not to be the prefix of an option it reads instead, since curl prefers an
+# exact match -- `--head` is `--head`, not `--header`.
+CURL_BARE_SHORT = frozenset("sSfIi")
+CURL_BARE_LONG = frozenset(
+    {"--silent", "--show-error", "--fail", "--fail-with-body", "--head", "--include"}
+    | {"--compressed"}
+)
+CURL_SECONDS_SHORT = frozenset("m")
+CURL_SECONDS_LONG = frozenset({"--max-time", "--connect-timeout"})
+CURL_SECONDS = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
+# curl skips the curlrc only for these, and only as its first argument: curl(1), `-q, --disable`.
+CURL_SKIPS_CURLRC = frozenset({"-q", "--disable"})
+
+# Where curl looks for a curlrc, which can hold any option -- `output`, `upload-file` -- with
+# nothing in the command to show it. curl(1), `-K, --config`, lists `$CURL_HOME/.curlrc`,
+# `$XDG_CONFIG_HOME/curlrc`, `$HOME/.curlrc` and the home directory of the account. curl 8.5.0
+# also reads `.config/curlrc` under `$CURL_HOME` and `$HOME` when `XDG_CONFIG_HOME` is unset
+# (observed). The hook asks whether each exists, whatever the other variables say, and opens none.
+CURLRC_LOCATIONS = (
+    ("CURL_HOME", ".curlrc"),
+    ("CURL_HOME", ".config/curlrc"),
+    ("XDG_CONFIG_HOME", "curlrc"),
+    ("HOME", ".curlrc"),
+    ("HOME", ".config/curlrc"),
+)
+
+# A host as a list can name it and a URL can carry it: lowercase labels joined by dots, so no
+# userinfo, port, percent-encoding or trailing dot, and no wildcard. A name whose last label is a
+# number is an IPv4 address to a URL parser (`127.1`, `0x7f.1`), which is no site, so it is no
+# host here either.
+_HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+CURL_HOST = re.compile(
+    rf"(?=.{{1,253}}$)(?!.*\.(?:[0-9]+|0x[0-9a-f]*)$){_HOST_LABEL}(?:\.{_HOST_LABEL})+"
+)
+
+# A `WebFetch` permission rule, bare or with a specifier, and the one specifier a site comes from:
+# how a deny or ask rule is read, broadly.
+WEBFETCH_RULE = re.compile(r"WebFetch(?:\((.*)\))?", re.DOTALL)
+WEBFETCH_DOMAIN = "domain:"
+# An allow rule is read as written, with no whitespace or capital letter: Claude Code may forgive
+# them in its own match, and a rule this reads as no site only costs a prompt.
+WEBFETCH_ALLOW_RULE = re.compile(r"WebFetch\(domain:([a-z0-9.-]+)\)")
+
+# Claude Code applies a deny or ask rule from every settings file, and none to a `curl`, so the
+# hook reads the `WebFetch` ones beyond the project's files as well: the user's, in the directory
+# `CLAUDE_CONFIG_DIR` (`CONFIG_DIR_ENV`) names or else `~/.claude`, and the managed file with the
+# `*.json` files in the `managed-settings.d/` beside it. Managed settings that are no file on
+# disk, from the server or a macOS configuration profile, are out of its view. Source: the
+# settings and managed-settings pages of Claude Code's docs.
+MANAGED_SETTINGS_DIRS = {
+    "linux": "/etc/claude-code",
+    "darwin": "/Library/Application Support/ClaudeCode",
+}
+# Set in managed settings, it makes Claude Code ignore the project's permission rules, the
+# `WebFetch` allow rules the list comes from among them
+MANAGED_RULES_ONLY = "allowManagedPermissionRulesOnly"
+
+
+def _webfetch_allowed_host(rule: object) -> str | None:
+    """The host a ``WebFetch`` allow rule lists for ``curl``, or ``None``.
+
+    Only an exact host, written ``WebFetch(domain:HOST)`` with nothing more (``CURL_HOST``). A
+    bare ``WebFetch`` and a wildcard such as ``*.github.io`` list nothing: the second would take in
+    every user's site.
+    """
+    match = WEBFETCH_ALLOW_RULE.fullmatch(rule) if isinstance(rule, str) else None
+    return match.group(1) if match and CURL_HOST.fullmatch(match.group(1)) else None
+
+
+def _webfetch_domain(rule: object) -> str | None:
+    """The domain a ``WebFetch`` deny or ask rule names, ``*`` for every domain, or ``None``.
+
+    ``None`` is a rule for another tool, or not a string. A bare ``WebFetch``, and a specifier
+    that is not ``domain:...``, apply to every fetch as far as this module can tell, hence ``*``.
+    """
+    match = WEBFETCH_RULE.fullmatch(rule.strip()) if isinstance(rule, str) else None
+    if match is None:
+        return None
+    specifier = (match.group(1) or "").strip()
+    if not specifier.startswith(WEBFETCH_DOMAIN):
+        return "*"
+    return specifier[len(WEBFETCH_DOMAIN) :].strip() or "*"
+
+
+def _withholds(domain: str, host: str) -> bool:
+    """Whether a deny or ask rule for ``domain`` covers ``host``.
+
+    Read broadly, since a mistake costs a prompt: case and a trailing dot are ignored, ``*.x``
+    covers ``x`` as well as its subdomains, and any other wildcard covers every host.
+    """
+    domain = domain.lower().rstrip(".")
+    if domain.startswith("*.") and "*" not in domain[2:]:
+        return host == domain[2:] or host.endswith(domain[1:])
+    return "*" in domain or domain == host
+
+
+def _curl_sites(
+    settings: tuple[list[dict], bool], outside: tuple[list[object], list[object], bool]
+) -> frozenset[str]:
+    """The hosts ``curl`` may GET: the project's ``WebFetch(domain:HOST)`` allow rules.
+
+    ``settings`` is the project's ``.claude/settings.json`` and ``.claude/settings.local.json``,
+    where the operator's Bash rules come from, and ``outside`` is ``_outside_settings``. Claude
+    Code treats ``.claude/`` as a protected directory: a session's ``Write`` or ``Edit`` there
+    prompts unless the session runs with ``bypassPermissions``, and the hook approves no Bash
+    command that writes there.
+
+    - An allow rule lists a host only in the project's files, and only as ``_webfetch_allowed_host``
+      reads it. One in the user's settings lets ``WebFetch`` fetch the site, and not ``curl``
+    - ``settings`` holds no allow rule of a file Claude Code doesn't apply in the session, only
+      its deny and ask rules (``_settings_permissions``)
+    - A ``WebFetch`` deny or ask rule in any of the files withholds every host it covers
+      (``_withholds``), since Claude Code would not fetch it unasked either
+    - Nothing is listed when a file cannot be read, a deny or ask list is not a list, or managed
+      settings set ``MANAGED_RULES_ONLY``
+    """
+    found, usable = settings
+    user, managed, readable = outside
+    if not usable or not readable or any(_managed_rules_only(document) for document in managed):
+        return frozenset()
+    listed: set[str] = set()
+    for permissions in found:
+        rules = permissions.get("allow")
+        for rule in rules if isinstance(rules, list) else []:
+            host = _webfetch_allowed_host(rule)
+            if host is not None:
+                listed.add(host)
+    withheld: list[str] = []
+    for permissions in [*found, *(_permissions_of(document) for document in user + managed)]:
+        for key in ("deny", "ask"):
+            rules = None if permissions is None else permissions.get(key, [])
+            if not isinstance(rules, list):
+                return frozenset()  # a list that cannot be read may withhold any host
+            withheld += [domain for rule in rules if (domain := _webfetch_domain(rule))]
+    return frozenset(
+        host for host in listed if not any(_withholds(domain, host) for domain in withheld)
+    )
+
+
+def _permissions_of(document: object) -> dict | None:
+    """A settings document's ``permissions``: ``{}`` when it has none, ``None`` when unreadable."""
+    if not isinstance(document, dict):
+        return None
+    permissions = document.get("permissions", {})
+    return permissions if isinstance(permissions, dict) else None
+
+
+def _managed_rules_only(document: object) -> bool:
+    """Whether a managed settings document sets ``MANAGED_RULES_ONLY``.
+
+    At the top level or in ``permissions``: it is read as set wherever it is.
+    """
+    permissions = _permissions_of(document) or {}
+    return isinstance(document, dict) and bool(
+        document.get(MANAGED_RULES_ONLY) or permissions.get(MANAGED_RULES_ONLY)
+    )
+
+
+def _managed_settings_dir() -> str | None:
+    """Where this platform keeps managed settings files, or ``None``."""
+    return MANAGED_SETTINGS_DIRS.get(sys.platform)
+
+
+def _outside_settings() -> tuple[list[object], list[object], bool]:
+    """The user's settings document and the managed ones, and whether every one could be read.
+
+    A missing file means nothing. A file that cannot be read may hold a deny rule, so the third
+    value is then false, and so it is for a ``CLAUDE_CONFIG_DIR`` or home directory that is not
+    absolute, or a ``managed-settings.d/`` that cannot be listed.
+    """
+    config = os.environ.get(CONFIG_DIR_ENV) or os.path.join(_home(), ".claude")
+    if not os.path.isabs(config):
+        return [], [], False
+    groups: tuple[list[Path], list[Path]] = ([Path(config, "settings.json")], [])
+    managed = _managed_settings_dir()
+    if managed:
+        drop_ins = Path(managed, "managed-settings.d")
+        try:
+            names = sorted(os.listdir(drop_ins))
+        except (FileNotFoundError, NotADirectoryError):
+            names = []
+        except OSError:
+            return [], [], False
+        groups[1].append(Path(managed, "managed-settings.json"))
+        groups[1].extend(drop_ins / name for name in names if name.endswith(".json"))
+    documents: tuple[list[object], list[object]] = ([], [])
+    for paths, into in zip(groups, documents, strict=True):
+        for path in paths:
+            try:
+                present, document = _load_settings_file(path)
+            except (OSError, ValueError, RecursionError):
+                return [], [], False
+            if present:
+                into.append(document)
+    return documents[0], documents[1], True
+
+
+def _check_curl(
+    args: list[str], rewritten: list[bool], spliced: list[bool], scope: _ReadScope | None
+) -> None:
+    """Approve a ``curl`` GET of one URL on a site the project lists; no opinion on the rest.
+
+    What leaves the machine is a GET with a URL Claude wrote, to a site the project lists, and
+    what comes back is the page, into Claude's context. So the command is read whole:
+
+    * every flag is one of the tables above, alone or bundled (``-sSf``), so nothing writes a
+      file, reads one, sends a body or a header, changes the method, follows a redirect, or
+      changes where the request goes or what it trusts
+    * exactly one URL, which ``_check_curl_url`` reads
+    * no word the shell still builds (``_rewritten_words``, ``_word_is_built``), and none spliced
+      in from a variable: a URL in a variable gains nothing, and the splice reads a value that a
+      later binding of the same name, in a ``for`` header or after ``do``, may have replaced
+    * nothing the shell may not wait for, so that a ``curl`` cannot outlive the Bash call: no job
+      behind ``&`` in the command, nor in one a substitution of it sits in, and no process
+      substitution (``_ShellState``)
+    * no curlrc, unless the command starts with ``curl -q``
+    """
+    sites = (
+        _curl_sites(scope.settings, _outside_settings())
+        if scope is not None and scope.settings is not None
+        else frozenset()
+    )
+    if not sites:
+        raise NoOpinion(
+            "curl with no site listed: no WebFetch(domain:...) allow rule of the project lists "
+            "one that no deny or ask rule withholds, or a settings file can't be read"
+        )
+    for arg, built, from_splice in zip(args, rewritten, spliced, strict=True):
+        if from_splice:
+            raise NoOpinion(f"curl given a word spliced in from a variable: {arg}")
+        if built or _word_is_built(arg):
+            raise NoOpinion(f"curl given a word the shell rewrites or builds: {arg}")
+    if scope is not None and scope.backgrounds:
+        raise NoOpinion("curl the shell may not wait for: behind `&`, or in a process substitution")
+
+    skips_curlrc = bool(args) and args[0] in CURL_SKIPS_CURLRC
+    rest = args[1:] if skips_curlrc else args
+    urls: list[str] = []
+    index = 0
+    while index < len(rest):
+        arg = rest[index]
+        index += 1
+        seconds = None
+        if arg in CURL_BARE_LONG:
+            continue
+        if arg in CURL_SECONDS_LONG:
+            seconds = rest[index] if index < len(rest) else ""
+            index += 1
+        elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
+            # `after` is where the word goes on past `letter`
+            for after, letter in enumerate(arg[1:], start=2):
+                if letter in CURL_BARE_SHORT:
+                    continue
+                if letter not in CURL_SECONDS_SHORT:
+                    raise NoOpinion(f"curl flag not known to be read-only: {arg}")
+                # The value is the rest of the bundle, or the next word when nothing is left
+                seconds = arg[after:]
+                if not seconds:
+                    seconds = rest[index] if index < len(rest) else ""
+                    index += 1
+                break
+            if seconds is None:
+                continue
+        elif arg.startswith("-"):
+            raise NoOpinion(f"curl flag not known to be read-only: {arg}")
+        else:
+            urls.append(arg)
+            continue
+        if not CURL_SECONDS.fullmatch(seconds):
+            raise NoOpinion(f"curl timeout that is not a number of seconds: {seconds}")
+
+    if len(urls) != 1:
+        raise NoOpinion(f"curl given {len(urls)} URLs: one URL per curl")
+    _check_curl_url(urls[0], sites)
+
+    if not skips_curlrc:
+        for path in _curlrc_paths():
+            # A relative one is wherever the shell stands when curl runs, which a `cd` earlier
+            # in the command moves, and not where the hook stands
+            if not os.path.isabs(path):
+                raise NoOpinion(f"curl reads a curlrc relative to the shell's directory: {path}")
+            if _may_exist(path):
+                raise NoOpinion(f"curl reads a curlrc, which the command does not show: {path}")
+
+
+def _check_curl_url(url: str, sites: frozenset[str]) -> None:
+    """An ``https`` URL whose authority is a listed host and nothing else.
+
+    The authority ends at the first ``/``, ``?`` or ``#``, as curl's own parser ends it, so
+    ``https://docs.python.org@example.com/`` names ``example.com`` and is refused, while
+    ``https://docs.python.org/@x`` is a path. The path and the query are free. Refused anywhere
+    in the URL:
+
+    * ``{``, ``}``, ``[`` and ``]``: curl's globbing turns one URL into many requests
+    * a backslash, which URL parsers disagree on
+    * whitespace and control characters
+    """
+    scheme = "https://"
+    if not url.startswith(scheme):
+        raise NoOpinion(f"curl URL that does not start with {scheme}: {url}")
+    if any(char in "{}[]" for char in url):
+        raise NoOpinion(f"curl URL that curl would glob into several: {url}")
+    if "\\" in url:
+        raise NoOpinion(f"curl URL with a backslash: {url}")
+    if any(char.isspace() or not char.isprintable() for char in url):
+        raise NoOpinion(f"curl URL with whitespace or a control character: {url!r}")
+    host = re.split(r"[/?#]", url[len(scheme) :], maxsplit=1)[0]
+    if not CURL_HOST.fullmatch(host):
+        raise NoOpinion(f"curl URL whose authority is not a host name alone: {host}")
+    if host not in sites:
+        raise NoOpinion(f"curl to a host not on the list of WebFetch(domain:...) sites: {host}")
+
+
+def _curlrc_paths() -> list[str]:
+    """Every file in ``CURLRC_LOCATIONS``, and the account's ``.curlrc`` and ``.config/curlrc``."""
+    paths = [
+        os.path.join(base, name)
+        for variable, name in CURLRC_LOCATIONS
+        if (base := os.environ.get(variable))
+    ]
+    account = _account_home()
+    if account:
+        paths += [os.path.join(account, ".curlrc"), os.path.join(account, ".config", "curlrc")]
+    return paths
+
+
+def _account_home() -> str | None:
+    """The home directory of the account the hook runs as, as curl finds it without ``HOME``.
+
+    ``pwd`` is imported here rather than at the top: it exists on Linux and macOS only, and
+    elsewhere ``main`` returns before anything calls this.
+    """
+    try:
+        import pwd  # noqa: PLC0415 - see the docstring
+
+        return pwd.getpwuid(os.geteuid()).pw_dir
+    except (ImportError, KeyError, OSError):
+        return None
+
+
+def _may_exist(path: str) -> bool:
+    """Whether ``path`` exists, or cannot be shown not to: a stat that fails otherwise counts."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except (OSError, ValueError):
+        return True
+    return True
 
 
 def _check_find(args: list[str]) -> None:
@@ -3678,14 +4082,16 @@ def _check_command(
         # '$ENV.GH_TOKEN'` prints the token, so the hook approves it neither by reading it nor
         # through a rule. A native `Bash(gh issue view *)` rule still lets Claude Code run it
         # without asking; only a native deny rule stops that.
-        rewritten = [
-            glob
-            or _carries_tilde_or_equals(token)
-            or _has_bare_variable(token, parts)
-            or _carries_substitution(token, parts)
-            for glob, token in zip(live_globs, arg_tokens, strict=True)
-        ]
-        _check_gh_read(args, rewritten)
+        _check_gh_read(args, _rewritten_words(arg_tokens, live_globs, parts))
+        return
+
+    # `curl` returns here for the same reason: an operator's `Bash(curl ...)` rule granted it
+    # before it had a validator, and still may, so the validator gives no opinion on what it
+    # does not approve, and reads each word itself rather than leave it to the checks below,
+    # which refuse outright. It is not in `PROGRAM_VALIDATORS` because it needs the scope: the
+    # sites the project lists, and whether the shell may not wait for the command.
+    if program == "curl":
+        _check_curl(args, _rewritten_words(arg_tokens, live_globs, parts), spliced, scope)
         return
 
     # A wrapper's own arguments are not the command; what it runs is checked in its place.
@@ -4000,8 +4406,8 @@ def _settings_permissions() -> tuple[list[dict], bool]:
     makes the second value false, and each caller decides what that costs it.
 
     Of a project file Claude Code doesn't apply in this session (``_sources_in_force``), only
-    the deny rules are kept: they can only cost a prompt. The files ``SETTINGS_ENV`` names
-    instead stand for files Claude Code applies.
+    the deny and ask rules are kept: they can only cost a prompt. The files ``SETTINGS_ENV``
+    names instead stand for files Claude Code applies.
     """
     override = os.environ.get(SETTINGS_ENV)
     if override is None:
@@ -4014,17 +4420,9 @@ def _settings_permissions() -> tuple[list[dict], bool]:
     in_force: frozenset[str] | None = None
     for path, source in files:
         try:
-            info = path.stat()  # follows a link, and raises for one that dangles
-        except OSError:
-            continue  # a settings file that is simply absent, which is the normal case
-        try:
-            # A directory, a FIFO, a device or an oversized file is never opened: the
-            # first would block for the length of the Bash call and the last would be
-            # read on every one of them. Raising sends it to the `except` below, as a file
-            # that cannot be read.
-            if not S_ISREG(info.st_mode) or info.st_size > SETTINGS_SIZE_CAP:
-                raise ValueError("not a settings file this module will read")  # noqa: TRY301
-            document = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            present, document = _load_settings_file(path)
+            if not present:
+                continue  # a settings file that is simply absent, which is the normal case
             permissions = document["permissions"]
         except (OSError, ValueError, KeyError, TypeError, RecursionError):
             usable = False  # it is there and it cannot be read; see the docstring
@@ -4035,7 +4433,8 @@ def _settings_permissions() -> tuple[list[dict], bool]:
             if in_force is None:
                 in_force = _sources_in_force()
             if source not in in_force:
-                permissions = {"deny": permissions.get("deny")}
+                kept = ("deny", "ask")
+                permissions = {key: permissions[key] for key in kept if key in permissions}
         found.append(permissions)
     return found, usable
 
@@ -4229,6 +4628,22 @@ def _git_pointer(path: Path) -> str | None:
     except (OSError, ValueError):
         return None
     return line if line and not GIT_POINTER_CONTROL.search(line) else None
+
+
+def _load_settings_file(path: Path) -> tuple[bool, object]:
+    """Whether a settings file is there, and its document when it is.
+
+    Raises ``OSError``, ``ValueError`` or ``RecursionError`` for a file that is there and cannot
+    be read. A directory, a FIFO, a device or an oversized file is never opened: the first would
+    block for the length of the Bash call and the last would be read on every one of them.
+    """
+    try:
+        info = path.stat()  # follows a link, and raises for one that dangles
+    except OSError:
+        return False, None
+    if not S_ISREG(info.st_mode) or info.st_size > SETTINGS_SIZE_CAP:
+        raise ValueError("not a settings file this module will read")
+    return True, json.loads(path.read_text(encoding="utf-8", errors="replace"))
 
 
 def _read_roots(settings: tuple[list[dict], bool] | None = None) -> list[str]:
@@ -4591,11 +5006,13 @@ class _ShellState:
     ``bases`` are the directories the shell may be in, and ``shell_bases`` those and the ones
     `CDPATH` may take it to, `_working_directories`; ``values`` are the ones its variables may
     hold, as `_known_values` reads them; ``bindings`` how many times it binds each name,
-    `_bindings`, with the bindings of the commands around it. A substitution's body runs in the
-    shell around it, so it is read against that one's.
+    `_bindings`, with the bindings of the commands around it; ``backgrounds`` whether the shell
+    may not wait for it, which ``curl`` reads: it runs a job behind `&`, or sits in a process
+    substitution or in a command that does. A substitution's body runs in the shell around it,
+    so it is read against that one's.
     """
 
-    __slots__ = ("bases", "bindings", "shell_bases", "values")
+    __slots__ = ("backgrounds", "bases", "bindings", "shell_bases", "values")
 
     def __init__(
         self,
@@ -4603,11 +5020,14 @@ class _ShellState:
         shell_bases: list[str],
         values: dict[str, list[str] | None],
         bindings: dict[str, int],
+        *,
+        backgrounds: bool = False,
     ) -> None:
         self.bases = bases
         self.shell_bases = shell_bases
         self.values = values
         self.bindings = bindings
+        self.backgrounds = backgrounds
 
 
 def _working_directories(
@@ -4754,7 +5174,16 @@ def _refuse_credential_paths(
 class _ReadScope:
     """Where a reader may read from, and what is known about the command's variables."""
 
-    __slots__ = ("bases", "git_runs", "loop_values", "roots", "spells_escape", "splice_vars")
+    __slots__ = (
+        "backgrounds",
+        "bases",
+        "git_runs",
+        "loop_values",
+        "roots",
+        "settings",
+        "spells_escape",
+        "splice_vars",
+    )
 
     def __init__(
         self,
@@ -4764,6 +5193,8 @@ class _ReadScope:
         loop_values: dict[str, list[str]],
         *,
         spells_escape: bool = False,
+        settings: tuple[list[dict], bool] | None = None,
+        backgrounds: bool = False,
     ) -> None:
         self.roots = roots
         self.bases = bases
@@ -4775,6 +5206,11 @@ class _ReadScope:
         # What git said when asked, once per command however many git calls it makes; see
         # `_run_git`
         self.git_runs: dict[tuple[str, ...], tuple[int, str] | None] = {}
+        # The project's settings, which list the hosts `curl` may GET; see `_curl_sites`
+        self.settings = settings
+        # Whether the shell may not wait for the command, which `curl` may not be part of; see
+        # `_ShellState`
+        self.backgrounds = backgrounds
 
 
 def _in_scope(absolute: str, scope: _ReadScope) -> bool:
@@ -5366,8 +5802,14 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # whitespace and glues `ls\nrm` into one word, so the split happens here. A newline
     # inside a quoted string is in the table by now, so it no longer reaches this.
     segments: list[list[str]] = []
+    # A substitution's body inherits the `&` of the command it sits in: in `echo "$(curl x)" &`,
+    # the `curl` runs in the job
+    backgrounds = inherited is not None and inherited.backgrounds
     for line in stripped.split("\n"):
-        segments.extend(_segments(_tokenize(line)))
+        tokens = _tokenize(line)
+        # A `&` token is the separator: `&&`, `|&` and a redirection's `&` are tokens of their own
+        backgrounds = backgrounds or "&" in tokens
+        segments.extend(_segments(tokens))
     if not segments:
         raise NotReadOnly("no command")
 
@@ -5407,7 +5849,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # Where a relative word may be resolved from, worked out once for the credential check, the
     # read scope and each substitution's body
     bases, shell_bases = _working_directories(segments, parts, inherited, known_values)
-    state = _ShellState(bases, shell_bases, known_values, bindings)
+    state = _ShellState(bases, shell_bases, known_values, bindings, backgrounds=backgrounds)
 
     # Layer B: no word may name a credential store, whatever program it belongs to and
     # whatever tier would otherwise approve it.
@@ -5416,10 +5858,12 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # A substitution runs a command wherever it sits, so each body is classified by these
     # same rules before the word it produces is looked at, in this command's shell state.
     # Everything above refuses outright or not at all, and the segments below can have no
-    # opinion, so a body's refusal still comes first.
+    # opinion, so a body's refusal still comes first. The shell runs a process substitution
+    # without waiting for it, as it runs a job behind `&`: `true <(curl x)` returns at once.
+    detached = _ShellState(bases, shell_bases, known_values, bindings, backgrounds=True)
     for kind, value in parts:
         if kind in RUNS_A_COMMAND:
-            _classify_with(value, depth + 1, state)
+            _classify_with(value, depth + 1, detached if kind == PROCESS_SUBSTITUTION else state)
 
     # Where readers may read. A relative path must be in scope from each working directory: a
     # `cd` inside a pipeline does not move the shell that runs the next command, so the module
@@ -5430,6 +5874,8 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         splice_vars=splice_vars,
         loop_values=loop_values,
         spells_escape=bool(TERMINAL_CONTROL_SPELLED.search(command)),
+        settings=settings,
+        backgrounds=backgrounds,
     )
 
     # A move to a directory the read scope doesn't vouch for leaves every program to the rules,

@@ -3,7 +3,7 @@
 Claude Code plugin:
 
 - A `PreToolUse` hook that auto-approves Bash commands it can prove are read-only, so they don't
-  raise a permission prompt
+  raise a permission prompt, and `curl` GETs of the documentation sites a project lists
 - A `PostToolUse` hook that restores the final newline a `Write` or `Edit` left out
 
 Distributed through the `things-to-know` plugin catalog.
@@ -38,6 +38,13 @@ insists on its own filename, symlink to this file rather than copying it.
     - The hook approves reading a `.env` file inside the project, an `additionalDirectories`
       entry or the session's scratchpad, `grep -r` included
     - README § "Secrets inside your project" tells users what still stops it
+  - One approval makes a network call: a `curl` GET of one URL on a listed site
+    - What leaves the machine is a URL Claude wrote, which a poisoned context can put a secret in
+      - So the request goes to an exact listed host, with no userinfo, redirect, proxy or
+        `--resolve`
+    - What comes in is the page, into Claude's context
+      - The README says what to leave out of the list
+    - Only the project's settings files widen it, through the list; see `curl` below
 - **Shell**:
   - The `Bash` tool runs bash or zsh: the user's `$SHELL` when it is one of them, or the one
     `CLAUDE_CODE_SHELL` names. Every rule has to hold under both grammars.
@@ -60,6 +67,27 @@ insists on its own filename, symlink to this file rather than copying it.
   - Operators can drop native `Bash(gh ... view|list *)` allow rules for the subcommands the hook
     reads
     - A native rule still approves `--jq '$ENV.GH_TOKEN'`, and only a native deny rule stops that
+- **`curl`**
+  - The list of sites is the project's `WebFetch(domain:HOST)` allow rules (`_curl_sites`)
+    - In the files the operator's Bash rules come from: `.claude/settings.json` and
+      `.claude/settings.local.json`
+    - Only from a file Claude Code applies, as for the Bash allow rules: see "Audit an allow rule"
+    - Claude Code protects `.claude/`: a session's `Write` or `Edit` there is never auto-approved
+      outside `bypassPermissions`
+    - A repository commits `.claude/settings.json`, so a cloned one can list sites, as it can
+      allow a Bash command
+  - An allow rule lists a host only as written: an exact host, with no whitespace or capital
+    letter
+  - A `WebFetch` deny or ask rule withholds the hosts it covers
+    - From the project's settings, the user's and the managed ones: Claude Code applies all of
+      them, and none to a `curl`
+  - Nothing is listed while a settings file the hook reads can't be read
+    - Nor while managed settings set `allowManagedPermissionRulesOnly`
+  - A call the validator doesn't approve is `NoOpinion`, as for `gh`
+    - So an operator's `Bash(curl ...)` rule still decides it
+    - That includes `-L`, a word spliced in from a variable, a command with a job behind `&`
+      (in its substitutions too), a process substitution, and any curlrc unless the command
+      starts with `curl -q`
 - **Widening**: a change that approves more records where it stops, as
   `TheWideningsHaveAnEdge` does for the loop and splice widenings
   - Each new approval comes with its paired refusals
