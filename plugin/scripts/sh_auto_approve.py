@@ -3108,11 +3108,14 @@ def _check_cd(args: list[str]) -> None:
         raise NotReadOnly(f"cd to a path this module cannot resolve: {target}")
 
     root = os.path.realpath(REPO_ROOT)
-    # `normpath` first, so that a `..` is resolved as bash's own `cd -L` resolves it, and
-    # `realpath` second, so that a symlink anywhere along the way is resolved as well.
-    resolved = os.path.realpath(os.path.normpath(os.path.join(root, target)))
-    if resolved != root and not resolved.startswith(root + os.sep):
-        raise NotReadOnly(f"cd outside the project: {target}")
+    # Both readings of a `..` after a link: `cd -L`, the default, drops the link's own name, as
+    # `normpath` does, and `cd -P`, or a startup file's `set -P` or zsh's `chase_dots`, climbs
+    # from where the link leads, as `realpath` alone does. `realpath` resolves a link anywhere
+    # along the way in either.
+    joined = os.path.join(root, target)
+    for resolved in {os.path.realpath(os.path.normpath(joined)), os.path.realpath(joined)}:
+        if resolved != root and not resolved.startswith(root + os.sep):
+            raise NotReadOnly(f"cd outside the project: {target}")
 
 
 def _strip_timeout(args: list[str]) -> list[str]:
@@ -4129,7 +4132,9 @@ def _in_scope_unguarded(absolute: str, scope: _ReadScope) -> bool:
     scratch = _scratch_root()
     if scratch is not None and _is_under(normal, scratch) and UNREAD_VALUE not in normal:
         return True
-    resolved = os.path.realpath(normal)
+    # Resolved as given, not as `normpath` reads it: the kernel resolves a link before the `..`
+    # after it, so `l/../x` is the `x` beside where `l` leads, and `realpath` does the same.
+    resolved = os.path.realpath(absolute)
     return any(_is_under(normal, root) and _is_under(resolved, root) for root in scope.roots)
 
 

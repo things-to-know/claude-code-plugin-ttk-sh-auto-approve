@@ -66,7 +66,8 @@ from a command that prompted in a real session.
           RefusesBuiltinsThatRunAProgram, RefusesSessionScopedEnvironmentHandover,
           RefusesSessionScopedProgramDefinitions
     10  `cd`
-          ApprovesCdInsideTheRepository, RefusesCdTargetsThatOnlyLookInside
+          ApprovesCdInsideTheRepository, RefusesCdTargetsThatOnlyLookInside,
+          RefusesADotDotAfterALinkOut
     11  Allowlisted programs: flags and operands
           RefusesAllowlistedProgramsThatWrite, RefusesWritingFlagsBundledIntoAShortOption,
           RefusesOutputOperandsPastAnOptionTerminator, RefusesFindWritingPredicates,
@@ -4247,6 +4248,67 @@ class RefusesCdTargetsThatOnlyLookInside(Verdicts, unittest.TestCase):
             self.assert_refused(
                 f"cd '{relative}/out' && ls", "follows a symlink out of the repository"
             )
+
+
+class RefusesADotDotAfterALinkOut(Verdicts, unittest.TestCase):
+    """The kernel resolves a link before the `..` after it, so `sub/l/../x` is the `x` beside
+    where `l` leads. The read scope resolved the path after `normpath` had dropped `l/..`, and
+    so placed it at `sub/x`: with `l` leading out of the project, `cat sub/l/../hostname` was
+    approved, a read outside it.
+
+    `cd` reads such a target two ways: `cd -L`, the default, drops `l/..` as `normpath` does,
+    and `cd -P`, or a startup file's `set -P` or zsh's `chase_dots`, climbs from where `l`
+    leads. A target has to stay in the project under both.
+
+    A project of its own beside `outside`: `sub/l` leads to `outside/ssl`, beside
+    `outside/hostname`, and `sub/m` to the project's `docs`. Each refusal sits beside the same
+    command through `m`, which stays in the project either way. Under bash 5.2.37 and zsh 5.9,
+    `cat sub/l/../hostname` printed `outside/hostname`, `cd sub/l/..` landed in `sub`, and
+    `cd -P sub/l/..` in `outside`.
+    """
+
+    @contextlib.contextmanager
+    def _project(self):
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_dotdot_") as directory:
+            top = Path(os.path.realpath(directory))
+            project, outside = top / "project", top / "outside"
+            (project / "sub").mkdir(parents=True)
+            (project / "docs").mkdir()
+            (project / "README.md").write_text("x\n")
+            (outside / "ssl").mkdir(parents=True)
+            (outside / "hostname").write_text("x\n")
+            (project / "sub" / "l").symlink_to(outside / "ssl")
+            (project / "sub" / "m").symlink_to(project / "docs")
+            with (
+                unittest.mock.patch.object(hook, "REPO_ROOT", project),
+                unittest.mock.patch.object(hook, "_SESSION_CWD", None),
+            ):
+                yield project
+
+    def test_a_read(self):
+        with self._project() as project:
+            for refused, control in (
+                ("cat sub/l/../hostname", "cat sub/m/../README.md"),
+                (f"cat {project}/sub/l/../hostname", f"cat {project}/sub/m/../README.md"),
+                ("grep -rn x sub/l/..", "grep -rn x sub/m/.."),
+                (
+                    "git -C sub diff --no-index l/../hostname x",
+                    "git -C sub diff --no-index m/../README.md x",
+                ),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_no_opinion(refused, "reads outside the project")
+                    self.assert_allowed(control, "stays inside it")
+
+    def test_a_cd(self):
+        with self._project():
+            for refused, control in (
+                ("cd sub/l/.. && ls", "cd sub/m/.. && ls"),
+                ("cd -P sub/l/.. && ls", "cd -P sub/m/.. && ls"),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_refused_outright(refused, "lands outside the project")
+                    self.assert_allowed(control, "stays inside it")
 
 
 # ======================================================================================
