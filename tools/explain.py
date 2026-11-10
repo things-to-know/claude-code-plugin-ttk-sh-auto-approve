@@ -28,6 +28,11 @@ A verdict depends on where the session stands, so the context is passed in, neve
   verdicts, and a warning on stderr
 - ``--settings``: the settings files to read the allow and deny rules and
   ``additionalDirectories`` from, instead of the project's own; ``--no-rules`` reads none
+- ``--setting-sources``: the setting sources the session loaded, as Claude Code's flag of that
+  name lists them; by default every one, as in a session started without it. The hook takes
+  the allow rules and ``additionalDirectories`` of the project's own files only from the
+  sources the session loaded, and only in a workspace Claude Code has a trust record for,
+  which it reads from this machine's Claude Code config
 - ``--hook``: the hook to ask, e.g. the installed copy under ``~/.claude/plugins/cache/``,
   whose decisions are the ones the operator saw. It defaults to this repository's working copy
 
@@ -320,6 +325,9 @@ def main(argv: list[str] | None = None) -> int:
     rules = parser.add_mutually_exclusive_group()
     rules.add_argument("--settings", help=f"settings files, separated by {os.pathsep!r}")
     rules.add_argument("--no-rules", action="store_true", help="read no settings file")
+    parser.add_argument(
+        "--setting-sources", help="the setting sources the session loaded; default: all"
+    )
     args = parser.parse_args(argv)
     if args.transcript is not None and args.commands:
         parser.error("--transcript takes no commands: they come from the transcript")
@@ -344,6 +352,18 @@ def main(argv: list[str] | None = None) -> int:
     hook._SESSION_CWD = cwd
     hook._SCRATCHPAD_DIR = args.scratchpad_dir
     hook.REPO_ROOT = root
+    if args.setting_sources is not None:
+        # Asked of the hook itself, which may be a copy that reads no setting sources
+        if not hasattr(hook, "_SETTING_SOURCES"):
+            parser.error(f"--setting-sources: {args.hook} reads no setting sources")
+        # Claude Code refuses a name it doesn't know, rather than load no source by it
+        unknown = {name.strip() for name in args.setting_sources.split(",")} - {""}
+        unknown -= hook.SETTING_SOURCES
+        if unknown:
+            parser.error(f"--setting-sources: not a setting source: {', '.join(sorted(unknown))}")
+        hook._SETTING_SOURCES = hook._setting_sources(
+            [hook.SETTING_SOURCES_FLAG, args.setting_sources]
+        )
 
     # Otherwise a typo in the option reads as the hook's own refusal. Asked of the hook itself,
     # which may be a copy that takes no `scratchpad_dir` at all.

@@ -75,6 +75,7 @@ TEST_PYTHON_VERSIONS ?= 3.12 3.13 3.14
 # approves no command that reaches one.
 # `SETTINGS` (settings files, separated by `:`) and `NO_RULES=1` (none) replace the project's
 # settings files, to audit an allow rule: see "Develop" in `AGENTS.md`.
+# `SETTING_SOURCES` is the session's `--setting-sources`, such as `user`: without it, every source.
 # `$HOME`, not `~`: zsh leaves a `~` after `=` in an argument as it is
 # (unless `magic_equal_subst` is set)
 PROJECT ?= ${CURDIR}
@@ -83,6 +84,7 @@ TRANSCRIPT ?=
 SCRATCHPAD_DIR ?=
 SETTINGS ?=
 NO_RULES ?=
+SETTING_SOURCES ?=
 HOOK ?= plugin/scripts/sh_auto_approve.py
 
 # The git revision whose hook `verdict-diff` compares the working copy's with. Empty: where HEAD
@@ -273,7 +275,8 @@ explain: ## Print the hook's verdict and reason for each command on stdin, or in
 	${PYTHON} -I -B tools/explain.py --project "${PROJECT}" --hook "${HOOK}" \
 		$(if ${TRANSCRIPT},--transcript="${TRANSCRIPT}") ${CWD_ARGS} \
 		$(if ${SCRATCHPAD_DIR},--scratchpad-dir="${SCRATCHPAD_DIR}") \
-		$(if ${SETTINGS},--settings="${SETTINGS}") $(if ${NO_RULES},--no-rules)
+		$(if ${SETTINGS},--settings="${SETTINGS}") $(if ${NO_RULES},--no-rules) \
+		$(if ${SETTING_SOURCES},--setting-sources="${SETTING_SOURCES}")
 
 .PHONY: verdict-diff
 verdict-diff: ## List the test commands whose verdict differs from the hook at BASE

@@ -2,6 +2,7 @@
 
 import itertools
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -548,6 +549,39 @@ class ExplainsATranscript(unittest.TestCase):
                     self.assertEqual(result.stdout, "")
                     self.assertIn(path.name, error_line(result))
         self.assertEqual(control[3], "ls")
+
+
+class ExplainsTheProjectFilesTheSessionApplies(unittest.TestCase):
+    """The project's own files, read as the hook reads them in the session: from the setting
+    sources it loaded, in a workspace Claude Code's config, in the scratch `HOME`, trusts."""
+
+    def test_the_setting_sources_the_session_loaded(self):
+        with tempfile.TemporaryDirectory(prefix="explain_sources_") as tmp:
+            home, project = Path(tmp, "home"), Path(os.path.realpath(tmp), "project")
+            (project / ".git").mkdir(parents=True)
+            (project / ".claude").mkdir()
+            home.mkdir()
+            rules = {"permissions": {"allow": ["Bash(gh release list *)"]}}
+            (project / ".claude" / "settings.local.json").write_text(json.dumps(rules))
+            records = {"projects": {str(project): {"hasTrustDialogAccepted": True}}}
+            (home / ".claude.json").write_text(json.dumps(records))
+
+            def decision(*args: str) -> str:
+                result = subprocess.run(
+                    [sys.executable, "-I", str(EXPLAIN), "--project", str(project), *args],
+                    input="gh release list --repo x\n",
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                    env={"PATH": os.environ["PATH"], "HOME": str(home)},
+                )
+                return result.stdout.split("\t")[0] or error_line(result)
+
+            self.assertEqual("allow", decision(), "every source, as without the flag")
+            self.assertEqual("allow", decision("--setting-sources", "user,local"))
+            self.assertEqual("no-opinion", decision("--setting-sources", "user"))
+            self.assertIn("not a setting source: lcoal", decision("--setting-sources", "lcoal"))
 
 
 if __name__ == "__main__":

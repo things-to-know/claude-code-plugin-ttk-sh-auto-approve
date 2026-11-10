@@ -85,7 +85,8 @@ from a command that prompted in a real session.
           RefusesGhApiCallsThatWriteOrLeak, ApprovesReadOnlyGhSubcommands,
           RefusesGhFlagsThatOpenOrWait, ReadsGhSearchQueries, RefusesGhJqThatReadsTheEnvironment
     14  The operator's own rules: the second tier
-          OperatorRules, OperatorRuleFileRobustness, ARepresentativeRuleFile
+          OperatorRules, OperatorRuleFileRobustness, ARepresentativeRuleFile,
+          AppliesOnlyTheProjectFilesClaudeCodeApplies
     15  The classifier as a function
           TheClassifierIsAPureFunction, SurvivesPathologicalInput, CostsBoundedTime
     16  Differential: ask bash instead of modeling it
@@ -876,7 +877,7 @@ class Verdicts:
 # one of these collects a command the operator granted -- `Bash(touch *)` is in
 # `REPRESENTATIVE_RULES` -- and reports the grant working as a bypass. A class that builds
 # a repository config asserts approvals that hold with that config only, the same way.
-RULE_DEPENDENT = ("operator_rules", "remotes_configured")
+RULE_DEPENDENT = ("operator_rules", "remotes_configured", "write_trust_records")
 
 
 def _literal_first_arguments(tree: ast.AST, method: str) -> list[str]:
@@ -6893,6 +6894,294 @@ class ARepresentativeRuleFile(Verdicts, unittest.TestCase):
         with operator_rules(**REPRESENTATIVE_RULES):
             self.assert_refused("cat a.md | tee b.md", "`Bash(tee *)` is denied")
             self.assert_refused("git add .", "`Bash(git add *)` is denied")
+
+
+# What a project's own files grant in `AppliesOnlyTheProjectFilesClaudeCodeApplies`: a command
+# only `.claude/settings.json`'s rule approves, one only `.claude/settings.local.json`'s does,
+# and, in its own test, a read only an `additionalDirectories` entry brings in scope
+PROJECT_RULE, PROJECT_RULED = "Bash(gh release list *)", "gh release list --repo x"
+LOCAL_RULE, LOCAL_RULED = "Bash(gh release view *)", "gh release view v1 --repo x"
+
+# Runs the command line after it, so that the process it runs has this one as its parent, with
+# that parent's command line holding whatever flags follow. It names itself in `CLAUDE_PID`, as
+# Claude Code does, unless the environment already names another process.
+PARENT_PROCESS = (
+    "import os, subprocess, sys\n"
+    "env = dict(os.environ, CLAUDE_PID=os.environ.get('CLAUDE_PID') or str(os.getpid()))\n"
+    "sys.exit(subprocess.run(sys.argv[1:3], env=env).returncode)\n"
+)
+
+
+class AppliesOnlyTheProjectFilesClaudeCodeApplies(Verdicts, unittest.TestCase):
+    """A project's own settings files grant only in a session where Claude Code applies them:
+    one that loaded their setting source, in a workspace it has a trust record for.
+
+    Elsewhere Claude Code ignores their allow rules and `additionalDirectories`, and approving
+    through them would grant what Claude Code alone refuses: `claude -p` in a folder never
+    trusted, or a session started with `--setting-sources user`. Each refusal has a control
+    beside it, the same command approved in the same layout once the record or the source is
+    there, so that a layout which grants nothing anyway fails instead of passing.
+
+    The records live in `.claude.json`, in the scratch `HOME` each test gets.
+    """
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="readonly_hook_trust_")
+        self.addCleanup(directory.cleanup)
+        self.tmp = Path(os.path.realpath(directory.name))
+        self.home = self.tmp / "home"
+        self.repository = self.tmp / "work" / "repository"
+        self.outside = self.tmp / "outside"
+        for path in (self.home, self.repository / ".git", self.outside):
+            path.mkdir(parents=True)
+        (self.outside / "f.txt").write_text("x\n")
+        environment = unittest.mock.patch.dict(os.environ, {"HOME": str(self.home)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in (
+            hook.SETTINGS_ENV,
+            hook.CONFIG_DIR_ENV,
+            hook.IGNORE_TRUST_ENV,
+            hook.CUSTOM_OAUTH_ENV,
+            hook.CLAUDE_PID_ENV,
+        ):
+            os.environ.pop(name, None)
+        self.start_session(self.repository)
+
+    def start_session(self, project: Path, sources=hook.SETTING_SOURCES) -> None:
+        """Run the module as `main` does in a session started in `project`, which gets both
+        files, and that loaded `sources`."""
+        for name, value in (("REPO_ROOT", project), ("_SETTING_SOURCES", frozenset(sources))):
+            patch = unittest.mock.patch.object(hook, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        (project / ".claude").mkdir(parents=True, exist_ok=True)
+        project_rules = {"allow": [PROJECT_RULE], "additionalDirectories": [str(self.outside)]}
+        (project / ".claude" / "settings.json").write_text(
+            json.dumps({"permissions": project_rules})
+        )
+        (project / ".claude" / "settings.local.json").write_text(
+            json.dumps({"permissions": {"allow": [LOCAL_RULE]}})
+        )
+
+    def write_trust_records(self, *keys: Path, config_dir: Path | None = None, value=True):
+        """Claude Code's global config, holding a trust record for each of `keys`."""
+        projects = {str(key): {"hasTrustDialogAccepted": value} for key in keys}
+        (config_dir or self.home).mkdir(parents=True, exist_ok=True)
+        ((config_dir or self.home) / ".claude.json").write_text(json.dumps({"projects": projects}))
+
+    def assert_granted(self, *, project=True, local=True, why=""):
+        """Each file's grant applies, or not, as given: the project file's rule and its
+        `additionalDirectories` entry, and the local file's rule."""
+        read = f"cat {self.outside}/f.txt"
+        for command, applies in ((PROJECT_RULED, project), (read, project), (LOCAL_RULED, local)):
+            with self.subTest(command=command, why=why):
+                (self.assert_allowed if applies else self.assert_refused)(command, why)
+
+    def test_a_trusted_workspace_gets_both_files(self):
+        self.write_trust_records(self.repository)
+        self.assert_granted(why="Claude Code applies both")
+
+    def test_a_workspace_with_no_trust_record_gets_neither(self):
+        self.assert_granted(project=False, local=False, why="no global config")
+        self.write_trust_records(self.tmp / "work")
+        self.assert_granted(project=False, local=False, why="a folder above holds the record")
+        self.write_trust_records(self.repository, value=False)
+        self.assert_granted(project=False, local=False, why="the record says false")
+        self.write_trust_records(self.repository)
+        self.assert_granted(why="the control")
+
+    def test_its_deny_rules_hold_all_the_same(self):
+        """Dropping a file costs a prompt only: its deny rules still refuse."""
+        (self.repository / ".claude" / "settings.json").write_text(
+            json.dumps({"permissions": {"deny": ["Bash(wc *)"]}})
+        )
+        self.assert_refused("wc -l README.md", "the untrusted file's deny rule matches")
+        (self.repository / ".claude" / "settings.json").write_text("{}")
+        self.assert_allowed("wc -l README.md", "the control: no deny rule")
+
+    def test_a_global_config_that_holds_no_record(self):
+        """An internal format, read strictly: whatever is not a record of `true` is no trust."""
+        config = self.home / ".claude.json"
+        key = json.dumps(str(self.repository))
+        for content in (
+            "{",
+            "[]",
+            '{"projects": []}',
+            f'{{"projects": {{{key}: true}}}}',
+            f'{{"projects": {{{key}: {{"hasTrustDialogAccepted": "true"}}}}}}',
+            f'{{"projects": {{{key}: {{"hasTrustDialogAccepted": 1}}}}}}',
+        ):
+            config.write_text(content)
+            self.assert_granted(project=False, local=False, why=content)
+        config.write_text(f'{{"projects": {{{key}: {{"hasTrustDialogAccepted": true}}}}}}')
+        self.assert_granted(why="the control")
+        config.unlink()
+        config.mkdir()
+        self.assert_granted(project=False, local=False, why="a directory where the file goes")
+
+    def test_only_the_sources_the_session_loaded(self):
+        self.write_trust_records(self.repository)
+        for sources, project, local in (
+            ({"user"}, False, False),
+            ({"user", "local"}, False, True),
+            ({"user", "project"}, True, False),
+            (set(), False, False),
+            ({"project", "local"}, True, True),
+        ):
+            with unittest.mock.patch.object(hook, "_SETTING_SOURCES", frozenset(sources)):
+                flag = f"--setting-sources {','.join(sorted(sources))}"
+                self.assert_granted(project=project, local=local, why=flag)
+
+    def test_while_claude_code_reads_no_record_or_another_file(self):
+        self.write_trust_records(self.repository)
+        for name in (hook.IGNORE_TRUST_ENV, hook.CUSTOM_OAUTH_ENV):
+            with unittest.mock.patch.dict(os.environ, {name: "1"}):
+                self.assert_granted(project=False, local=False, why=f"{name} is set")
+        self.assert_granted(why="the control")
+
+    def test_the_config_dir_claude_code_reads(self):
+        config_dir = self.tmp / "config"
+        self.write_trust_records(self.repository, config_dir=config_dir)
+        self.assert_granted(
+            project=False, local=False, why="the record is in CLAUDE_CONFIG_DIR, which is unset"
+        )
+        with unittest.mock.patch.dict(os.environ, {hook.CONFIG_DIR_ENV: str(config_dir)}):
+            self.assert_granted(why="the record is where Claude Code reads it")
+        self.write_trust_records(self.repository)
+        with unittest.mock.patch.dict(os.environ, {hook.CONFIG_DIR_ENV: "config"}):
+            self.assert_granted(project=False, local=False, why="a relative CLAUDE_CONFIG_DIR")
+
+    def test_a_legacy_config_file_leaves_trust_unknown(self):
+        self.write_trust_records(self.repository)
+        (self.home / ".claude").mkdir()
+        (self.home / ".claude" / ".config.json").write_text("{}")
+        self.assert_granted(
+            project=False, local=False, why="Claude Code may read .config.json instead"
+        )
+
+    def test_a_session_in_a_subdirectory_is_keyed_by_its_repository(self):
+        subdirectory = self.repository / "sub"
+        subdirectory.mkdir()
+        self.start_session(subdirectory)
+        self.write_trust_records(subdirectory)
+        self.assert_granted(
+            project=False, local=False, why="Claude Code keys the record by the repository"
+        )
+        self.write_trust_records(self.repository)
+        self.assert_granted(why="the control")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git, to make a worktree as git does")
+    def test_a_linked_worktree_is_keyed_by_its_main_worktree(self):
+        git = shutil.which("git")
+        environment = {
+            "PATH": os.environ["PATH"],
+            "HOME": str(self.home),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+        }
+        shutil.rmtree(self.repository / ".git")
+        worktree = self.tmp / "work" / "linked"
+        identity = ["-c", "user.name=x", "-c", "user.email=x@x"]
+        for args in (
+            ["init", "-q", "-b", "main"],
+            [*identity, "commit", "-q", "--allow-empty", "-m", "x"],
+            ["worktree", "add", "-q", "-b", "linked", str(worktree)],
+        ):
+            subprocess.run([git, "-C", str(self.repository), *args], env=environment, check=True)
+        self.start_session(worktree)
+        self.write_trust_records(worktree)
+        self.assert_granted(
+            project=False, local=False, why="Claude Code keys the record by the main worktree"
+        )
+        self.write_trust_records(self.repository)
+        self.assert_granted(why="the control")
+        pointer = self.repository / ".git" / "worktrees" / "linked" / "gitdir"
+        pointer.write_text(f"{self.tmp}/elsewhere/.git\n")
+        self.write_trust_records(self.repository, worktree)
+        self.assert_granted(
+            project=False, local=False, why="the main worktree's git dir doesn't point back"
+        )
+
+    def test_a_submodule_is_keyed_by_its_own_root(self):
+        """Its `.git` file names a git dir with no `commondir`."""
+        submodule = self.repository / "sub"
+        (self.repository / ".git" / "modules" / "sub").mkdir(parents=True)
+        submodule.mkdir()
+        (submodule / ".git").write_text("gitdir: ../.git/modules/sub\n")
+        self.start_session(submodule)
+        self.write_trust_records(self.repository)
+        self.assert_granted(project=False, local=False, why="the record is the superproject's")
+        self.write_trust_records(submodule)
+        self.assert_granted(why="the control")
+
+    def test_a_git_entry_that_is_a_link_leaves_the_key_unknown(self):
+        self.write_trust_records(self.repository)
+        self.assert_granted(why="the control")
+        (self.repository / ".git").rmdir()
+        (self.tmp / "git-dir").mkdir()
+        (self.repository / ".git").symlink_to(self.tmp / "git-dir")
+        self.assert_granted(project=False, local=False, why="a .git link")
+
+    def test_the_home_directory_holds_no_record(self):
+        """Claude Code never records the home directory's trust, so a session in a folder of a
+        dotfiles repository has none to read."""
+        notes = self.home / "notes"
+        notes.mkdir()
+        self.start_session(notes)
+        self.write_trust_records(notes)
+        self.assert_granted(why="the control")
+        (self.home / ".git").mkdir()
+        self.write_trust_records(self.home, notes)
+        self.assert_granted(project=False, local=False, why="the key is the home directory")
+
+    def test_the_sources_on_claude_codes_command_line(self):
+        every = hook.SETTING_SOURCES
+        for argv, expected in (
+            (["claude"], every),
+            (["claude", "-p", "x"], every),
+            (["claude", "--setting-sources", "user"], {"user"}),
+            (["claude", "--setting-sources=user,local"], {"user", "local"}),
+            (["claude", "--setting-sources", "user, project"], {"user", "project"}),
+            (["claude", "--setting-sources", ""], set()),
+            (["claude", "--setting-sources="], set()),
+            (["claude", "--setting-sources"], set()),
+            (["claude", "--setting-sources", "project", "--setting-sources=user"], set()),
+            (["claude", "-p", "--setting-sources user", "x"], every),
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(frozenset(expected), hook._setting_sources(argv))
+
+    @unittest.skipUnless(
+        sys.platform == "linux" or Path("/bin/ps").exists(), "reads the parent's command line"
+    )
+    def test_the_hook_reads_the_sources_from_its_parent(self):
+        """End to end: `main` reads `--setting-sources` from its parent's command line, and
+        reads nothing from a parent `CLAUDE_PID` doesn't name."""
+        self.write_trust_records(self.repository)
+        env = dict(os.environ, **{hook.PROJECT_DIR_ENV: str(self.repository)})
+        call = {"cwd": str(self.repository), "tool_name": "Bash"}
+        payload = json.dumps({**call, "tool_input": {"command": LOCAL_RULED}})
+
+        def verdict(*flags, **extra):
+            argv = [sys.executable, "-c", PARENT_PROCESS, sys.executable, str(MODULE_PATH)]
+            result = subprocess.run(
+                [*argv, *flags],
+                input=payload,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+                env={**env, **extra},
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            out = result.stdout
+            return out and json.loads(out)["hookSpecificOutput"]["permissionDecision"]
+
+        self.assertEqual("allow", verdict(), "the control: every source")
+        self.assertEqual("allow", verdict("--setting-sources=user,local"))
+        self.assertEqual("", verdict("--setting-sources", "user,project"))
+        self.assertEqual("", verdict(**{hook.CLAUDE_PID_ENV: "1"}), "another process's")
 
 
 # ======================================================================================

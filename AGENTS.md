@@ -192,6 +192,14 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   - The hook reads allow and deny rules, and `additionalDirectories`, only from the project's
     `.claude/settings.json` and `.claude/settings.local.json`; Claude Code alone applies a rule
     from any other settings file
+  - It takes a file's allow rules and `additionalDirectories` only where Claude Code applies the
+    file: in a workspace with a trust record in Claude Code's global config, from a setting
+    source the session loaded
+    - `claude -p` and the SDK run hooks in a workspace never trusted; an interactive session asks
+      for trust first
+    - The hook reads `--setting-sources` from Claude Code's command line, its parent process's
+    - `make explain` reads this machine's trust records; `SETTING_SOURCES=user` explains a
+      session started with `--setting-sources user`
   - `NO_RULES=1` and `SETTINGS=<file>` replace those 2 files, `additionalDirectories` included
   - `NO_RULES=1`: whether the hook approves the rule's command without the rule
     - If it does, the rule is redundant wherever the hook runs. It stays silent below
