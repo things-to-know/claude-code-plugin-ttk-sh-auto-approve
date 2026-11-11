@@ -29,6 +29,8 @@ insists on its own filename, symlink to this file rather than copying it.
   an earlier hook and the working copy's, each asked in its test's context
 - `pyproject.toml` and `uv.lock` pin the dev tools (`coverage`, `ruff`), which `uv` installs
   into `.venv`; neither ships
+- `docs/` holds the guides that would grow `README.md` too long: installing from a clone, and
+  releasing
 
 ## Rules for the approval hook
 
@@ -264,28 +266,8 @@ other change: where a fix rewrote content that was correct, revert it and adjust
 
 ## Release
 
-1. Merge to `main` with CI green.
-2. In the catalog repo, set this plugin's `source.sha` to the merged commit
-   (full 40-character lowercase sha):
-
-   <!-- editorconfig-checker-disable: a JSON string cannot be wrapped -->
-   ```json
-   {
-     "name": "ttk-sh-auto-approve",
-     "description": "Auto-approves Bash commands it can prove are read-only, and restores the final newline a Write loses",
-     "source": {
-       "source": "git-subdir",
-       "url": "things-to-know/claude-code-plugin-ttk-sh-auto-approve",
-       "path": "plugin",
-       "sha": "<sha>"
-     }
-   }
-   ```
-   <!-- editorconfig-checker-enable -->
-
-3. Users receive it through marketplace auto-update, if they turned it on, or
-   `claude plugin marketplace update <catalog>` followed by
-   `claude plugin update ttk-sh-auto-approve@<catalog>`.
+[docs/release.md](docs/release.md) has the steps: merge, point the catalog's `source.sha` at the
+merge commit, update the installed copy, and check it took.
 
 ## Public repository
 
