@@ -3119,7 +3119,7 @@ class CurlStopsAtTheListedSites(Verdicts, unittest.TestCase):
             self.assert_no_opinion("curl -sSfL 'https://peps.python.org/pep-0008/'")
             self.assert_no_opinion("curl -s --location 'https://peps.python.org/pep-0008/'")
             self.assert_no_opinion(
-                "curl -sL --proto-redir =https 'https://peps.python.org/pep-0008/'"
+                "curl -sL --proto-redir '=https' 'https://peps.python.org/pep-0008/'"
             )
 
     def test_a_file_is_written_only_by_the_redirect(self):
@@ -4362,6 +4362,138 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             self.assert_allowed("pushd src; grep -rl PRIVATE .", "the control")
             self.assert_no_opinion("pushd ~-; grep -rl PRIVATE .")
 
+    def test_a_tilde_prefix_the_shell_holds(self):
+        """`~-` is `$OLDPWD`, `~+` `$PWD` and `~1` an entry of the directory stack, and zsh reads
+        `~name` as a named directory before a user's home, `~HOME` and `~OLDPWD` included (#83).
+        `os.path.expanduser` left each as a name in the project. With `OLDPWD` the home, bash 5.2
+        printed the key for `cat ~-/.ssh/id_rsa` and listed it for `grep -rl PRIVATE ~-` and
+        `p=~-; grep -rl PRIVATE "$p"`, and zsh 5.9 did the same for `~HOME`. zsh's `dirstack`
+        array is the directory stack, so a command fills it with no `pushd`: zsh 5.9 printed the
+        key for `dirstack=~; cat ~1/.ssh/id_rsa`."""
+        with a_project_below_home():
+            for command in (
+                "grep -rl PRIVATE src",
+                "cat ~/a/b/proj/README.md",
+                'p=~/a/b/proj/src; grep -rl PRIVATE "$p"',
+                "cat '~-/x'",  # a directory named `~-`
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            for command in (
+                "cat ~-/.ssh/id_rsa",
+                "cat ~HOME/.ssh/id_rsa",
+                "cat ~1/../.ssh/id_rsa",
+                "wc -l < ~-/.ssh/id_rsa",
+                "x=~OLDPWD/.ssh/id_rsa; cat $x",
+                "dirstack=~; cat ~1/.ssh/id_rsa",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
+            for command in (
+                "grep -rl PRIVATE ~-",
+                "grep -rl PRIVATE ~HOME",
+                'p=~-; grep -rl PRIVATE "$p"',
+                "p=~OLDPWD; grep -rl PRIVATE $p",
+                "cat ~+/README.md",
+                "cat ~-1/README.md",
+                "git -C ~- log -1",
+                "dirstack=~; grep -rl PRIVATE ~1",
+                "for dirstack in ~; do grep -rl PRIVATE ~1; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command)
+            self.assert_allowed("wc -l < README.md", "the control")
+            self.assert_refused("wc -l < ~-/README.md")
+
+    @unittest.skipUnless(Path("~root").expanduser() == Path("/root"), "needs root's home at /root")
+    def test_a_user_home_bash_reads(self):
+        """bash reads `~root` as root's home, a credential store, which zsh reads only when no
+        named directory has the name. Layer B reads both."""
+        with a_project_below_home():
+            self.assert_allowed("cat README.md", "the control")
+            self.assert_refused_outright("cat ~root/x")
+
+    def test_a_word_zsh_replaces_with_a_commands_path(self):
+        """zsh replaces an unquoted `=name` with the path of the command `name`, so `cat =ls` is
+        `cat /usr/bin/ls`, a file on `PATH` that neither layer reads, and bash reads a file named
+        `=ls` (#61). It does the same in an assignment's value, at its start or after a `:`, both
+        of which a quoted part or an expansion can supply, and with `magic_equal_subst` in any
+        word with a `=`. Refused outright, as zsh's other expansions are. zsh 5.9 read
+        `/usr/bin/ls` for each, as `DifferentialAgainstZsh` checks."""
+        for command in (
+            "cat '=ls'",
+            "grep -c x \\=ls AGENTS.md",
+            "wc -l < '=ls'",
+            "head -c 4 AGENTS.md",
+            "test a = b",  # a `=` on its own
+            "x=a=b; echo $x",
+            "x=a'b'=c; echo $x",
+            "x=a:'='ls; echo $x",
+            "cut -d= -f2 AGENTS.md",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "the control")
+        for command in (
+            "cat =ls",
+            "grep -c x =ls",
+            "head -c 4 =ssh",
+            "wc -l < =ls",
+            "wc -l <=ls",
+            "ls -l =ssh",
+            'cat ="ls"',
+            "for f in =ls; do cat $f; done",
+            "test a == b",
+            "x==ls; cat $x",
+            "x+==ls; cat $x",
+            "x=a:=ls; echo $x",
+            "x=a':'=ls; echo $x",
+            "p=; x=$p=ls; cat $x",
+            "grep --file==ls AGENTS.md",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused_outright(command)
+
+    def test_an_input_redirection_through_a_link_or_after_a_move(self):
+        """A `<` target is read as an operand is: from each directory the shell may be in, and
+        through the links on disk (#77). It was measured by its text, so `cat < sub/out/hostname`
+        read `outside/hostname` through the link `sub/out`, and so did `wc -l < hostname` after
+        `pushd ../outside`, which bash 5.2 and zsh 5.9 each read. Refused outright, as an
+        absolute target outside is: a rule matches the command with the redirection stripped,
+        so `Bash(wc *)` would approve it."""
+        with a_project_below_home() as project:
+            outside = project.parent / "outside"
+            outside.mkdir()
+            (outside / "hostname").write_text("one\n")
+            (project / "sub").mkdir()
+            (project / "sub" / "x.txt").write_text("one\n")
+            (project / "sub" / "out").symlink_to(outside)
+            for command in (
+                "cat < README.md",
+                "cat < sub/x.txt",
+                "cd src && wc -l < lib/x.txt",
+                "cd src && x=$(wc -l < lib/x.txt); echo $x",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            self.assert_no_opinion("cat sub/out/hostname", "the control: read as an operand")
+            for command in (
+                "cat < sub/out/hostname",
+                "cd sub && wc -l < out/hostname",
+                "cd sub && x=$(wc -l < out/hostname); echo $x",
+                "cat < src/../README.md",  # a `..` is refused as it was, wherever it leads
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
+            with operator_rules(allow=["Bash(pushd *)", "Bash(wc *)"]):
+                self.assert_allowed("pushd sub && wc -l < x.txt", "the control")
+                self.assert_allowed("pushd ../outside && wc -l hostname", "the rule's to grant")
+                for command in (
+                    "pushd ../outside && wc -l < hostname",
+                    'pushd "$d" && wc -l < x.txt',
+                ):
+                    with self.subTest(command=command):
+                        self.assert_refused_outright(command)
+
     def test_a_read_from_a_directory_the_shell_supplies(self):
         """After `pushd "$d"` the shell can be anywhere, and so can every program after it,
         however the words it reads are spelled (#72). One `d=src` is the one value `d` holds."""
@@ -4417,6 +4549,35 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             self.assert_allowed("pushd ~; git status", "a rule approves each program")
             self.assert_refused_outright(
                 "pushd ~; git log --output=PWNED", "a validator's refusal still stands"
+            )
+
+    def test_a_second_operand_that_rewrites_the_directory(self):
+        """zsh's `pushd old new` and `cd old new` go to the working directory with its first
+        `old` replaced by `new`, so the shell picks the directory, wherever the first operand
+        leads (#82). From `~/a/b/proj`, zsh 5.9 moved to `~/.ssh` for `pushd a/b/proj .ssh` and
+        grepped the key there, and to `~/a` for `pushd a/b/proj a`; bash 5.2 refused the second
+        operand and stayed. Layer B reads `.ssh` below that directory, as it reads a word after
+        `pushd "$d"`."""
+        with a_project_below_home(), operator_rules(allow=["Bash(pushd *)"]):
+            for command in (
+                "pushd src; grep -rl PRIVATE .",
+                "pushd src >/dev/null 2>&1; grep -rl PRIVATE .",
+                "echo pushd a b; ls",  # a word `pushd` that is no command moves nothing
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control")
+            for command in (
+                "pushd a/b/proj a; grep -rl PRIVATE .",
+                "pushd -- a/b/proj a; grep -rl PRIVATE .",
+                "pushd proj x; git status",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command)
+            self.assert_refused_outright("pushd a/b/proj .ssh; grep -rl PRIVATE .")
+        with a_project_below_home():
+            self.assert_allowed("cd src; grep -rl PRIVATE .", "the control")
+            self.assert_refused_outright(
+                "cd a/b/proj .ssh; grep -rl PRIVATE .", "`cd` takes one operand here"
             )
 
     def test_a_glob_that_climbs_past_its_directory(self):
@@ -6996,7 +7157,9 @@ class RefusesGhFlagsThatOpenOrWait(Verdicts, unittest.TestCase):
         self.assert_allowed("gh pr list --head '~' --search '=ls'", "the control")
         self.assert_no_opinion("gh pr list --head ~", "both shells make it $HOME")
         self.assert_no_opinion("gh pr list --search ~+", "both shells make it $PWD")
-        self.assert_no_opinion("gh pr list --search =ls", "zsh makes it the path of ls")
+        self.assert_refused_outright(
+            "gh pr list --search =ls", "zsh makes it the path of ls, for every program (#61)"
+        )
         self.assert_no_opinion(
             "gh pr list --search=~+", "neither shell expands it, but any unquoted `~` counts"
         )
@@ -7064,12 +7227,13 @@ class ReadsGhSearchQueries(Verdicts, unittest.TestCase):
 
     def test_a_word_the_shell_rewrites_is_not_read(self):
         """Both shells rewrite an unquoted `~`, and zsh a word that starts with `=`, so the
-        query sent is not the words the hook read: `~+` sends the working directory to GitHub."""
+        query sent is not the words the hook read: `~+` sends the working directory to GitHub.
+        The `=` is refused outright, for every program (#61)."""
         self.assert_allowed("gh search issues crash '~+' '~' 'x=~' '=ls'", "the control")
         self.assert_no_opinion("gh search issues crash ~+", "both shells make it $PWD")
         self.assert_no_opinion("gh search issues crash ~", "both shells make it $HOME")
         self.assert_no_opinion("gh search issues crash x=~", "bash makes it x=$HOME")
-        self.assert_no_opinion("gh search issues =ls", "zsh makes it the path of ls")
+        self.assert_refused_outright("gh search issues =ls", "zsh makes it the path of ls")
         self.assert_no_opinion("gh search issues -- crash ~+", "after the terminator too")
 
     def test_a_repository_filter_is_owner_slash_repo(self):
@@ -8425,6 +8589,23 @@ class DifferentialAgainstZsh(unittest.TestCase):
                     self.assertFalse(tried, "zsh tried the plant with its own module_path")
                     continue
                 self.assertTrue(tried, "zsh tried no plant: a dead case")
+                self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
+
+    # #61: zsh replaces an unquoted `=ls` with the path of `ls`, and bash reads a file named
+    # `=ls`, which the tree doesn't hold. They change nothing, so each is told by what it prints
+    EQUALS_READS = (
+        "wc -c =ls",
+        "wc -c <=ls",
+        "x==ls; wc -c $x",
+        "p=; x=$p=ls; wc -c $x",
+    )
+
+    def test_a_word_zsh_replaces_with_a_commands_path(self):
+        for command in self.EQUALS_READS:
+            with self.subTest(command=command), scratch_tree() as root:
+                read = run_in_zsh(command, root).stdout
+                self.assertTrue(read.strip(), "zsh read no command's file: a dead case")
+                self.assertEqual("", run_in_bash(command, root).stdout, "bash read a file")
                 self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
 
     def test_no_approved_command_mutates_the_tree_in_zsh(self):

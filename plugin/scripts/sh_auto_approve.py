@@ -27,7 +27,7 @@ Thus, every rule here has to hold under both grammars. Decisions for this hook:
   - ``${(e)x}``
   - ``$~x``
   - glob qualifiers
-  - ``=(...)``
+  - ``=(...)``, and ``=ls`` for the path of ``ls``
   - ``echo`` interpreting escapes without ``-e``
   - ``printf '%d'`` evaluating its argument
 
@@ -1353,9 +1353,13 @@ def _literal_assignments(
                 continue
             # Bash expands a leading tilde in an assignment's value, so `x=~/a` holds the
             # home-relative path, not the two characters. Storing the expansion is what lets
-            # the read scope see where `"$x"` really points.
+            # the read scope see where `"$x"` really points. `x=~-` holds `$OLDPWD`, which
+            # the shell holds: no value here to read.
             if value_token.startswith("~"):
-                expanded_value = os.path.expanduser(expanded_value)
+                directory = _tilde_expansion(expanded_value)
+                if directory is None:
+                    continue
+                expanded_value = directory
             assigned[name] = expanded_value.split()
     return assigned
 
@@ -1501,14 +1505,28 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
 def _tilde_expansion(text: str) -> str | None:
     """The directory a word starting with an unquoted `~` names, or None where the shell picks it.
 
-    `~` and `~/x` are in the home directory, and `~user` in that user's. `~+` and `~-` are
-    `$PWD` and `$OLDPWD`, and `~1`, `~+1` and `~-1` entries of the directory stack, which the
-    shell holds: `os.path.expanduser` leaves each as the text it is, a name in the project.
+    `~` and `~/x` are in the home directory. Any other prefix is a value the shell holds:
+    `~+` and `~-` are `$PWD` and `$OLDPWD`, and `~1`, `~+1` and `~-1` entries of the directory
+    stack. zsh reads `~name` as a named directory before a user's home: one a startup file's
+    `hash -d` names, or a parameter whose value starts with `/`, as `~HOME` and `~OLDPWD` are.
+    `os.path.expanduser` leaves each of these as the text it is, a name in the project, unless a
+    user has the name, whose home directory bash reads.
     """
-    head = text[1:].split("/", 1)[0]
-    if head[:1] in ("+", "-") or head.isdigit():
+    if text[1:].split("/", 1)[0]:
         return None
     return os.path.expanduser(text)
+
+
+def _tilde_word(text: str) -> str:
+    """``text``, which starts with an unquoted `~`, with its prefix read by `_tilde_expansion`.
+
+    Where the shell picks the directory, it is `UNREAD_VALUE`, and the rest of the word below it.
+    """
+    directory = _tilde_expansion(text)
+    if directory is not None:
+        return directory
+    _, slash, rest = text.partition("/")
+    return UNREAD_VALUE + slash + rest
 
 
 def _literal_loop_values(
@@ -1911,7 +1929,7 @@ def _known_values(
             if name in splice_vars:
                 value = _expand(value_token, parts)
                 if value_token.startswith("~"):
-                    value = os.path.expanduser(value)
+                    value = _tilde_word(value)
                 values[name] = [value]
     return {name: values.get(name) for name in bindings}
 
@@ -4710,9 +4728,12 @@ def _is_under(path: str, root: str) -> bool:
 
 
 def _expand_home(text: str, *, tilde: bool) -> str:
-    """Replace a leading `~`, `~user`, `$HOME` or `${HOME}` with the directory it names."""
+    """Replace a leading `~`, `$HOME` or `${HOME}` with the directory it names.
+
+    Any other tilde prefix, as `~-` and `~name`, is `UNREAD_VALUE`: `_tilde_word`.
+    """
     if tilde and text.startswith("~"):
-        return os.path.expanduser(text)
+        return _tilde_word(text)
     for spelling in ("${HOME}", "$HOME"):
         if text.startswith(spelling):
             return _home() + text[len(spelling) :]
@@ -4756,6 +4777,14 @@ def _names_a_credential_unguarded(
         tilde = True
     if not text:
         return False
+    # `_expand_home` reads `~name` as `UNREAD_VALUE`, which zsh can take from a named directory;
+    # bash takes the home directory of the user `name`, when there is one, read here
+    if tilde and text.startswith("~") and _tilde_expansion(text) is None:
+        user_home = os.path.expanduser(text)
+        if user_home != text and _names_a_credential_unguarded(
+            user_home, tilde=False, bases=bases, live_glob=live_glob
+        ):
+            return True
     text = _expand_home(text, tilde=tilde)
     if UNREAD_VALUE in text:
         unread = [text]
@@ -4881,7 +4910,9 @@ def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[s
 
     Where the program spells no target, the shell picks it, and the target is `UNREAD_VALUE`:
     `pushd -` goes to `$OLDPWD`, `pushd +1` and `pushd -0` to an entry of the directory stack,
-    and a bare `cd` to `$HOME`. So does a target `_tilde_expansion` doesn't read, as `pushd ~-`.
+    and a bare `cd` to `$HOME`. So does a target `_tilde_expansion` doesn't read, as `pushd ~-`,
+    and one with a second operand: zsh's `cd old new` and `pushd old new` go to the working
+    directory with its first `old` replaced by `new`, which bash refuses.
     """
     targets = []
     program = _program_index(words)
@@ -4889,7 +4920,7 @@ def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[s
         if _expand(word, parts) not in DIRECTORY_CHANGERS:
             continue
         spelled = None
-        for following in words[index + 1 :]:
+        for position, following in enumerate(words[index + 1 :], start=index + 1):
             target = _expand(following, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
             if target in DIRECTORY_CHANGER_OPTIONS:
                 continue
@@ -4898,7 +4929,8 @@ def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[s
                     target = _tilde_expansion(target) or UNREAD_VALUE
                 if _carries_live_glob(following):
                     raise NotReadOnly(f"cd to a directory a wildcard picks: {target}")
-                spelled = target
+                if index != program or position == len(words) - 1:
+                    spelled = target
             break
         if spelled is not None:
             targets.append(spelled)
@@ -4935,13 +4967,13 @@ def _directory_word(token: str, parts: list[tuple[str, str]]) -> str:
     """The directory ``token``, a word of its own, names for a program that changes to it.
 
     A command's output, and a wildcard the shell expands, which picks the directory, are
-    `UNREAD_VALUE`. A leading `~` is the home directory. A variable stays as spelled, for
+    `UNREAD_VALUE`. A leading `~` is read by `_tilde_word`. A variable stays as spelled, for
     `_spellings`.
     """
     if _carries_live_glob(token):
         return UNREAD_VALUE
     text = _expand(token, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
-    return os.path.expanduser(text) if token.startswith("~") else text
+    return _tilde_word(text) if token.startswith("~") else text
 
 
 def _changed_directories(
@@ -5294,7 +5326,10 @@ def _read_scope_problem(
     if SUBSTITUTION_MARKER in text:
         return "a path produced by a command"
     if token.startswith("~"):
-        text = os.path.expanduser(text)
+        directory = _tilde_expansion(text)
+        if directory is None:
+            return f"a path in a directory the shell picks: {text}"
+        text = directory
     candidates = _resolve_variables(text, scope)
     if candidates is None:
         return "a path this module cannot resolve"
@@ -5688,29 +5723,77 @@ def _resolves_into_scratch(path: str) -> bool:
         return False  # a path that cannot be resolved is not one to vouch for
 
 
-def _readable_input_target(target: str, parts: list[tuple[str, str]], roots: list[str]) -> bool:
-    """Whether ``< target`` names a file the operator wrote out, not one the shell computes.
+def _zsh_equals_expansion(token: str, parts: list[tuple[str, str]]) -> bool:
+    """Whether zsh replaces part of this word with the path of a command, `=ls` with `/usr/bin/ls`.
+
+    zsh does so for an unquoted `=` that starts a word and has more after it, and in an
+    assignment's value for one that starts the value or follows a `:`, as in `x==ls` and
+    `x=a:=ls`. With `magic_equal_subst`, which a startup file can set, every word with a `=` is
+    read as an assignment is, as `--file==ls` is. A quoted part or an expansion can supply the
+    `:`, or nothing at all: `x=a':'=ls` and `p=; x=$p=ls` each expand. A `=` on its own, as in
+    `test a = b`, is left as it is. ``token`` is a reduced word, so a quoted `=` is in ``parts``,
+    and expands nothing.
+    """
+    if token.startswith("=") and len(token) > 1:
+        return True
+    _, equals, value = token.partition("=")
+    if not equals:
+        return False
+    for index, char in enumerate(value):
+        if char != "=":
+            continue
+        before = _expand(value[:index], parts).rpartition(":")[2]
+        if not before or "$" in before or SUBSTITUTION_MARKER in before:
+            return True
+    return False
+
+
+def _input_target(target: str, parts: list[tuple[str, str]]) -> str | None:
+    """The file ``< target`` reads, when the operator wrote it out, not the shell; else None.
 
     The pseudo-device check in ``_classify`` reads literal text, so a target assembled at
     runtime -- ``"$x$y"``, ``"/dev/"'tcp/h/80'``, a glob -- is exactly what it cannot see.
-    Such a target is left in place for ``_segments`` to refuse as an unaccounted ``<``.
+    Such a target, a relative one with a ``..``, and one below a directory the shell picks, as
+    ``~-/x``, is left in place for ``_segments`` to refuse as an unaccounted ``<``. Whether
+    the file is in the working directories is `_check_input_targets`'s, once they are known.
     """
     if re.search(r"[$*?\[\]{}`\\]", PLACEHOLDER.sub("", target)):
-        return False
+        return None
     for index in PLACEHOLDER.findall(target):
         kind, value = parts[int(index)]
         if kind == SUBSTITUTION or (kind == DOUBLE_QUOTED and "$" in value):
-            return False
+            return None
     expanded = PLACEHOLDER.sub(lambda match: parts[int(match.group(1))][1], target)
     if NETWORK_DEVICE.search(expanded) is not None:
-        return False
-    # The read scope applies to `<` as it does to an operand: a target outside the working
-    # directories is left in place, and `_segments` refuses it as an unaccounted `<`.
+        return None
     if target.startswith("~"):
-        expanded = os.path.expanduser(expanded)
-    if expanded.startswith("/"):
-        return _in_scope(expanded, _ReadScope(roots, [str(REPO_ROOT)], {}, {}))
-    return ".." not in Path(expanded).parts
+        directory = _tilde_expansion(expanded)
+        if directory is None:
+            return None
+        expanded = directory
+    if not expanded.startswith("/") and ".." in Path(expanded).parts:
+        return None
+    return expanded
+
+
+def _check_input_targets(targets: list[str], scope: _ReadScope) -> None:
+    """Refuse the command where a file a ``<`` reads, `_input_target`, is outside ``scope``.
+
+    The read scope applies to ``<`` as it does to an operand: an absolute file is measured as
+    it is, and a relative one from each directory the shell may be in, through the links on
+    disk, so ``sub/out/x`` is outside where ``sub/out`` leads out (#77). A directory below a
+    value this module didn't read is none to place it in. Refused outright, as a target left
+    in place is: an allow rule matches the command with the redirection stripped.
+    """
+    for target in targets:
+        paths = (
+            [target]
+            if target.startswith("/")
+            else [os.path.join(base, target) for base in scope.bases]
+        )
+        for path in paths:
+            if UNREAD_VALUE in path or not _in_scope(path, scope):
+                raise NotReadOnly(f"< reads outside the working directories: {target}")
 
 
 def _classify(command: str, depth: int = 0) -> None:
@@ -5777,6 +5860,16 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         if ZSH_PARAMETER_FLAGS.search(text) or ZSH_GLOB_SUBST.search(text):
             raise NotReadOnly("zsh expansion that re-evaluates a value")
 
+    # zsh replaces `=ls` with the path of `ls`, a file on `PATH` that neither layer reads, and
+    # bash leaves it as it is. Read before the redirections are stripped, so that a `<` target
+    # is a word here too.
+    for line in reduced.split("\n"):
+        for token in _tokenize(line):
+            if _zsh_equals_expansion(token, parts):
+                raise NotReadOnly(
+                    f"zsh replaces a word with the path of a command: {_expand(token, parts)}"
+                )
+
     # Read once, for both tiers: the read roots below and the operator's rules further down.
     settings = _settings_permissions()
     roots = _read_roots(settings)
@@ -5791,12 +5884,17 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
             lambda match: " " if _resolves_into_scratch(match["target"]) else match.group(0),
             stripped,
         )
-    stripped = FILE_INPUT_REDIRECT.sub(
-        lambda match: (
-            " " if _readable_input_target(match.group(1), parts, roots) else match.group(0)
-        ),
-        stripped,
-    )
+    # Each `<` target stripped here is checked once the working directories are known
+    input_targets: list[str] = []
+
+    def strip_input(match: re.Match) -> str:
+        target = _input_target(match.group(1), parts)
+        if target is None:
+            return match.group(0)
+        input_targets.append(target)
+        return " "
+
+    stripped = FILE_INPUT_REDIRECT.sub(strip_input, stripped)
 
     # A newline separates commands exactly as `;` does, but shlex counts it as
     # whitespace and glues `ls\nrm` into one word, so the split happens here. A newline
@@ -5855,16 +5953,6 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # whatever tier would otherwise approve it.
     _refuse_credential_paths(reduced, parts, state)
 
-    # A substitution runs a command wherever it sits, so each body is classified by these
-    # same rules before the word it produces is looked at, in this command's shell state.
-    # Everything above refuses outright or not at all, and the segments below can have no
-    # opinion, so a body's refusal still comes first. The shell runs a process substitution
-    # without waiting for it, as it runs a job behind `&`: `true <(curl x)` returns at once.
-    detached = _ShellState(bases, shell_bases, known_values, bindings, backgrounds=True)
-    for kind, value in parts:
-        if kind in RUNS_A_COMMAND:
-            _classify_with(value, depth + 1, detached if kind == PROCESS_SUBSTITUTION else state)
-
     # Where readers may read. A relative path must be in scope from each working directory: a
     # `cd` inside a pipeline does not move the shell that runs the next command, so the module
     # does not guess which one applies.
@@ -5877,6 +5965,17 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         settings=settings,
         backgrounds=backgrounds,
     )
+    _check_input_targets(input_targets, scope)
+
+    # A substitution runs a command wherever it sits, so each body is classified by these
+    # same rules before the word it produces is looked at, in this command's shell state.
+    # Everything above refuses outright or not at all, and the segments below can have no
+    # opinion, so a body's refusal still comes first. The shell runs a process substitution
+    # without waiting for it, as it runs a job behind `&`: `true <(curl x)` returns at once.
+    detached = _ShellState(bases, shell_bases, known_values, bindings, backgrounds=True)
+    for kind, value in parts:
+        if kind in RUNS_A_COMMAND:
+            _classify_with(value, depth + 1, detached if kind == PROCESS_SUBSTITUTION else state)
 
     # A move to a directory the read scope doesn't vouch for leaves every program to the rules,
     # wherever it stands, since a program reads where it runs (#72). What a validator refuses
