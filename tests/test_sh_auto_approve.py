@@ -2403,6 +2403,28 @@ class AllowsALoopVariableBoundToLiterals(Verdicts, unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_refused(command)
 
+    def test_a_list_word_is_read_with_the_values_the_command_sets(self):
+        """#84: an expansion glued to literal text in the list is read with the value the
+        command gives it, so `${o}utput=PWNED` with `o=--o` is the flag `--output=PWNED`."""
+        self.assert_allowed('for p in AGENTS.md; do git log -1 "$p"; done', "the control")
+        self.assert_allowed(
+            '_p=proj; for f in "${_p}-a" "${_p}-b"; do gcloud projects describe "$f"; done',
+            "the control: a value the command sets that makes no flag",
+        )
+        self.assert_allowed('o=a; for p in ${o}x; do sed -n "$p" AGENTS.md; done', "the control")
+        for command in (
+            'o=--o; for p in ${o}utput=PWNED; do git log -1 "$p"; done',
+            'o=--o; for p in "${o}utput=PWNED"; do git log -1 "$p"; done',
+            'o=-; for p in ${o}i; do sed "$p" s/one/1/ AGENTS.md; done',
+            'o=-; for p in ${o}iPWNED; do sed "$p" s/one/1/ AGENTS.md; done',
+            # A name bound twice holds a value this module didn't read
+            'o=x; o=-; for p in ${o}i; do sed "$p" s/one/1/ AGENTS.md; done',
+            # bash splits an unquoted value: `a -ix` is the words `a` and `-ix`
+            "o='a -i'; for p in ${o}x; do sed \"$p\" s/one/1/ AGENTS.md; done",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command)
+
     def test_the_exemption_does_not_cover_a_write_in_the_body(self):
         self.assert_refused(
             'for f in a.md; do sort "$f" -o PWNED; done', "an output flag is still a write"
@@ -8246,6 +8268,9 @@ class DifferentialAgainstBash(unittest.TestCase):
         'o=-oPWNED; echo "$(sort $o AGENTS.md; o=-u)"',
         'o=-oPWNED; echo "$(o+=; sort $o AGENTS.md)"',
         'p=$(echo -oPWNED); echo "$(sort "$p" AGENTS.md; for p in AGENTS.md; do true; done)"',
+        # #84: a loop list word glued to a value the command sets. `-iPWNED` edits in place
+        # and keeps a backup, `AGENTS.mdPWNED`
+        'o=-; for p in ${o}iPWNED; do sed "$p" s/one/1/ AGENTS.md; done',
     ) + (
         # `e` is GNU sed's execute command, and the only entry here that runs a program
         ("cat AGENTS.md | sed '/one/e touch PWNED'",) if HAS_GNU_SED else ()

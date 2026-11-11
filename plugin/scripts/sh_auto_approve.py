@@ -1273,7 +1273,10 @@ def _is_bare_expansion_of(token: str, parts: list[tuple[str, str]], names: froze
 # body, `for p in a; do p=-i; ...`, or a zsh header that binds it second, `for q p in x -i`,
 # leaves it bound to a value no header spells.
 def _safe_loop_names(
-    segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
+    segments: list[list[str]],
+    parts: list[tuple[str, str]],
+    bindings: dict[str, int],
+    known_values: dict[str, list[str] | None],
 ) -> frozenset[str]:
     safe: dict[str, int] = {}
     for segment in segments:
@@ -1281,7 +1284,7 @@ def _safe_loop_names(
             continue
         name = _expand(segment[1], parts)
         values = segment[3:]
-        if values and all(_value_is_literal_non_flag(word, parts) for word in values):
+        if values and all(_value_is_literal_non_flag(word, parts, known_values) for word in values):
             safe[name] = safe.get(name, 0) + 1
     return frozenset(name for name, count in safe.items() if bindings.get(name) == count)
 
@@ -2075,18 +2078,28 @@ def _arg_variants(
     return [list(variant) for variant in itertools.product(*choices) if list(variant) != args]
 
 
-def _value_is_literal_non_flag(token: str, parts: list[tuple[str, str]]) -> bool:
+def _value_is_literal_non_flag(
+    token: str, parts: list[tuple[str, str]], known_values: dict[str, list[str] | None]
+) -> bool:
     """A single loop-list value that the operator wrote out and that is not a flag.
 
-    It must carry no expansion, substitution, glob or brace the shell would still act on --
-    anything that leaves the final text up to the shell disqualifies it -- and the literal
-    it does spell must not begin with `-`.
+    It must carry no substitution, glob or brace the shell would still act on, and not be
+    nothing but expansions, as `_word_the_shell_decides` reads them. An expansion glued to
+    literal text is read with the values the command sets, as `_word_shapes` reads an
+    argument's: `o=--o; for p in ${o}utput=x` is `--output=x`. No shape may begin with `-`, nor
+    be one `_flag_an_expansion_spells`, and an unquoted expansion must hold a value bash
+    neither splits nor globs, as `_unclean_expansion` reads it.
     """
     if _word_the_shell_decides(token, parts) or _carries_substitution(token, parts):
         return False
     if _carries_live_glob(token) or _carries_brace_expansion(token):
         return False
-    return not _expand(token, parts).startswith("-")
+    if _unclean_expansion(token, known_values) is not None:
+        return False
+    shapes = _word_shapes(token, parts, known_values)
+    return shapes is not None and not any(
+        shape.startswith("-") or _flag_an_expansion_spells(shape) for shape in shapes
+    )
 
 
 def _word_the_shell_decides(token: str, parts: list[tuple[str, str]]) -> bool:
@@ -6012,12 +6025,6 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     for name, count in (inherited.bindings if inherited else {}).items():
         bindings[name] = bindings.get(name, 0) + count
 
-    # Loop variables whose `in` list is all literal non-flag words. Collected across every
-    # segment first, because the header that binds a name and the body that uses it are
-    # separate segments, and `_strip_structure` discards the header. A bare `"$name"` of
-    # one of these is exempt from the flag check inside `_check_command`; nothing else is.
-    safe_names = _safe_loop_names(segments, parts, bindings)
-
     # Variables assigned a fully literal value in this command. A `$name`/`${name}`/`${=name}`
     # that uses one is spliced into its words and checked as the flags it is, which is how a
     # `_p='--profile x --region y'` hoisted out of repeated vendor calls stops prompting.
@@ -6031,6 +6038,13 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
             known_values[name] = None
         else:
             known_values[name] = [*values, *known_values[name]]
+
+    # Loop variables whose `in` list is all literal non-flag words, with the values the command
+    # sets in place. Collected across every segment first, because the header that binds a name
+    # and the body that uses it are separate segments, and `_strip_structure` discards the
+    # header. A bare `"$name"` of one of these is exempt from the flag check inside
+    # `_check_command`; nothing else is.
+    safe_names = _safe_loop_names(segments, parts, bindings, known_values)
 
     # Where a relative word may be resolved from, worked out once for the credential check, the
     # read scope and each substitution's body
