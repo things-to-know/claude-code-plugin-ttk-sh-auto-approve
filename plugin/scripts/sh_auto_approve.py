@@ -4362,6 +4362,14 @@ def _check_command(
     # own allow rules decide, as they do for any program the module cannot read.
     if program in READER_SPECS:
         _check_read_scope(program, _file_operands(program, args), args, arg_tokens, parts, scope)
+    # And for a link it follows while it recurses, wherever the link is (#63)
+    if program in LINK_FOLLOWERS:
+        links = _followed_links(program, args, arg_tokens, parts, scope.bases, known_values)
+        # The link by its own path, which `_in_scope` resolves as the scratchpad is resolved:
+        # its target alone is out of a scratchpad whose path goes through a link, as on macOS
+        for link, _ in links:
+            if not _in_scope(link, scope):
+                raise NoOpinion(f"{program} follows the link {link} out of the working directories")
 
 
 def _check_read_scope(
@@ -4941,7 +4949,8 @@ def _names_a_credential_unguarded(
     if not text.startswith("/") and not relative_partial and relative_directory in ("", "."):
         # The wildcard or expansion reads the base itself, as `*` and `"$f"` do: the read
         # scope's question. No base is in a credential store, `_working_directories` sees to
-        # that, and a link in one is read by neither layer, as for `grep -R x .`
+        # that, and a link in one that the wildcard matches is read by neither layer (#54); one
+        # a reader follows while it recurses is `_refuse_followed_credential_links`'
         return False
     for absolute in spellings:
         prefix = absolute[: len(absolute) - len(text) + special.start()]
@@ -5703,14 +5712,17 @@ def _short_flag(arg: str, takes_value: set[str], *, bundles: bool) -> tuple[str,
     return arg, 0
 
 
-def _file_operands(program: str, args: list[str]) -> list[tuple[int, int]]:
+def _file_operands(
+    program: str, args: list[str], spec: dict | None = None
+) -> list[tuple[int, int]]:
     """Where in `args` the words this reader will open as files are.
 
     Each entry is an index into `args`, and where the path starts in that word: past
     `--from-file=` or `-rf` when it is attached to its flag, 0 when the word is all path.
-    Raises `NoOpinion` for a flag in `file_lists`, whose files no word names.
+    Raises `NoOpinion` for a flag in `file_lists`, whose files no word names. `spec` is the
+    reader's `READER_SPECS` entry, unless given.
     """
-    spec = READER_SPECS[program]
+    spec = READER_SPECS[program] if spec is None else spec
     values = spec.get("values", set())
     attached_values = spec.get("attached_values", set())
     files = spec.get("files", set())
@@ -5776,6 +5788,520 @@ def _file_operands(program: str, args: list[str]) -> list[tuple[int, int]]:
             found.append((index, 0))
         index += 1
     return found
+
+
+# The readers that follow a link they meet while they recurse, and so read wherever it leads
+# from a directory that is in scope: `grep -R x .` with `k -> ~/.ssh` in it prints the key (#63).
+# `grep -r`, `rg`, `find`, `ls -R` and `du` without these follow only a link the command line
+# names, which both layers resolve. Each with the spec its operands are read by, and:
+# - `short` and `long`: the flags that make it follow; a long one by any prefix of at least
+#   `long_prefix` letters, as getopt_long reads it
+# - `recursive`: the flags it needs as well, unless it always recurses
+# - `stop`: the long flags that stop it, `diff --no-dereference`
+# - `default`: whether no operand is the working directory
+# - `pattern_free`: the flags that leave no pattern operand, as `rg --files` does
+RG_SPEC = {
+    "pattern": True,
+    "script_flags": {"-e", "--regexp", "-f", "--file", "--files", "--type-list"},
+    "values": {
+        "-A",
+        "-B",
+        "-C",
+        "-E",
+        "-M",
+        "-T",
+        "-d",
+        "-e",
+        "-f",
+        "-g",
+        "-j",
+        "-m",
+        "-r",
+        "-t",
+        "--after-context",
+        "--before-context",
+        "--color",
+        "--colors",
+        "--context",
+        "--context-separator",
+        "--dfa-size-limit",
+        "--encoding",
+        "--engine",
+        "--field-context-separator",
+        "--field-match-separator",
+        "--file",
+        "--glob",
+        "--hostname-bin",
+        "--hyperlink-format",
+        "--iglob",
+        "--ignore-file",
+        "--max-columns",
+        "--max-count",
+        "--max-depth",
+        "--max-filesize",
+        "--path-separator",
+        "--pre",
+        "--pre-glob",
+        "--regex-size-limit",
+        "--regexp",
+        "--replace",
+        "--sort",
+        "--sortr",
+        "--threads",
+        "--type",
+        "--type-add",
+        "--type-clear",
+        "--type-not",
+    },
+}
+LINK_FOLLOWERS = {
+    "grep": {
+        "spec": READER_SPECS["grep"],
+        "short": "RS",  # `-S` is ugrep's, which Claude Code's `grep` runs: links to files
+        "long": ("--dereference-recursive", "--dereference-files"),
+        # `--der`: `--de` is ambiguous with `--devices` and `--directories`, `--der` is not
+        "long_prefix": 5,
+        "default": True,
+    },
+    "rg": {"spec": RG_SPEC, "short": "L", "long": ("--follow",), "default": True},
+    "diff": {
+        "spec": READER_SPECS["diff"],
+        "follows_by_default": True,
+        "stop": ("--no-dereference",),
+        "long_prefix": 5,
+    },
+    "find": {"short": "L", "default": True},
+    "ls": {
+        "spec": READER_SPECS["ls"],
+        "short": "L",
+        "long": ("--dereference",),
+        "recursive": ("R", "--recursive"),
+        "default": True,
+    },
+    "du": {"spec": READER_SPECS["du"], "short": "L", "long": ("--dereference",), "default": True},
+}
+for _name in ("egrep", "fgrep", "ugrep", "ug"):
+    LINK_FOLLOWERS[_name] = LINK_FOLLOWERS["grep"]
+
+# Programs that hand the program after them operands no word of the command spells: from the
+# input, or each file a search finds
+OPERANDS_FROM_ELSEWHERE = frozenset({"find", "parallel", "xargs"})
+
+# The most directory entries the walk for `LINK_FOLLOWERS` reads for one command. Past it, the
+# command is refused outright: a link it didn't reach could lead into a credential store, and
+# an operator's rule for the reader would approve it.
+MAX_WALKED_ENTRIES = 50000
+
+
+def _short_letters(word: str, values: set[str]) -> str:
+    """The flag letters a single-dash ``word`` sets, up to the first that takes a value."""
+    letters = ""
+    for letter in word[1:]:
+        letters += letter
+        if "-" + letter in values:
+            break
+    return letters
+
+
+def _follow_depth(program: str, args: list[str]) -> int | None:
+    """How deep the reader `program` follows the links in its directory operands.
+
+    None where it doesn't follow one, 0 where it follows them all the way down, and 1 where it
+    reads only a directory's own entries, as `diff` without `-r` does.
+    """
+    follower = LINK_FOLLOWERS[program]
+    spec = follower.get("spec", {})
+    values = spec.get("values", set()) | spec.get("files", set())
+    long_prefix = follower.get("long_prefix", 0)
+    follows = recursive = False
+    stopped = False
+    always_recursive = "recursive" not in follower and program != "diff"
+
+    def long_match(name: str, flags: tuple[str, ...]) -> bool:
+        return any(
+            name == flag or (long_prefix and len(name) >= long_prefix and flag.startswith(name))
+            for flag in flags
+        )
+
+    expression = False
+    for index, arg in enumerate(args):
+        if arg == "--":
+            break
+        if program == "find":
+            # Its options come before the paths; `-follow` is an expression anywhere after them
+            if arg == "-follow":
+                follows = True
+            elif not expression and arg.startswith("-") and arg not in ("-H", "-L", "-P"):
+                expression = True
+            elif not expression and arg == "-L":
+                follows = True
+            continue
+        if not arg.startswith("-") or arg == "-":
+            continue
+        if index and args[index - 1] in values:
+            continue  # the value of the flag before it
+        if arg.startswith("--"):
+            name = arg.partition("=")[0]
+            follows = follows or long_match(name, follower.get("long", ()))
+            stopped = stopped or long_match(name, follower.get("stop", ()))
+            recursive = recursive or long_match(name, follower.get("recursive", ("",))[1:])
+            if program == "diff":
+                recursive = recursive or long_match(name, ("--recursive",))
+        else:
+            letters = _short_letters(arg, values)
+            follows = follows or any(letter in letters for letter in follower.get("short", ""))
+            recursive = recursive or any(
+                letter in letters for letter in follower.get("recursive", ("",))[0]
+            )
+            if program == "diff":
+                recursive = recursive or "r" in letters
+    if program == "diff":
+        if stopped:
+            return None
+        return 0 if recursive else 1
+    if not follows or not (always_recursive or recursive):
+        return None
+    return 0
+
+
+def _follower_operands(program: str, args: list[str]) -> list[int]:
+    """The indexes in `args` of the directories a `LINK_FOLLOWERS` reader reads."""
+    if program == "find":
+        operands = []
+        for index, arg in enumerate(args):
+            if arg in ("-H", "-L", "-P"):
+                continue
+            if arg.startswith(("-", "(", "!")):
+                break
+            operands.append(index)
+        return operands
+    spec = LINK_FOLLOWERS[program].get("spec", {})
+    return [index for index, start in _file_operands(program, args, spec) if not start]
+
+
+def _followed_links(
+    program: str,
+    args: list[str],
+    tokens: list[str],
+    parts: list[tuple[str, str]],
+    bases: list[str],
+    values: dict[str, list[str] | None],
+    *,
+    operands_elsewhere: bool = False,
+) -> list[tuple[str, str]]:
+    """Each link a `LINK_FOLLOWERS` reader follows in its directory operands, and where it leads.
+
+    Each place it leads to is one of its `_resolutions`, and the links the command makes count,
+    `_PLANNED_LINKS`. An operand is each of its `_spellings`, with ``values`` as `_known_values`
+    reads them, and a wildcard the shell expands is each name it matches. An operand, or a
+    working directory, below a value this module didn't read is the residual a recursive read of
+    it is, as `grep -r x "$d"`: not walked. Raises `NotReadOnly` for operands that come from
+    elsewhere, as `xargs grep -R x` takes them, and for a walk past `MAX_WALKED_ENTRIES`.
+
+    The walk reads every entry, ignore files or not, and follows each link into where it leads
+    as the reader does, so a link in a directory outside the project is found too.
+    """
+    depth = _follow_depth(program, args)
+    if depth is None:
+        return []
+    if operands_elsewhere:
+        raise NotReadOnly(f"{program} follows links below directories no word of the command names")
+    indexes = _follower_operands(program, args)
+    directories: list[str] = []
+    for index in indexes:
+        token, text = tokens[index], args[index]
+        whole = PLACEHOLDER.fullmatch(token)
+        if whole is not None and parts[int(whole.group(1))][0] == PROCESS_SUBSTITUTION:
+            continue  # `<(...)`: a pipe, not a directory
+        if token.startswith("~"):
+            text = _tilde_word(text)
+        spellings = _spellings(text, values, bases, before=False)
+        if not _carries_live_glob(token):
+            directories += spellings
+            continue
+        # A wildcard is matched once the shell has put each value in place: `d=a/b; ... "$d"/*`
+        for spelled in spellings:
+            if UNREAD_VALUE in spelled:
+                directories.append(spelled)  # the residual: see the docstring
+                continue
+            if GLOB_FROM_ITS_DIRECTORY.search(spelled) and depth:
+                depth = 0  # the literal directory holds the matches at any depth
+            directories += _glob_matches(spelled, bases)
+    if not indexes and LINK_FOLLOWERS[program].get("default"):
+        directories.append(".")
+    roots: list[str] = []
+    for directory in directories:
+        for base in bases if not directory.startswith("/") else [""]:
+            if UNREAD_VALUE in base or UNREAD_VALUE in directory:
+                continue  # the residual: see the docstring
+            if directory in ("", "."):
+                roots.append(base)
+            else:
+                roots.append(os.path.join(base, directory) if base else directory)
+    return _walk_for_links(roots, depth)
+
+
+# A wildcard `_glob_matches` doesn't match by its parts: `**`, which zsh, and bash with
+# `globstar`, read as any depth, and zsh's `***`, which follows links as it recurses; a collating
+# element, `[[.ch.]]`, which can be several characters; and the operators of bash's `extglob` and
+# zsh's `EXTENDED_GLOB`, which a startup file can set, `[^...]` among them. Such a pattern is
+# walked from the directory its literal part names instead, which holds every name it matches:
+# the walk follows each link below it anyway.
+GLOB_FROM_ITS_DIRECTORY = re.compile(r"\*\*|\[\[\.|[()|#^<>]|(?<!^)~")
+
+# How many bytes of UTF-8 a character can take: in the C locale, `?` and `[...]` match one byte
+MAX_CHARACTER_BYTES = 4
+
+
+def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
+    """Each path a wildcard the shell expands may match, from each of ``bases``: more, never fewer.
+
+    Every reading a startup file can choose is taken at once, so that none is missed: dot files
+    match, as with `dotglob` or zsh's `GLOB_DOTS`; a name matches whatever its case, as with
+    `nocaseglob` or zsh's `NO_CASE_GLOB`, which reads a literal component that way too; and a run
+    of `?` and `[...]`, each a byte in the C locale, matches from a quarter as many characters to
+    as many. A set, `[[:alpha:]]` and `[!x]` included, is any one of them. A pattern
+    `GLOB_FROM_ITS_DIRECTORY` holds is its literal directory instead, which a recursive walk
+    covers. Past `MAX_WALKED_ENTRIES` names, `NotReadOnly`.
+    """
+    if GLOB_FROM_ITS_DIRECTORY.search(pattern):
+        head = PATH_SPECIAL.split(pattern, 1)[0]
+        return [head.rsplit("/", 1)[0] or "/" if "/" in head else "."]
+    components = [component for component in pattern.split("/") if component]
+    starts = ["/"] if pattern.startswith("/") else [b for b in bases if UNREAD_VALUE not in b]
+    matches: list[str] = []
+    for start in starts:
+        current = [start]
+        for index, component in enumerate(components):
+            regex = _glob_component_regex(component)
+            last = index == len(components) - 1
+            found: list[str] = []
+            for directory in current:
+                try:
+                    names = os.listdir(directory)
+                except (OSError, ValueError):
+                    names = []
+                if regex is None:
+                    chosen = [name for name in names if name.casefold() == component.casefold()]
+                    if component in (".", ".."):
+                        chosen.append(component)
+                else:
+                    chosen = [name for name in names if regex.fullmatch(name)]
+                    # bash before 5.2 matches `.` and `..` with a pattern that starts with `.`
+                    if component.startswith("."):
+                        chosen += [name for name in (".", "..") if regex.fullmatch(name)]
+                for name in dict.fromkeys(chosen):
+                    path = os.path.join(directory, name)
+                    if last or os.path.isdir(path):
+                        found.append(path)
+                if len(found) + len(matches) > MAX_WALKED_ENTRIES:
+                    raise NotReadOnly(
+                        f"a wildcard that matches more than {MAX_WALKED_ENTRIES} names"
+                    )
+            current = found
+        matches += current
+    return matches
+
+
+def _glob_component_regex(component: str) -> re.Pattern[str] | None:
+    """The names one component of a wildcard may match, as `_glob_matches` reads them.
+
+    None for a component with no wildcard.
+    """
+    parts: list[str] = []
+    singles = 0
+    wildcard = False
+
+    def flush() -> None:
+        nonlocal singles
+        if singles:
+            parts.append(f".{{{-(-singles // MAX_CHARACTER_BYTES)},{singles}}}")
+            singles = 0
+
+    index = 0
+    while index < len(component):
+        character = component[index]
+        if character == "*":
+            flush()
+            parts.append(".*")
+            wildcard = True
+            index += 1
+        elif character == "?":
+            singles += 1
+            wildcard = True
+            index += 1
+        elif character == "[":
+            end = _bracket_end(component, index)
+            singles += 1  # a set is one character; an unmatched `[` is the character itself
+            wildcard = True
+            index = index + 1 if end is None else end + 1
+        else:
+            flush()
+            parts.append(re.escape(character))
+            index += 1
+    flush()
+    if not wildcard:
+        return None
+    return re.compile("".join(parts), re.DOTALL | re.IGNORECASE)
+
+
+def _bracket_end(text: str, start: int) -> int | None:
+    """The index of the `]` that ends the set opening at ``start``, or None for a literal `[`.
+
+    A `]` right after the `[`, or after its `!` or `^`, is a member, and so is each `[:...:]`
+    and `[=...=]` class whole.
+    """
+    index = start + 1
+    if index < len(text) and text[index] in "!^":
+        index += 1
+    if index < len(text) and text[index] == "]":
+        index += 1
+    while index < len(text):
+        if text[index] == "]":
+            return index
+        if text.startswith(("[:", "[="), index):
+            close = text.find(text[index + 1] + "]", index + 2)
+            if close < 0:
+                return None
+            index = close + 2
+            continue
+        index += 1
+    return None
+
+
+# The walks `_walk_for_links` made for the command being classified, by roots, depth and the
+# links the command makes: Layer B and Layer A each ask, and `_classify` may read a command more
+# than once. Reset by `_classify`.
+_WALKS: dict[tuple, list[tuple[str, str]]] = {}
+
+
+def _walk_for_links(roots: list[str], depth: int) -> list[tuple[str, str]]:
+    """`_followed_links`' walk, from each of ``roots``, to ``depth`` levels, or all with 0.
+
+    A root is each of its `_resolutions`, so one an `ln` in the command makes, or one whose
+    path goes through a link, is walked where it leads, and reported as a link to there.
+    """
+    key = (
+        tuple(roots),
+        depth,
+        tuple(sorted((link, tuple(sorted(targets))) for link, targets in _PLANNED_LINKS.items())),
+    )
+    if key not in _WALKS:
+        _WALKS[key] = _walk_for_links_uncached(roots, depth)
+    return _WALKS[key]
+
+
+def _walk_for_links_uncached(roots: list[str], depth: int) -> list[tuple[str, str]]:
+    """`_walk_for_links`, without the cache.
+
+    Each directory is listed where it resolves, and its entries are named below the path the walk
+    came by, so that a link is reported by a path the read scope places as the shell does: one in
+    a scratchpad under macOS's `/tmp -> /private/tmp` is in the scratchpad. A directory is listed
+    once, by where it resolves.
+    """
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    count = 0
+    stack: list[tuple[str, int]] = []
+    for root in roots:
+        try:
+            resolutions = _resolutions(root)
+        except (OSError, ValueError):
+            raise NotReadOnly(f"a directory this module can't resolve: {root}") from None
+        found += [
+            (root, resolved) for resolved in resolutions if resolved != os.path.normpath(root)
+        ]
+        stack.append((root, 1))
+    while stack:
+        directory, level = stack.pop()
+        try:
+            reals = _resolutions(directory)
+        except (OSError, ValueError):
+            raise NotReadOnly(f"a directory this module can't resolve: {directory}") from None
+        entries: list[tuple[str, bool, bool]] = []
+        for real in reals:
+            if real in seen or not os.path.isdir(real):
+                continue
+            seen.add(real)
+            try:
+                with os.scandir(real) as listing:
+                    entries += [
+                        (
+                            os.path.join(directory, entry.name),
+                            entry.is_symlink(),
+                            entry.is_dir(follow_symlinks=False),
+                        )
+                        for entry in listing
+                    ]
+            except (OSError, ValueError):
+                continue  # what the walk can't list, the reader can't either
+            entries += [
+                (os.path.join(directory, os.path.basename(key)), True, False)
+                for key in _PLANNED_LINKS
+                if os.path.dirname(key) == real
+            ]
+        count += len(entries)
+        if count > MAX_WALKED_ENTRIES:
+            raise NotReadOnly(
+                f"a read that follows links below more than {MAX_WALKED_ENTRIES} entries"
+            )
+        deeper = depth == 0 or level < depth
+        for path, is_link, is_directory in entries:
+            if is_link:
+                try:
+                    targets = _resolutions(path)
+                except (OSError, ValueError):
+                    raise NotReadOnly(f"a link this module can't resolve: {path}") from None
+                found += [(path, target) for target in targets]
+            if (is_link or is_directory) and deeper:
+                stack.append((path, level + 1))
+    return found
+
+
+def _refuse_followed_credential_links(
+    segments: list[list[str]], parts: list[tuple[str, str]], state: _ShellState
+) -> None:
+    """Layer B, for the links a reader follows while it recurses.
+
+    Refuses the command outright if one leads into a credential store, or to a directory that
+    holds one, as `~` does.
+
+    Every segment, whatever tier approves it: under `Bash(grep *)`, `grep -R x .` reads `~/.ssh`
+    through `k -> ~`, and no word names it. The reader is the program, or any word after one
+    that runs another, `RUNS_ANOTHER_PROGRAM`. A reader behind a program that gives it operands
+    of its own, as `xargs grep -R x` is, is refused: no word names what it reads.
+    """
+    stores = [os.path.realpath(store) for store in _credential_roots()]
+    for segment in segments:
+        start = _command_index(segment, refuse=False)
+        if start is None:
+            continue
+        tokens = segment[start:]
+        words = [_expand(token, parts) for token in tokens]
+        # The program, or any word after one that runs another, as `timeout 5 grep -R` does
+        wrapper = os.path.basename(words[0]) if words else ""
+        runs_another = wrapper in RUNS_ANOTHER_PROGRAM or wrapper in OPERANDS_FROM_ELSEWHERE
+        for index, word in enumerate(words if runs_another else words[:1]):
+            program = os.path.basename(word)
+            if program not in LINK_FOLLOWERS:
+                continue
+            elsewhere = index > 0 and wrapper in OPERANDS_FROM_ELSEWHERE
+            links = _followed_links(
+                program,
+                words[index + 1 :],
+                tokens[index + 1 :],
+                parts,
+                state.shell_bases,
+                state.values,
+                operands_elsewhere=elsewhere,
+            )
+            for link, target in links:
+                if _names_a_credential(target, tilde=False, bases=[], live_glob=False) or any(
+                    _is_under(store, target) for store in stores
+                ):
+                    raise NotReadOnly(
+                        f"{program} follows the link {link} to a credential store: {target}"
+                    )
 
 
 def _scratch_directory() -> str | None:
@@ -6197,6 +6723,7 @@ def _classify(command: str, depth: int = 0) -> None:
     """
     global _PLANNED_LINKS  # noqa: PLW0603 - per command, as `_SESSION_CWD` is per call
     _PLANNED_LINKS = {}
+    _WALKS.clear()
     try:
         for _ in range(MAX_LINK_PASSES):
             known = {key: set(targets) for key, targets in _PLANNED_LINKS.items()}
@@ -6206,6 +6733,7 @@ def _classify(command: str, depth: int = 0) -> None:
         raise NotReadOnly("links that make further links, past what this module reads")
     finally:
         _PLANNED_LINKS = {}
+        _WALKS.clear()
 
 
 def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> None:
@@ -6362,8 +6890,9 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     _record_planned_links(segments, parts, shell_bases)
 
     # Layer B: no word may name a credential store, whatever program it belongs to and
-    # whatever tier would otherwise approve it.
+    # whatever tier would otherwise approve it, nor may a link a reader follows lead to one.
     _refuse_credential_paths(reduced, parts, state)
+    _refuse_followed_credential_links(segments, parts, state)
 
     # Where readers may read. A relative path must be in scope from each working directory: a
     # `cd` inside a pipeline does not move the shell that runs the next command, so the module

@@ -61,7 +61,8 @@ from a command that prompted in a real session.
      8  Redirection, sockets, and egress
           RefusesDescriptorAndSocketRedirection, RefusesRedirectionAttachedToACompound,
           RefusesReadsOutsideTheWorkingDirectories, ResolvesThroughALinkTheCommandMakes,
-          RefusesACredentialStoreAWildcardOrABaseReaches, RefusesAScratchPathThroughALinkOut,
+          RefusesALinkARecursiveReadFollows, RefusesACredentialStoreAWildcardOrABaseReaches,
+          RefusesAScratchPathThroughALinkOut,
           RefusesEgressThroughAnApprovedProgram
      9  Program identity, environment, and session state
           RefusesControlOfTheEnvironmentAndTheProgram, StripsTheWrapperTheHostStrips,
@@ -4887,6 +4888,267 @@ class ResolvesThroughALinkTheCommandMakes(Verdicts, unittest.TestCase):
             ):
                 with self.subTest(command=command):
                     self.assert_refused(command)
+
+
+class RefusesALinkARecursiveReadFollows(Verdicts, unittest.TestCase):
+    """#63: a reader that follows links while it recurses reads wherever one below its operand
+    leads, and both layers measured only the operand. With `k -> ~/.ssh` in the project,
+    `grep -R PRIVATE k` was refused and `grep -R PRIVATE .` approved, and it printed the key.
+
+    Now the directory operands of `LINK_FOLLOWERS` are walked: a link to a credential store, or
+    to a directory that holds one, refuses the command outright, under any rule, and one out of
+    the working directories leaves it to the rules. In `a_project_below_home`, with `d1/` holding
+    no link, `src/lib2 -> ~/.ssh`, and `d2/o` leading to `~/a/b/outside`, which holds no store.
+    """
+
+    @contextlib.contextmanager
+    def _project(self):
+        with a_project_below_home() as project:
+            home = Path(os.environ["HOME"])
+            (project / "d1").mkdir()
+            (project / "d1" / "y.txt").write_text("one\n")
+            (project / "src" / "lib2").symlink_to(home / ".ssh")
+            outside = project.parent / "outside"
+            outside.mkdir()
+            (outside / "f").write_text("one\n")
+            (project / "d2").mkdir()
+            (project / "d2" / "o").symlink_to(outside)
+            yield project, home
+
+    REFUSED_AND_CONTROLS = (
+        ("grep -R PRIVATE .", "grep -r PRIVATE ."),
+        ("grep --dereference-recursive PRIVATE .", "grep -r PRIVATE ."),
+        ("grep --dereference PRIVATE .", "grep -r PRIVATE ."),
+        ("grep --der PRIVATE .", "grep --de PRIVATE ."),
+        ("grep -rS PRIVATE .", "grep -r PRIVATE ."),
+        ("grep -R PRIVATE src", "grep -R PRIVATE d1"),
+        ("grep -m 5 -R PRIVATE", "grep -m 5 -R PRIVATE d1"),
+        ("timeout 5 grep -R PRIVATE .", "timeout 5 grep -R PRIVATE d1"),
+        ("diff -rN . d1", "diff -rN d1 src/lib"),
+        ("diff -N src d1", "diff -N d1 src/lib"),
+        ("find -L . -name id_rsa", "find . -name id_rsa"),
+        ("find . -follow -name id_rsa", "find -L d1 -name id_rsa"),
+        ("ls -RL", "ls -R"),
+        ("ls -R --dereference src", "ls -RL d1"),
+        ("du -L", "du"),
+    )
+
+    def test_a_link_to_a_credential_store(self):
+        with self._project():
+            for refused, control in self.REFUSED_AND_CONTROLS:
+                with self.subTest(refused=refused):
+                    self.assert_refused_outright(refused, "reads ~/.ssh through a link")
+                    self.assert_allowed(control, "follows no link to it")
+            self.assert_allowed("diff -r --no-dereference . d1", "the control: follows none")
+
+    def test_under_a_rule_for_the_reader(self):
+        """Layer B: no word names the store, and the rule approves the reader itself."""
+        rules = ["Bash(grep *)", "Bash(rg *)", "Bash(find *)", "Bash(ls *)", "Bash(xargs *)"]
+        rules.append("Bash(ln *)")
+        with self._project(), operator_rules(allow=rules):
+            for refused, control in (
+                ("grep -R PRIVATE .", "grep -r PRIVATE ."),
+                ("rg -L PRIVATE", "rg PRIVATE"),
+                ("rg --follow PRIVATE .", "rg --follow PRIVATE d1"),
+                ("rg -e PRIVATE -L src", "rg -e PRIVATE -L d1"),
+                ("xargs grep -R PRIVATE < list.txt", "xargs grep -r PRIVATE < list.txt"),
+                ("ln -s src j && grep -R PRIVATE j", "ln -s d1 j && grep -R PRIVATE j"),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_refused(refused, "the rule approves it, and it reads ~/.ssh")
+                    self.assert_allowed(control, "the rule approves it")
+
+    def test_a_link_to_a_directory_that_holds_a_store(self):
+        """`~` is no store, and a recursive read of it reads `~/.ssh`, so is a link below a
+        directory outside the project, which the walk follows into."""
+        with self._project() as (project, home):
+            self.assert_allowed("grep -R one d1", "the control")
+            (project / "d1" / "h").symlink_to(home)
+            self.assert_refused_outright("grep -R one d1", "reads ~/.ssh through d1/h")
+            (project / "d1" / "h").unlink()
+            (project.parent / "outside" / "h").symlink_to(home)
+            self.assert_refused_outright("grep -R one d2", "reads ~/.ssh through d2/o/h")
+            self.assert_allowed("grep -r one d2", "the control: follows neither link")
+
+    def test_a_link_out_of_the_working_directories(self):
+        """No store: the read scope's question, and so the rule's."""
+        with self._project():
+            self.assert_allowed("grep -r one d2", "the control")
+            self.assert_no_opinion("grep -R one d2", "reads ~/a/b/outside through d2/o")
+            with operator_rules(allow=["Bash(grep *)"]):
+                self.assert_allowed("grep -R one d2", "the rule approves it")
+
+    def test_a_link_the_command_makes(self):
+        """#79's links count: `j` isn't there when the hook runs, as an entry of a directory
+        walked or as the operand itself."""
+        with self._project(), operator_rules(allow=["Bash(ln *)"]):
+            self.assert_allowed("ln -s ../src/lib d1/j && grep -R one d1", "the control")
+            self.assert_refused_outright("ln -s ~ d1/j && grep -R PRIVATE d1", "reads ~/.ssh")
+            self.assert_allowed("ln -s d1 j && grep -R one j", "the control")
+            self.assert_refused_outright("ln -s src j && grep -R PRIVATE j", "src/lib2 leads out")
+
+    def test_an_operand_the_shell_builds(self):
+        """A value the command sets, and a wildcard's matches, are walked. One this module
+        didn't read is the residual a recursive read of it is, as `grep -r x "$d"`: the read
+        scope's, and so the rules'."""
+        with self._project():
+            self.assert_allowed('f=d1; grep -R one "$f"', "the control: d1 holds no link")
+            self.assert_refused_outright('f=src; grep -R PRIVATE "$f"', "src/lib2 leads out")
+            self.assert_allowed("diff -u README.md *.md", "the control: no directory matches")
+            self.assert_refused_outright("grep -R one *", "matches k and src")
+            self.assert_allowed("grep -R one d1*", "the control: matches d1 alone")
+            for command in ('grep -R one "$DIR"', 'diff "$A" "$B"'):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "a value this module didn't read")
+                    with operator_rules(allow=["Bash(grep *)", "Bash(diff *)"]):
+                        self.assert_allowed(command, "the rule approves it")
+
+    def test_a_wildcard_that_recurses(self):
+        """zsh's `**` and `***`, and bash's `**` with `globstar`, match at any depth, which `glob`
+        doesn't: the walk starts where the literal part ends. Here only `a/b/d1/k -> ~` leads
+        out, three levels down."""
+        with self._project() as (project, home):
+            (project / "k").unlink()
+            (project / "src" / "lib2").unlink()
+            (project / "a" / "b" / "d1").mkdir(parents=True)
+            (project / "a" / "b" / "d1" / "k").symlink_to(home)
+            self.assert_allowed("grep -R one src/**", "the control: src holds no link")
+            self.assert_allowed("grep -r PRIVATE **/d1", "the control: follows none")
+            for command in (
+                "grep -R PRIVATE **/d1",
+                "grep -R PRIVATE ***/d1",
+                "grep -R PRIVATE */*/d1",
+                "grep -R PRIVATE a/[^z]",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through a/b/d1/k")
+
+    def test_a_wildcard_read_every_way_a_shell_can(self):
+        """A startup file can make the shell match more than `fnmatch` does: `nocaseglob` and
+        zsh's `NO_CASE_GLOB`, which reads a literal component that way too, and the C locale,
+        where `?` matches one byte of `é`. Both shells read `[[:alpha:]]` as a letter, which
+        `fnmatch` reads as the set `[:alph` and a `]`. Each is matched every way at once; a
+        collating element, which can be several characters, sends the walk to the directory."""
+        with self._project() as (project, home):
+            (project / "k").unlink()
+            (project / "src" / "lib2").unlink()
+            for name in ("d1", "\u00e91", "x1"):
+                (project / "a" / "b" / name).mkdir(parents=True)
+            (project / "a" / "b" / "d1" / "k").symlink_to(home)
+            (project / "a" / "b" / "\u00e91" / "k").symlink_to(home)
+            self.assert_allowed("grep -R PRIVATE a/b/x*", "the control: x1 holds no link")
+            self.assert_allowed("grep -R PRIVATE a/b/x?", "the control")
+            self.assert_allowed("grep -r PRIVATE a/b/[[:alpha:]]1", "the control: follows none")
+            for command in (
+                "grep -R PRIVATE a/b/[[:alpha:]]1",
+                "grep -R PRIVATE a/b/[[:alnum:]]*",
+                "grep -R PRIVATE a/b/[!x]1",
+                "grep -R PRIVATE a/b/D*",
+                "grep -R PRIVATE A/b/d*",
+                "grep -R PRIVATE a/b/??1",
+                "grep -R PRIVATE a/b/[[.d.]]1",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(
+                        command, "reads ~/.ssh through a/b/d1 or a/b/\u00e91"
+                    )
+
+    def test_a_wildcard_built_from_a_value_the_command_sets(self):
+        """The shell puts the value in place before it matches: `d=a/b; ... "$d"/*` is `a/b/*`.
+        A value this module didn't read stays the residual, left to the rules."""
+        with self._project() as (project, home):
+            (project / "k").unlink()
+            (project / "src" / "lib2").unlink()
+            for name in ("d1", "x1"):
+                (project / "a" / "b" / name).mkdir(parents=True)
+            (project / "a" / "b" / "d1" / "k").symlink_to(home)
+            self.assert_allowed('d=a/b; grep -R PRIVATE "$d"/x*', "the control: x1 holds no link")
+            self.assert_allowed('d=a/b; grep -r PRIVATE "$d"/*', "the control: follows none")
+            self.assert_no_opinion('grep -R PRIVATE "$D"/*', "a value this module didn't read")
+            for command in (
+                'd=a/b; grep -R PRIVATE "$d"/*',
+                "d=a/b; grep -R PRIVATE $d/d*",
+                'd=a; grep -R PRIVATE "$d"/b/*',
+                'for d in a/b; do grep -R PRIVATE "$d"/*; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through a/b/d1/k")
+
+    def test_in_a_scratchpad_below_a_link(self):
+        """macOS's `/tmp` leads to `/private/tmp`, and a link is placed by its own path, as the
+        scratchpad is: one that stays in the scratchpad is in scope, and one out of it is not."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_private_") as directory:
+            top = Path(os.path.realpath(directory))
+            real = top / "private" / "tmp" / "claude-501" / "p" / SESSION_ID / "scratchpad"
+            (real / "d" / "e").mkdir(parents=True)
+            (top / "tmp").symlink_to("private/tmp")
+            (top / "outside").mkdir()
+            scratch = str(top / "tmp" / real.relative_to(top / "private" / "tmp"))
+            for name in ("a", "b"):
+                (real / name).write_text("x\n")
+            (real / "d" / "e" / "up").symlink_to("..")
+            with with_scratchpad_dir(scratch):
+                for command in (
+                    f"cat {scratch}/a",
+                    f"diff {scratch}/a {scratch}/b",
+                    f"grep -R x {scratch}/d",
+                    f"grep -R x {scratch}/*",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_allowed(command, "every link stays in the scratchpad")
+                (real / "d" / "out").symlink_to(top / "outside")
+                self.assert_no_opinion(f"grep -R x {scratch}/d", "d/out leads out of it")
+                self.assert_allowed(f"grep -r x {scratch}/d", "the control: follows none")
+
+    def test_operands_from_elsewhere(self):
+        """`xargs` and `find -exec` give the reader operands no word names, so nothing can be
+        walked: refused outright, under any rule. Here only the directory piped in, `~/other`,
+        holds a link to a store, and the project none."""
+        with (
+            self._project() as (project, home),
+            operator_rules(allow=["Bash(xargs *)", "Bash(grep *)"]),
+        ):
+            (project / "k").unlink()
+            (project / "src" / "lib2").unlink()
+            (home / "other").mkdir()
+            (home / "other" / "k").symlink_to(home / ".ssh")
+            self.assert_allowed("printf '%s\\n' ~/other | xargs grep -r PRIVATE", "follows none")
+            self.assert_refused_outright("printf '%s\\n' ~/other | xargs grep -R PRIVATE")
+
+    def test_each_walk_runs_once_per_command(self):
+        """Layer B and Layer A ask for the same walk. A command with an `ln` is read once more,
+        with the links the first reading found, which is a different walk."""
+        original = hook._walk_for_links_uncached
+        with self._project(), operator_rules(allow=["Bash(ln *)"]):
+            for command, walks in (
+                ("grep -R one d1", 1),
+                ("ln -s ../src/lib d1/j && grep -R one d1", 2),
+            ):
+                with (
+                    self.subTest(command=command),
+                    unittest.mock.patch.object(
+                        hook, "_walk_for_links_uncached", side_effect=original
+                    ) as walk,
+                ):
+                    self.assert_allowed(command)
+                    self.assertEqual(walk.call_count, walks)
+
+    def test_in_the_scratchpad(self):
+        """The scratchpad is a read root as the project is."""
+        with self._project() as (_, home):
+            scratch = home / "scratch" / "scratchpad"
+            scratch.mkdir(parents=True)
+            with with_scratchpad_dir(str(scratch)):
+                self.assert_allowed(f"grep -R PRIVATE {scratch}", "the control: no link in it")
+                (scratch / "key").symlink_to(home / ".ssh" / "id_rsa")
+                self.assert_refused_outright(f"grep -R PRIVATE {scratch}", "reads the key")
+                self.assert_allowed(f"grep -r PRIVATE {scratch}", "the control: follows none")
+
+    def test_past_the_walk_budget(self):
+        """A link the walk didn't reach could lead anywhere, and a rule would approve the read."""
+        with self._project(), unittest.mock.patch.object(hook, "MAX_WALKED_ENTRIES", 3):
+            self.assert_allowed("grep -r one d1", "the control: follows no link")
+            self.assert_refused_outright("grep -R one src", "more entries than the budget")
 
 
 class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase):

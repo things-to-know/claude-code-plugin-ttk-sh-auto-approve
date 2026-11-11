@@ -46,6 +46,14 @@ insists on its own filename, symlink to this file rather than copying it.
     - Not through one that another program makes, under an operator's rule for it: `tar x`,
       `unzip`, `cp -s`, `git worktree add` or a script
     - A scratchpad whose own path is a link is none: no command reaches it
+  - A reader that follows links while it recurses, such as `grep -R`, reads where they lead
+    - Both layers walk its directory operands for links (`LINK_FOLLOWERS`), every entry,
+      ignore files or not
+    - Past `MAX_WALKED_ENTRIES` the command is refused outright, under any rule
+    - Behind `xargs`, `find -exec` or `parallel`, no word names what it reads: refused outright
+    - An operand below a value the hook didn't read isn't walked: the residual of `grep -r x "$d"`
+    - A wildcard operand is matched every way a startup file can make the shell read it
+      (`_glob_matches`); one it can't bound, such as `**`, is walked from its literal directory
   - One approval makes a network call: a `curl` GET of one URL on a listed site
     - What leaves the machine is a URL Claude wrote, which a poisoned context can put a secret in
       - So the request goes to an exact listed host, with no userinfo, redirect, proxy or
