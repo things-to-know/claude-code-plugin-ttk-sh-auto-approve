@@ -845,6 +845,8 @@ GIT_READ_SUBCOMMANDS = {
 # read bundled after another letter: `git log -pO<file>`. `-G`, `-I` and `-S` take the rest of
 # the word, so an `O` after them is part of their value; git stops on most other letters
 # before it reads the file, which costs this table no more than a prompt.
+# `_check_git` reads `grep`'s `short` and `values` too, to find its `-O` in a bundle, so a letter
+# there that takes nothing would hide an `O` after it: `grep -nO<cmd>` runs `<cmd>`.
 # Checked against git 2.48.1 (`builtin/blame.c`, `builtin/grep.c`, `builtin/ls-files.c`), and
 # the order file by running each subcommand with a FIFO as the file.
 GIT_ORDER_FILE = {"short": "O", "values": "GIS"}
@@ -2476,6 +2478,20 @@ def _check_git(args: list[str]) -> None:
     index, _ = _git_global_options(args)
     subcommand = "version" if args[index] in GIT_VERSION_FLAGS else args[index]
     sub_args = args[index + 1 :]
+
+    # `grep -O` runs the rest of its word as a program, and the configured pager when nothing is
+    # left. git reads it anywhere in a bundle of short flags, after a `-<num>` too: `git grep
+    # -iO<cmd>`, `-5O<cmd>` and `-nO` each run one. A letter that takes the rest of the word ends
+    # the bundle before it, so in `-eO` the `O` is the pattern. `GIT_FILE_OPTIONS["grep"]` has
+    # those letters, and `O`, and `_short_flag` walks past a digit as past a letter that takes
+    # nothing.
+    if subcommand == "grep":
+        spec = GIT_FILE_OPTIONS["grep"]
+        letters = {f"-{letter}" for letter in spec["short"] + spec["values"]}
+        for arg in sub_args:
+            single_dash = arg.startswith("-") and not arg.startswith("--")
+            if single_dash and _short_flag(arg, letters, bundles=True)[0] == "-O":
+                raise NotReadOnly(f"git mutating or execution flag: {arg}")
 
     # git takes the first word after `stash` alone as its subcommand. Any other word there, an
     # option included, runs `git stash push` with every word: `git stash -m list` stashes the
