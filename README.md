@@ -151,7 +151,8 @@ startup file is out of its view.
 
 ## Install
 
-Through the things-to-know plugin catalog (not published yet).
+Through the things-to-know plugin catalog (not published yet). Until then, from a clone of this
+repo, pinned to a commit or following the clone: see [docs/install.md](docs/install.md).
 
 To try it for one session from a clone of this repo:
 
@@ -175,5 +176,5 @@ which do.
 
 ## Development
 
-See [AGENTS.md](AGENTS.md) for the layout, the rules the hook follows, how to
-test it and how releases work.
+See [AGENTS.md](AGENTS.md) for the layout, the rules the hook follows and how to test it, and
+[docs/release.md](docs/release.md) for how releases work.
