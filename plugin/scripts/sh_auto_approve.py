@@ -4341,14 +4341,17 @@ def _check_command(
             problem = _read_scope_problem(arg_tokens[position], args[position], parts, scope)
             if problem is not None:
                 raise NoOpinion(f"git -C points at {problem}")
-        # Layer A, below, for the files git opens, which it resolves from the `-C` directory
+        # Layer A, below, for the files git opens, which it resolves from the `-C` directory,
+        # and for the paths it reads in a repository whose root is outside the read roots
         found = _git_file_operands(args, index)
-        if found and scope is not None:
+        if scope is not None:
             files_scope = scope
             if directories:
                 token = arg_tokens[directories[0]]
                 files_scope = _directory_scope(token, parts, known_values, scope)
-            _check_read_scope(f"git {args[index]}", found, args, arg_tokens, parts, files_scope)
+            if found:
+                _check_read_scope(f"git {args[index]}", found, args, arg_tokens, parts, files_scope)
+            _check_git_paths(args, index, arg_tokens, parts, files_scope)
         directory = args[directories[0]] if directories else None
         _check_git_remote_reach(args[index:], directory, scope)
 
@@ -4370,6 +4373,201 @@ def _check_command(
         for link, _ in links:
             if not _in_scope(link, scope):
                 raise NoOpinion(f"{program} follows the link {link} out of the working directories")
+
+
+# The read subcommands whose operands include paths git resolves in its repository: pathspecs,
+# and `<rev>:<path>` and `:<path>`, which it reads from the repository's root
+GIT_PATH_SUBCOMMANDS = frozenset(
+    {
+        "blame",
+        "cat-file",
+        "check-ignore",
+        "diff",
+        "grep",
+        "log",
+        "ls-files",
+        "ls-tree",
+        "rev-list",
+        "shortlog",
+        "show",
+        "stash",
+        "status",
+    }
+)
+
+# The options of `GIT_PATH_SUBCOMMANDS` whose value, the next word, is no path: a pattern, a
+# string, a number or a name. `_check_git_paths` skips that word. Only a value spelled as its own
+# word is listed: one attached, as `--author=x` or `-Sx`, is part of a word that starts with `-`.
+# `--pretty`, whose value is optional, and `--format`, whose value git takes only after `=`, are
+# not: the word after either is a path.
+# `-L`, of `log`, is `<range>:<file>`, whose file is read from where git runs, so it is measured.
+GIT_REVISION_VALUES = frozenset(
+    {
+        "-G",
+        "-I",
+        "-S",
+        "-n",
+        "--after",
+        "--author",
+        "--before",
+        "--committer",
+        "--date",
+        "--diff-filter",
+        "--encoding",
+        "--find-object",
+        "--grep",
+        "--ignore-matching-lines",
+        "--max-count",
+        "--since",
+        "--skip",
+        "--until",
+    }
+)
+GIT_PATH_FLAG_VALUES = {
+    "blame": frozenset({"-L", "--ignore-rev"}),
+    "grep": frozenset({"-e", "-A", "-B", "-C", "-m", "--max-count", "--max-depth", "--threads"}),
+    "ls-files": frozenset({"-x", "--exclude", "--format", "--exclude-per-directory"}),
+    "ls-tree": frozenset({"--format"}),
+    "diff": GIT_REVISION_VALUES,
+    "log": GIT_REVISION_VALUES,
+    "rev-list": GIT_REVISION_VALUES,
+    "shortlog": GIT_REVISION_VALUES,
+    "show": GIT_REVISION_VALUES,
+    "stash": GIT_REVISION_VALUES,
+}
+
+# Pathspec magic: `:(top,icase)path`, or the short `:/!path`, whose `/` is `top`
+PATHSPEC_LONG_MAGIC = re.compile(r":\(([^)]*)\)(.*)", re.DOTALL)
+PATHSPEC_SHORT_MAGIC = re.compile(r":([/!^]*):?(.*)", re.DOTALL)
+
+
+def _check_git_paths(
+    args: list[str],
+    index: int,
+    tokens: list[str],
+    parts: list[tuple[str, str]],
+    scope: _ReadScope,
+) -> None:
+    """Raise ``NoOpinion`` for a path git reads out of the working directories (#48).
+
+    git resolves its paths in the whole repository it runs in, and stops at its root, so where
+    that root is in the read roots, as the project's own is, no path git takes reaches out of
+    them. Where it isn't, as for a project that is a package of a larger repository, or under
+    a dotfiles repository at `~`, each operand of a subcommand in `GIT_PATH_SUBCOMMANDS` is
+    measured from the directory git runs in: a pathspec, and before `--` any word, which git
+    reads as a revision or a path. It has no opinion on magic that starts at the root, `:/` and
+    `:(top)`, on a tree or index path git reads from the root, `<rev>:<path>` and `:<path>`,
+    unless the path starts with `./` or `../`, and on `ls-tree --full-tree`.
+
+    Not measured: what a subcommand reads with no path, as `git log -p` and `git diff` read the
+    whole repository; `AGENTS.md` names that gap.
+    """
+    subcommand = args[index]
+    if subcommand not in GIT_PATH_SUBCOMMANDS:
+        return
+    if not any(_repository_root_out_of_scope(base, scope) for base in scope.bases):
+        return
+    values = GIT_PATH_FLAG_VALUES.get(subcommand, frozenset())
+    # `git grep`'s first operand is its pattern, unless an `-e` or `-f` gave one
+    pattern_pending = subcommand == "grep" and not any(
+        arg in ("-e", "-f") or (arg[:1] == "-" and arg[1:2] != "-" and set("ef") & set(arg))
+        for arg in args[index + 1 :]
+    )
+    after_dashes = False
+    skip = False
+    for position in range(index + 1, len(args)):
+        word, token = args[position], tokens[position]
+        if skip:
+            skip = False
+            continue
+        if word == "--" and not after_dashes:
+            after_dashes = True
+            continue
+        if not after_dashes and word.startswith("-"):
+            if word == "--full-tree" and subcommand == "ls-tree":
+                raise NoOpinion(
+                    "git ls-tree --full-tree reads the root of a repository out of scope"
+                )
+            if word == "-L" and subcommand == "log" and position + 1 < len(args):
+                # `-L <range>:<file>`: the file, after the last `:`, is read from where git runs
+                value = args[position + 1]
+                _check_git_path(value.rpartition(":")[2], tokens[position + 1], parts, scope, value)
+                skip = True
+            elif word.startswith("-L") and subcommand == "log":
+                _check_git_path(word.rpartition(":")[2], token, parts, scope, word)
+            else:
+                skip = word in values
+            continue
+        if position == index + 1 and subcommand == "stash":
+            continue  # `show`
+        if pattern_pending and not after_dashes:
+            pattern_pending = False
+            continue
+        path = _git_path_from_cwd(word, after_dashes=after_dashes)
+        _check_git_path(path, token, parts, scope, word)
+
+
+def _check_git_path(
+    path: str, token: str, parts: list[tuple[str, str]], scope: _ReadScope, word: str
+) -> None:
+    """Raise ``NoOpinion`` unless ``path``, which git reads from where it runs, is in ``scope``."""
+    if _word_the_shell_builds(token, parts):
+        raise NoOpinion(f"git given a path the shell builds: {word}")
+    for base in scope.bases:
+        if not _in_scope(os.path.join(base, path or "."), scope):
+            raise NoOpinion(f"git reads out of the working directories: {word}")
+
+
+def _git_path_from_cwd(word: str, *, after_dashes: bool) -> str:
+    """The path in ``word`` that git resolves from its working directory.
+
+    Raises ``NoOpinion`` for one it resolves from its repository's root, which
+    `_check_git_paths` reads only where that root is out of scope.
+    """
+    root_reason = f"git reads {word} from the root of a repository out of the working directories"
+    if word.startswith(":"):
+        long_magic = PATHSPEC_LONG_MAGIC.fullmatch(word)
+        if long_magic is not None:
+            names = {name.strip().split(":")[0] for name in long_magic.group(1).split(",")}
+            if "top" in names:
+                raise NoOpinion(root_reason)
+            return long_magic.group(2)
+        short_magic = PATHSPEC_SHORT_MAGIC.fullmatch(word)
+        magic, rest = short_magic.group(1), short_magic.group(2)
+        if "/" in magic:
+            raise NoOpinion(root_reason)
+        # Before `--`, a word with no magic can be the index's `:<path>` or `:<stage>:<path>`
+        if not after_dashes and not magic and not rest.startswith(("./", "../")):
+            raise NoOpinion(root_reason)
+        return rest
+    if not after_dashes and ":" in word:
+        _, _, path = word.partition(":")
+        if path in (".", "..") or path.startswith(("./", "../")):
+            return path
+        raise NoOpinion(root_reason)
+    return word
+
+
+def _repository_root_out_of_scope(base: str, scope: _ReadScope) -> bool:
+    """Whether git, run in ``base``, finds a repository whose root is out of ``scope``.
+
+    The nearest directory with a `.git`, from ``base``'s real path up, as git looks for one.
+    `GIT_DIR` or `GIT_WORK_TREE` in the environment the hook shares with the shell puts the
+    repository anywhere, and so out of scope. No repository is none to read paths in.
+    """
+    if os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE"):
+        return True
+    try:
+        directory = os.path.realpath(base)
+    except (OSError, ValueError):
+        return True
+    while True:
+        if os.path.lexists(os.path.join(directory, ".git")):
+            return not _in_scope(directory, scope)
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return False
+        directory = parent
 
 
 def _check_read_scope(

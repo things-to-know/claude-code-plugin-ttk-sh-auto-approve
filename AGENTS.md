@@ -46,6 +46,10 @@ insists on its own filename, symlink to this file rather than copying it.
     - Not through one that another program makes, under an operator's rule for it: `tar x`,
       `unzip`, `cp -s`, `git worktree add` or a script
     - A scratchpad whose own path is a link is none: no command reaches it
+  - Known gap: git in a repository whose root is out of the read roots, as for a project that
+    is a package of a larger repository
+    - The hook measures each path git takes, but not what a subcommand reads with none:
+      `git log -p` and `git diff` read the whole repository
   - A reader that follows links while it recurses, such as `grep -R`, reads where they lead
     - Both layers walk its directory operands for links (`LINK_FOLLOWERS`), every entry,
       ignore files or not
@@ -112,13 +116,11 @@ insists on its own filename, symlink to this file rather than copying it.
   - For a path-based widening, the refusals include a recursive read, such as `grep -r`, of the
     directory holding each credential store: Layer B refuses a word that names a store, not one
     that names its parent
-  - One exception, git's quoted pathspecs, until #48 gives them refusals:
-    - A quoted `'../*'` reaches no further than a literal `..`, which the hook approves too, as it
-      measures none of git's paths
-    - git stops both above the repository's root, which is wider than the project when the
-      project sits inside a larger repository
-    - `test_git_refuses_a_pathspec_above_its_repository` pins git's stop, for a repository whose
-      root is the project
+  - git's quoted pathspecs, such as `'../*'`, reach no further than a literal `..`
+    - Where the repository's root is in the read roots, git stops both there:
+      `test_git_refuses_a_pathspec_above_its_repository` pins that stop
+    - Where it isn't, the hook measures each path git takes (`_check_git_paths`), with
+      `RefusesGitPathsInAnEnclosingRepository`'s refusals
 - **Stdlib only, isolated interpreter.** `-I` ignores `PYTHONPATH` and user
   site-packages, and keeps the script's own directory off `sys.path`. If the
   hook is split into modules, add its directory explicitly:

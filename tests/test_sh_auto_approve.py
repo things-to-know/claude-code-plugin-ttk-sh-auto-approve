@@ -83,10 +83,11 @@ from a command that prompted in a real session.
           RefusesGitConfigDrivenExecution, RefusesGitSubcommandsOutsideTheReadSet,
           RefusesUnlistedGitGlobalOptions, GitGlobalOptionsUnderOperatorRules,
           RefusesAGitStashThatPushes, RefusesGitReadsOutsideTheWorkingDirectories,
-          RefusesAwsCallsThatWriteOrExecute, RefusesAwsCallsThatPrintASecret,
-          ApprovesGcloudHelpForABlockedVerb, RefusesGcloudCallsThatWriteLocallyOrExecute,
-          RefusesGhApiCallsThatWriteOrLeak, ApprovesReadOnlyGhSubcommands,
-          RefusesGhFlagsThatOpenOrWait, ReadsGhSearchQueries, RefusesGhJqThatReadsTheEnvironment
+          RefusesGitPathsInAnEnclosingRepository, RefusesAwsCallsThatWriteOrExecute,
+          RefusesAwsCallsThatPrintASecret, ApprovesGcloudHelpForABlockedVerb,
+          RefusesGcloudCallsThatWriteLocallyOrExecute, RefusesGhApiCallsThatWriteOrLeak,
+          ApprovesReadOnlyGhSubcommands, RefusesGhFlagsThatOpenOrWait, ReadsGhSearchQueries,
+          RefusesGhJqThatReadsTheEnvironment
     14  The operator's own rules: the second tier
           OperatorRules, OperatorRuleFileRobustness, ARepresentativeRuleFile,
           AppliesOnlyTheProjectFilesClaudeCodeApplies
@@ -2695,12 +2696,11 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
 
     @unittest.skipUnless(GIT, "needs git on PATH")
     def test_git_refuses_a_pathspec_above_its_repository(self):
-        """Where the widening above stops, for now, is git's: the hook approves `git grep -e one
-        -- '../*'`, as it approves a literal `..`, and git refuses both above the repository's
-        root. Run here, so that a git that stopped refusing fails this test.
-
-        The repository's root is the project here. In a project inside a larger repository, git
-        reads the rest of it, which #48 is for, and whose refusals will replace this test."""
+        """Where the widening above stops, where the repository's root is the project: the hook
+        approves `git grep -e one -- '../*'`, as it approves a literal `..`, and git refuses both
+        above the repository's root. Run here, so that a git that stopped refusing fails this
+        test. In a project inside a larger repository, the hook measures git's paths itself:
+        `RefusesGitPathsInAnEnclosingRepository`."""
         with scratch_tree() as root:
             # `LC_ALL=C`: git translates its "outside repository" message
             env = sandbox_env(root) | {"GIT_CONFIG_NOSYSTEM": "1", "LC_ALL": "C"}
@@ -7204,6 +7204,118 @@ class RefusesGitReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             hook._directory_scope("x$d", [], {"d": ["docs"]}, scope)
         joined = hook._directory_scope("docs", [], {}, scope)
         self.assertEqual([str(hook.REPO_ROOT / "docs")], joined.bases)
+
+
+class RefusesGitPathsInAnEnclosingRepository(Verdicts, unittest.TestCase):
+    """#48: a project can be a package of a larger repository, or sit under a dotfiles one at
+    `~`, and git resolves its paths in the whole repository: `git grep -e x -- ../sibling`
+    read the sibling package, and `git show HEAD:sibling/data` a file from the repository's
+    root. Where that root is out of the read roots, each path git takes is measured from where
+    it runs; where it is the project, git stops at it and nothing changes.
+
+    `project/a.txt` and `sibling/data`, in a repository whose root holds both. Each refusal sits
+    beside a control approved in the same setup, and each is approved too where the root is the
+    project. The recursive reads of the root, which is `~` for a dotfiles repository, are among
+    them: `..`, `:/` and `--no-index ..`.
+    """
+
+    CASES = (
+        ("git grep -e x -- ../sibling", "git grep -e x -- a.txt"),
+        ("git grep -e x -- '../*'", "git grep -e x -- '*.txt'"),
+        ("git grep -e x -- :/", "git grep -e x -- ."),
+        ("git grep -e x -- ':/!a.txt'", "git grep -e x -- ':!a.txt'"),
+        ("git grep -e x -- ':(top)sibling'", "git grep -e x -- ':(exclude)a.txt'"),
+        ("git grep -e x -- ':(top,icase)sibling'", "git grep -e x -- ':(icase)A.txt'"),
+        ("git log -p -- ../sibling", "git log -p -- a.txt"),
+        ("git show HEAD:sibling/data", "git show HEAD:./a.txt"),
+        ("git show HEAD:../sibling/data", "git show HEAD:../project/a.txt"),
+        ("git show :sibling/data", "git show :./a.txt"),
+        ("git cat-file -p HEAD:sibling/data", "git cat-file -p HEAD:./a.txt"),
+        ("git grep -e x -- ..", "git grep -e x -- ."),
+        ("git grep --untracked -e x -- ../sibling", "git grep --untracked -e x -- ."),
+        ("git grep --no-index -e x -- ..", "git grep --no-index -e x -- ."),
+        ("git ls-files -- ../sibling", "git ls-files -- ."),
+        ("git ls-files ../sibling", "git ls-files a.txt"),
+        ("git ls-tree -r --full-tree HEAD", "git ls-tree -r HEAD"),
+        ("git stash show -p -- ../sibling", "git stash show -p -- a.txt"),
+    )
+
+    @contextlib.contextmanager
+    def _repository(self, *, root_is_the_project: bool = False):
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_enclosing_") as directory:
+            top = Path(os.path.realpath(directory))
+            project, sibling = top / "project", top / "sibling"
+            project.mkdir()
+            sibling.mkdir()
+            (project / "a.txt").write_text("x\n")
+            (sibling / "data").write_text("x\n")
+            git_directory_at((project if root_is_the_project else top) / ".git")
+            environment = {
+                k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE")
+            }
+            with (
+                unittest.mock.patch.dict(os.environ, environment, clear=True),
+                unittest.mock.patch.object(hook, "REPO_ROOT", project),
+                unittest.mock.patch.object(hook, "_SESSION_CWD", None),
+            ):
+                yield project
+
+    def test_a_path_out_of_the_project(self):
+        with self._repository():
+            for refused, control in self.CASES:
+                with self.subTest(refused=refused):
+                    self.assert_no_opinion(refused, "git reads the sibling, or from the root")
+                    self.assert_allowed(control, "stays in the project")
+
+    def test_nothing_changes_where_the_root_is_the_project(self):
+        """git stops at its root, `test_git_refuses_a_pathspec_above_its_repository`."""
+        with self._repository(root_is_the_project=True):
+            for refused, control in self.CASES:
+                if "sibling" in refused:
+                    continue  # no such path in this repository: a pathspec git refuses
+                with self.subTest(command=refused):
+                    self.assert_allowed(refused, "git stops at the project")
+                    self.assert_allowed(control)
+
+    def test_a_repository_the_environment_names(self):
+        """`GIT_DIR` puts the repository anywhere, its root out of scope included."""
+        with self._repository(root_is_the_project=True):
+            self.assert_allowed("git show HEAD:a.txt", "the control")
+            with unittest.mock.patch.dict(os.environ, {"GIT_DIR": "/elsewhere/.git"}):
+                self.assert_no_opinion("git show HEAD:a.txt", "a root this module didn't find")
+                self.assert_allowed("git show HEAD:./a.txt", "the control: from where git runs")
+
+    def test_values_and_patterns_are_no_paths(self):
+        """The value of an option that takes no path, and `git grep`'s pattern, are not
+        measured. `log -L`'s file is, from where git runs."""
+        with self._repository():
+            for command in (
+                "git grep -e foo:bar",
+                "git grep -e ../x",
+                "git grep foo:bar",
+                "git log -S a:b",
+                'git log --author "x <a:b>"',
+                "git log -L 1,2:a.txt",
+                "git log --since ../x a.txt",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "no path out of the project")
+            for command in (
+                "git log -L 1,2:../sibling/data",
+                "git log -L1,2:../sibling/data",
+                "git grep foo ../sibling",
+                "git grep -n -e x ../sibling",
+                # `--pretty`'s value is optional: the next word is a path
+                "git log -p --pretty ../sibling",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "reads the sibling")
+
+    def test_the_gap_left(self):
+        """What git reads with no path: the whole repository, as `AGENTS.md` records."""
+        with self._repository():
+            self.assert_allowed("git log -p", "reads the sibling's history too")
+            self.assert_allowed("git diff HEAD~1", "and its changes")
 
 
 @approvals_budgeted
