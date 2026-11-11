@@ -213,6 +213,8 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
     - A test that fails or errors asks nothing after its failure, and it names each on stderr
   - It compares with the hook where `HEAD` left `origin/main`, which it fetches first;
     `BASE=<revision>` compares with another
+  - Past a dozen rows: a summary table, one example per issue or cause with its count, and
+    every row below it in a collapsed `<details>`
 - Triage a command that prompted by replaying it in its session's context, never a guessed one:
   - Find the session's transcript by its id: `ls ~/.claude/projects/*/<session-id>.jsonl`. It
     moves when the session is resumed elsewhere, and every directory there starts with `-`, so
