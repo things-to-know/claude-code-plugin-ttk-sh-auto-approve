@@ -494,11 +494,15 @@ INDIRECT = re.compile(r"\$\{!(?![A-Za-z_][A-Za-z0-9_]*(?:\[[@*]\]|[@*])\})")
 ZSH_PARAMETER_FLAGS = re.compile(r"\$\{\s*\(")
 ZSH_GLOB_SUBST = re.compile(r"\$\{?~")
 
-# A `printf` conversion whose argument zsh evaluates as arithmetic: a numeric type, or any
-# conversion taking its width or precision from an argument (`%*s`, `%.*f`).
-PRINTF_NUMERIC = re.compile(
-    r"%[-+ #0']*(?:\d+)?(?:\.\d*)?[diouxXeEfFgGaA]|%[-+ #0']*(?:\d*\*|\d*\.\*)"
+# A `printf` conversion: `%%`, or a position (`%1$d`), flags, a width and a precision, each a
+# number or a `*` that takes it from an operand (`%*s`, `%.*f`, `%*2$d`), length modifiers, and
+# the conversion letter. zsh evaluates as arithmetic the operand of a numeric letter, and of
+# each `*`. No letter, at the end of the format, is read as unknown.
+PRINTF_CONVERSION = re.compile(
+    r"%(?:%|(\d+\$)?[-+ #0']*(\*(\d+\$)?|\d+)?(?:\.(\*(\d+\$)?|\d*))?[hlLjzt]*(.)?)", re.DOTALL
 )
+PRINTF_NUMERIC_LETTERS = frozenset("diouxXeEfFgGaA")
+PRINTF_TEXT_LETTERS = frozenset("sbqc")
 
 # A field wider than this is not alignment:
 # - `printf '%099999999d' 1` allocates 100 MB and prints them into Claude's context
@@ -507,7 +511,10 @@ PRINTF_NUMERIC = re.compile(
 PRINTF_WIDTH_CAP = 1000
 PRINTF_WIDTH = re.compile(r"%[-+ #0']*(\d+)?(?:\.(\d+))?")
 PRINTF_STAR = re.compile(r"%[-+ #0']*\d*\.?\*")
-PRINTF_INTEGER_ARGUMENT = re.compile(r"[-+]?\d+")
+# A number spelled out, in the forms zsh's arithmetic reads as a constant: an integer, or a
+# decimal for `%e`, `%f` and `%g`. Anything else is an expression zsh evaluates, and a name, a
+# subscript or a `base#` prefix can run a command: `printf '%d' 'path[`cmd`1]'` runs `cmd`.
+PRINTF_NUMBER_ARGUMENT = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
 # Text that is parameter expansions and nothing else, so that the shell supplies all of it.
 # `$(` never survives the scan, so only the parameter forms are here.
@@ -3839,21 +3846,84 @@ def _check_printf(args: list[str]) -> None:
         raise NotReadOnly("printf assigns to a variable with -v")
 
     # zsh's `printf` evaluates the argument of a numeric conversion -- and of a `*` width
-    # -- as an arithmetic expression, so `printf '%d' "$x"` runs what `$((x))` runs. A
-    # number spelled out is fine; one the shell supplies is a value this module never read.
-    if any(PRINTF_NUMERIC.search(arg) for arg in args) and any(
-        "$" in arg or SUBSTITUTION_MARKER in arg for arg in args
-    ):
-        raise NotReadOnly("printf evaluates an expanded value as arithmetic")
+    # -- as an arithmetic expression, after the shell's quoting is gone: `printf '%d' "$x"`
+    # runs what `$((x))` runs, a quoted `'path[`cmd`1]'` runs `cmd`, and a bare name `x` is
+    # evaluated as the value the command may have assigned it. Only a number spelled out is
+    # read: each operand such a conversion consumes must be one.
+    words = args[1:] if args[:1] == ["--"] else args
+    if words:
+        evaluated = _printf_evaluated_operands(words[0], len(words) - 1)
+        if not all(PRINTF_NUMBER_ARGUMENT.fullmatch(words[1 + i]) for i in evaluated):
+            raise NotReadOnly("printf evaluates an operand that is not a number as arithmetic")
 
     if _exceeds_width_cap(args) or (
         any(PRINTF_STAR.search(arg) for arg in args)
         and any(
-            PRINTF_INTEGER_ARGUMENT.fullmatch(arg) and abs(int(arg)) > PRINTF_WIDTH_CAP
+            PRINTF_NUMBER_ARGUMENT.fullmatch(arg) and abs(float(arg)) > PRINTF_WIDTH_CAP
             for arg in args
         )
     ):
         raise NotReadOnly(f"printf field wider than {PRINTF_WIDTH_CAP}")
+
+
+def _check_printf_unread_format(
+    args: list[str],
+    tokens: list[str],
+    parts: list[tuple[str, str]],
+    known_values: dict[str, list[str] | None],
+) -> None:
+    """Read a `printf` format that holds a value this module didn't read as an unknown conversion.
+
+    Every operand must then be a number. `$_`, a name the command binds to values unread, or one
+    it never binds, such as an environment variable, can be `%d`: in
+    `true %d; printf "a$_" 'path[`cmd`1]'`, zsh runs `cmd`. A value the command sets is read by
+    `_arg_variants` instead.
+    """
+    index = 1 if args[:1] == ["--"] else 0
+    if index >= len(args):
+        return
+    shapes = _word_shapes(tokens[index], parts, known_values)
+    if shapes is None:
+        raise NoOpinion(TOO_MANY_SHAPES)
+    for shape in shapes:
+        if UNREAD_VALUE in shape or OPERATOR_VALUE in shape:
+            unread = shape.replace(UNREAD_VALUE, "%?").replace(OPERATOR_VALUE, "%?")
+            _check_printf([*args[:index], unread, *args[index + 1 :]])
+
+
+def _printf_evaluated_operands(text: str, count: int) -> list[int]:
+    r"""The indexes of the `count` operands that zsh's `printf` evaluates as arithmetic.
+
+    `text` is the format. Each conversion consumes the next operand, and each `*` one before it;
+    the format is reused while operands remain, as in both shells. A position (`%1$d`), or a
+    letter neither table holds, is not mapped: every operand counts as evaluated then, if any
+    conversion is numeric. An escaped `%`, such as `\045`, is literal text in both shells, so
+    only a spelled `%` starts a conversion.
+    """
+    kinds: list[bool] = []
+    unmapped = False
+    for match in PRINTF_CONVERSION.finditer(text):
+        if match.group(0) == "%%":
+            continue
+        position, width, width_position, precision, precision_position, letter = match.groups()
+        if position or width_position or precision_position:
+            unmapped = True
+        if width and width.startswith("*"):
+            kinds.append(True)
+        if precision and precision.startswith("*"):
+            kinds.append(True)
+        if letter in PRINTF_NUMERIC_LETTERS:
+            kinds.append(True)
+        elif letter in PRINTF_TEXT_LETTERS:
+            kinds.append(False)
+        else:
+            unmapped = True
+            kinds.append(True)
+    if not any(kinds):
+        return []
+    if unmapped:
+        return list(range(count))
+    return [i for i in range(count) if kinds[i % len(kinds)]]
 
 
 def _exceeds_width_cap(formats: list[str]) -> bool:
@@ -4235,6 +4305,8 @@ def _check_command(
                     raise type(error)(
                         f"{error}, with the values this command sets: {' '.join(variant)}"
                     ) from None
+        if program == "printf":
+            _check_printf_unread_format(args, arg_tokens, parts, known_values)
     elif program not in READ_ONLY:
         raise NoOpinion(f"unrecognized program: {program}")
 

@@ -3925,6 +3925,36 @@ class RefusesReEvaluatingAValue(Verdicts, unittest.TestCase):
         self.assert_refused("printf '%*s|\\n' \"$w\" x")
         self.assert_refused("printf '%d\\n' \"$(wc -l < AGENTS.md)\"")
 
+    def test_zsh_printf_evaluates_an_operand_the_shell_passes_as_it_is(self):
+        """#8: zsh evaluates the operand again, after the shell's quoting is gone, so a quoted
+        backtick in a subscript of a set array runs, and a bare name is read as its value.
+        Only a number spelled out is read; each refusal sits beside its control."""
+        cases = (
+            ("printf '%d\\n' 'path[`touch PWNED`1]'", "printf '%d\\n' 42"),
+            ("printf '%x\\n' 'HOME[`touch PWNED`1]'", "printf '%x\\n' 255"),
+            ("printf '%*s\\n' 'path[`touch PWNED`1]' a", "printf '%*s\\n' 5 a"),
+            ("printf '%.*f\\n' 'path[`touch PWNED`1]' 1", "printf '%.*f\\n' 2 3.14159"),
+            ("printf '%1$d\\n' 'path[`touch PWNED`1]'", "printf '%1$d\\n' 7"),
+            ("printf '%*2$d\\n' 3 'path[`touch PWNED`1]'", "printf '%2$s\\n' 3 x"),
+            ("printf '%ld\\n' 'path[`touch PWNED`1]'", "printf '%ld\\n' 7"),
+            ("x='path[`touch PWNED`1]'; printf '%d\\n' x", "x=5; printf '%s\\n' x"),
+            ("printf '%d\\n' x", "printf '%s\\n' x"),
+            ("printf '%d\\n' '1+1'", "printf '%d %5.2f\\n' 42 3.14159"),
+            ("printf '%d\\n' 16#ff", "printf -- '%d\\n' -16"),
+            # The format is reused while operands remain, so the 4th is a `%d` operand too
+            ("printf '%s %d\\n' a 1 b 'path[`touch PWNED`1]'", "printf '%s %d\\n' a 1 b 2"),
+            # An escaped or doubled `%` starts no conversion, in either shell
+            ("printf '%%%d\\n' x", "printf '%%d \\045d %s\\n' x"),
+            # A format holding a value this module didn't read can be `%d`: `$_`, or a name from
+            # the environment
+            ("true %d; printf \"a$_\" 'path[`touch PWNED`1]'", 'true %d; printf "a$_" 5'),
+            ("printf \"a$FOO\" 'path[`touch PWNED`1]'", "printf '%s\\n' \"$FOO\""),
+        )
+        for refused, control in cases:
+            with self.subTest(refused=refused):
+                self.assert_refused(refused, "zsh evaluates it as arithmetic")
+                self.assert_allowed(control, "no operand zsh evaluates is anything but a number")
+
     def test_what_evaluates_nothing_stays_approved(self):
         """The forms that look alike and run nothing: whole-array and literal subscripts,
         literal offsets, defaults, key listing, constant arithmetic, and numbers spelled out."""
@@ -8525,6 +8555,15 @@ class DifferentialAgainstZsh(unittest.TestCase):
     ATTACKS = (
         "x='$(touch PWNED)'; echo \"${(e)x}\"",
         "x='path[$(touch PWNED)]'; printf '%d\\n' \"$x\"",
+        # #8: zsh's `printf` evaluates the operand itself, so a quoted backtick runs too
+        "printf '%d\\n' 'path[`touch PWNED`1]'",
+        "printf '%x\\n' 'HOME[`touch PWNED`1]'",
+        "printf '%*s\\n' 'path[`touch PWNED`1]' a",
+        "printf '%.*f\\n' 'path[`touch PWNED`1]' 1",
+        "printf '%1$d\\n' 'path[`touch PWNED`1]'",
+        "printf '%s %d\\n' a 1 b 'path[`touch PWNED`1]'",
+        "x='path[`touch PWNED`1]'; printf '%d\\n' x",
+        "true %d; printf \"a$_\\n\" 'path[`touch PWNED`1]'",
         "x='path[$(touch PWNED)]'; echo $((x))",
         # `argv` is zsh's positional parameters, which `for p do` walks. The `ls` is a segment
         # left to check once the header's segment is discarded
