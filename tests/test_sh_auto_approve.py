@@ -60,8 +60,9 @@ from a command that prompted in a real session.
           RefusesWordsAnExpansionSupplies
      8  Redirection, sockets, and egress
           RefusesDescriptorAndSocketRedirection, RefusesRedirectionAttachedToACompound,
-          RefusesReadsOutsideTheWorkingDirectories, RefusesACredentialStoreAWildcardOrABaseReaches,
-          RefusesAScratchPathThroughALinkOut, RefusesEgressThroughAnApprovedProgram
+          RefusesReadsOutsideTheWorkingDirectories, ResolvesThroughALinkTheCommandMakes,
+          RefusesACredentialStoreAWildcardOrABaseReaches, RefusesAScratchPathThroughALinkOut,
+          RefusesEgressThroughAnApprovedProgram
      9  Program identity, environment, and session state
           RefusesControlOfTheEnvironmentAndTheProgram, StripsTheWrapperTheHostStrips,
           RefusesBuiltinsThatRunAProgram, RefusesSessionScopedEnvironmentHandover,
@@ -4775,6 +4776,119 @@ def a_project_below_home(cwd: str = ""):
         shutil.rmtree(home, ignore_errors=True)
 
 
+class ResolvesThroughALinkTheCommandMakes(Verdicts, unittest.TestCase):
+    """#79: both layers resolved a path through the links on disk when the hook ran, before an
+    `ln` in the same command made one, so under `Bash(ln *)` a read through it went wherever the
+    link led: `ln -s ~ j && xxd j/.ssh/id_rsa` printed the key. A later word is now resolved
+    through each link an `ln` in the command makes, and each it may not make, as if it were
+    there. In `a_project_below_home`, with `~/.bashrc`, `~/.config/gh/hosts.yml` and
+    `~/a/b/outside/hostname` beside it; `j` is a name no file has yet.
+    """
+
+    @contextlib.contextmanager
+    def _home(self):
+        with a_project_below_home() as project:
+            home = Path(os.environ["HOME"])
+            (home / ".bashrc").write_text("x\n")
+            (home / ".config" / "gh").mkdir(parents=True)
+            (home / ".config" / "gh" / "hosts.yml").write_text("oauth_token: x\n")
+            (project.parent / "outside").mkdir()
+            (project.parent / "outside" / "hostname").write_text("x\n")
+            with operator_rules(allow=["Bash(ln *)", "Bash(tar *)"]):
+                yield project, home
+
+    def test_a_read_through_it_into_a_credential_store(self):
+        with self._home():
+            self.assert_allowed("ln -s README.md j && cat j", "the control: a link inside")
+            self.assert_allowed("ln -s src j && cat j/lib/x.txt", "the control")
+            self.assert_refused_outright("xxd ~/.ssh/id_rsa", "the control")
+            self.assert_refused_outright("ln -s ~/.ssh j && xxd j/id_rsa", "the control")
+            for command in (
+                "ln -s ~ j && xxd j/.ssh/id_rsa",
+                "ln -s ~ j && awk 1 j/.ssh/id_rsa",
+                "ln -s ~ j && cat j/.ssh/id_rsa",
+                "ln -s ~ j && wc -c < j/.ssh/id_rsa",
+                "ln -sfn ~ j; cat j/.ssh/id_rsa",
+                "ln -s -- ~ j; cat j/.ssh/id_rsa",
+                "ln -s ../../.. j; cat j/.ssh/id_rsa",
+                "ln -s ~/a j && cat j/../.ssh/id_rsa",
+                # Read before the `ln`, which a later call of the same command may not be
+                "cat j/.ssh/id_rsa; ln -s ~ j",
+                # Two links, the second through the first
+                "ln -s ~ j && ln -s j/.ssh i && cat i/id_rsa",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh/id_rsa through j")
+
+    def test_a_read_through_it_outside_the_working_directories(self):
+        """Not a store, so it is the read scope's: no opinion, and the rule for the reader
+        decides."""
+        with self._home() as (_, home):
+            self.assert_allowed("cat README.md", "the control")
+            for command in (
+                "ln -s ~ j && grep -r oauth j/.config",
+                "ln -s ~ j && cat j/.bashrc",
+                "ln -s ../outside j && cat j/hostname",
+                "ln -sr ../outside j && cat j/hostname",
+                "ln -s --relative ../outside j && cat j/hostname",
+                "ln ~/.bashrc j && cat j",
+                f"ln -t d {home} && cat d/{home.name}/.bashrc",
+                f"ln --target-directory=d {home} && cat d/{home.name}/.bashrc",
+                f"ln -s {home} d && cat d/{home.name}/.bashrc",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "reads outside the project through j")
+            self.assert_allowed("ln -s src j && cd j && cat lib/x.txt", "the control")
+            self.assert_refused("ln -s ~ j && cd j && cat .bashrc", "a cd out of the project")
+
+    def test_a_link_made_inside_a_substitution(self):
+        """The body is read after the words around it, so the command is read again once its
+        links are known. Under `Bash(cat *)` too, which approves the `cat` itself."""
+        with self._home():
+            self.assert_allowed('echo "$(ln -s README.md j)"; cat j', "the control")
+            with operator_rules(allow=["Bash(ln *)", "Bash(cat *)", "Bash(echo *)"]):
+                self.assert_allowed('echo "$(ln -s README.md j)"; cat j', "the control")
+                self.assert_refused('echo "$(ln -s ~ j)"; cat j/.ssh/id_rsa', "reads the key")
+
+    def test_a_hard_link_of_a_symbolic_link(self):
+        """GNU `ln` hard-links a symbolic link itself, `-P`, so the copy's text leads from the
+        copy's directory: `ln sub/up up` with `sub/up -> ..` makes `up -> ..` at the project's
+        root, its parent. BSD's `-L` links where it leads; without either, both are read."""
+        with self._home() as (project, _):
+            (project / "sub").mkdir()
+            (project / "sub" / "up").symlink_to("..")
+            (project.parent / "secretdir").mkdir()
+            (project.parent / "secretdir" / "s").write_text("x\n")
+            self.assert_allowed("ln README.md c && cat c", "the control: a hard link of a file")
+            self.assert_allowed("cat sub/up/README.md", "the control: the link leads in")
+            for command in (
+                "ln sub/up up && cat up/secretdir/s",
+                "ln -P sub/up up && cat up/secretdir/s",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "up leads to the project's parent")
+            self.assert_refused_outright(
+                "ln -s ~ j && ln j i && cat i/.ssh/id_rsa", "a hard link of a link it makes"
+            )
+
+    def test_an_ln_it_cant_place(self):
+        """Operands the shell supplies, an option this module doesn't read, or `ln` run by
+        another program: no rule approves the command."""
+        with self._home():
+            self.assert_allowed("ln -s src j && cat j/lib/x.txt", "the control")
+            for command in (
+                'd=~; ln -s "$d" j && cat j/lib/x.txt',
+                "ln -s $(echo ~) j && cat README.md",
+                "ln -s * j && cat README.md",
+                "ln --frobnicate src j && cat README.md",
+                "xargs ln -s < list.txt; cat README.md",
+                "find . -name x -exec ln -s ~ j ';'",
+                "command ln -s ~ j; cat README.md",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command)
+
+
 class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase):
     """Layer B read a word with a wildcard by its literal part alone, and gave up on a relative
     one, so a word the shell expands into a credential store got past it (#43). Each is refused
@@ -4975,10 +5089,11 @@ class RefusesAScratchPathThroughALinkOut(Verdicts, unittest.TestCase):
     )
 
     @contextlib.contextmanager
-    def _scratch(self, *, through_a_link: bool = False):
+    def _scratch(self, *, through_a_link: bool = False, itself_a_link: bool = False):
         """The scratch directory, and its links, beside a directory outside it. With
-        `through_a_link`, the scratch directory is named by a link to it, as a scratch
-        directory under `/tmp` is on macOS, where `/tmp` leads to `/private/tmp`."""
+        `through_a_link`, a directory above it is named by a link, as `/tmp` is on macOS, where
+        it leads to `/private/tmp`. With `itself_a_link`, its own path is a link to it, as one
+        an earlier command replaced with a link would be."""
         with tempfile.TemporaryDirectory(prefix="readonly_hook_links_") as directory:
             top = Path(os.path.realpath(directory))
             scratch, outside = top / "scratch", top / "outside"
@@ -4992,6 +5107,9 @@ class RefusesAScratchPathThroughALinkOut(Verdicts, unittest.TestCase):
             (scratch / "dangling").symlink_to(outside / "new")
             named = scratch
             if through_a_link:
+                (top / "top-link").symlink_to(top)
+                named = top / "top-link" / "scratch"
+            if itself_a_link:
                 named = top / "scratch-link"
                 named.symlink_to(scratch)
             with with_scratchpad_dir(str(named)):
@@ -5047,6 +5165,17 @@ class RefusesAScratchPathThroughALinkOut(Verdicts, unittest.TestCase):
                     self.assert_refused(spelling.format(f"{scratch}/out"), "leads outside it")
                     self.assert_allowed(spelling.format(f"{scratch}/in"), "leads inside it")
                     self.assert_allowed(spelling.format(f"{scratch}/inner"), "a plain path")
+
+    def test_a_scratch_directory_that_is_itself_a_link(self):
+        """#79: one whose own path is a link takes in wherever the link leads, as a scratchpad
+        an earlier command replaced with `ln -s ~` would, so no path in it is in reach. The
+        control is the same directory named by its own path."""
+        for spelling in self.READS_AND_WRITES:
+            with self.subTest(spelling=spelling):
+                with self._scratch() as scratch:
+                    self.assert_allowed(spelling.format(f"{scratch}/inner"), "the control")
+                with self._scratch(itself_a_link=True) as scratch:
+                    self.assert_refused(spelling.format(f"{scratch}/inner"), "its path is a link")
 
 
 @approvals_budgeted

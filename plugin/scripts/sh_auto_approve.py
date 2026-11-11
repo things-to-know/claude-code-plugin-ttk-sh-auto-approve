@@ -120,7 +120,7 @@ import shlex
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from stat import S_ISDIR, S_ISREG
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import NoReturn
 
 # Maximum command length inspected before defaulting to user prompt (matches host caution)
@@ -447,6 +447,11 @@ _SESSION_CWD: str | None = None
 # The `scratchpad_dir` of the hook payload. Set by `main()`; the scratchpad in reach is that
 # directory, and none is while it is unset. See `_scratch_directory`.
 _SCRATCHPAD_DIR: str | None = None
+
+# The symbolic and hard links an `ln` in the command being classified makes: where each will be,
+# with each parent directory resolved, mapped to the absolute paths it may lead to. Set by
+# `_classify` for each command, and read by `_resolutions`; see `_record_planned_links`.
+_PLANNED_LINKS: dict[str, set[str]] = {}
 
 # The setting sources the session loaded. `main()` sets it to None, so the first call that needs
 # it reads them from Claude Code's command line (`_session_setting_sources`). In process, as
@@ -4044,7 +4049,7 @@ def _check_cd(args: list[str]) -> None:
     # from where the link leads, as `realpath` alone does. `realpath` resolves a link anywhere
     # along the way in either.
     joined = os.path.join(root, target)
-    for resolved in {os.path.realpath(os.path.normpath(joined)), os.path.realpath(joined)}:
+    for resolved in {*_resolutions(os.path.normpath(joined)), *_resolutions(joined)}:
         if resolved != root and not resolved.startswith(root + os.sep):
             raise NotReadOnly(f"cd outside the project: {target}")
 
@@ -4904,7 +4909,7 @@ def _names_a_credential_unguarded(
     special = PATH_SPECIAL.search(text)
     if special is None:
         for absolute in spellings:
-            for candidate in {os.path.normpath(absolute), os.path.realpath(absolute)}:
+            for candidate in {os.path.normpath(absolute), *_resolutions(absolute)}:
                 if PROCESS_SECRETS.match(candidate):
                     return True
                 if any(_is_under(candidate, root) for root in roots):
@@ -4941,7 +4946,7 @@ def _names_a_credential_unguarded(
     for absolute in spellings:
         prefix = absolute[: len(absolute) - len(text) + special.start()]
         directory, _, partial = prefix.rpartition("/")
-        for resolved in {os.path.normpath(directory or "/"), os.path.realpath(directory or "/")}:
+        for resolved in {os.path.normpath(directory or "/"), *_resolutions(directory or "/")}:
             # `dir/` keeps its slash, so a root that starts with it is one the wildcard can
             # reach; `dir/.ss` is a root's own name in part. A `.` or `..` is a directory
             # too, as in `/..*`, which is `/` and every name under it.
@@ -5373,8 +5378,11 @@ def _in_scope_unguarded(absolute: str, scope: _ReadScope) -> bool:
     # Resolved as given, not as `normpath` reads it: the kernel resolves a link before the `..`
     # after it, so `l/../x` is the `x` beside where `l` leads, and `realpath` does the same.
     # The scratchpad's check above is given the path as it is for the same reason.
-    resolved = os.path.realpath(absolute)
-    return any(_is_under(normal, root) and _is_under(resolved, root) for root in scope.roots)
+    resolutions = _resolutions(absolute)
+    return all(
+        any(_is_under(normal, root) and _is_under(resolved, root) for root in scope.roots)
+        for resolved in resolutions
+    )
 
 
 VARIABLE_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -5790,7 +5798,19 @@ def _scratch_root() -> str | None:
     if _SCRATCHPAD_DIR is None:
         return None
     directory = _SCRATCHPAD_DIR.rstrip("/")
-    return directory if SCRATCH_DIRECTORY.fullmatch(directory) is not None else None
+    if SCRATCH_DIRECTORY.fullmatch(directory) is None:
+        return None
+    # A scratchpad whose own path is a link takes in wherever the link leads, as one an earlier
+    # command replaced with `ln -s ~` would (#79). A link above it, as macOS's `/tmp` is, is not
+    # its own path.
+    try:
+        if S_ISLNK(os.lstat(directory).st_mode):
+            return None
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return None
+    return directory
 
 
 def _scratch_redirect() -> re.Pattern[str] | None:
@@ -5819,9 +5839,276 @@ def _resolves_into_scratch(path: str) -> bool:
     if root is None:
         return False
     try:
-        return _is_under(os.path.realpath(path), os.path.realpath(root))
+        resolved_root = os.path.realpath(root)
+        return all(_is_under(resolved, resolved_root) for resolved in _resolutions(path))
     except (OSError, ValueError):
         return False  # a path that cannot be resolved is not one to vouch for
+
+
+# The links one `ln` makes, and all of a command's, past which it is one this module doesn't
+# read: each is a branch of every path resolved through it
+MAX_PLANNED_LINKS = 32
+
+# The most places one path can lead to through the planned links, and the most links one
+# resolution follows, as the kernel's own limit on a path is 40
+MAX_RESOLUTIONS = 64
+MAX_LINK_HOPS = 40
+
+# `ln`'s options, GNU's and BSD's: those that take nothing, and those that take the next word
+LN_FLAG_LETTERS = frozenset("bdfFhiLnPrsTvw")
+LN_VALUE_LETTERS = frozenset("St")
+LN_LONG_FLAGS = frozenset(
+    {
+        "--backup",
+        "--directory",
+        "--force",
+        "--interactive",
+        "--logical",
+        "--no-dereference",
+        "--no-target-directory",
+        "--physical",
+        "--relative",
+        "--symbolic",
+        "--verbose",
+    }
+)
+LN_LONG_VALUES = frozenset({"--suffix", "--target-directory"})
+
+# Programs that run the program their words name, `ln` among them, where its operands are not
+# words this module reads in order: from the input, as `xargs ln`, or among others, as
+# `find -exec ln`
+RUNS_ANOTHER_PROGRAM = frozenset(
+    {
+        "busybox",
+        "command",
+        "doas",
+        "env",
+        "exec",
+        "find",
+        "nice",
+        "nohup",
+        "setsid",
+        "stdbuf",
+        "sudo",
+        "time",
+        "timeout",
+        "xargs",
+    }
+)
+
+
+def _resolutions(path: str) -> set[str]:
+    """Where ``path`` leads, through the links on disk and those the command makes.
+
+    `os.path.realpath`, when the command makes none. Otherwise each planned link is taken and
+    not taken, since an `ln` may fail and leave what was there, and each target it may have, so
+    a path through one is each place it may be once the command has run. A branch that follows
+    more than `MAX_LINK_HOPS` links is a loop, through which the kernel opens nothing. Raises
+    `OSError` past `MAX_RESOLUTIONS`, which each caller reads as a path it can't place.
+    """
+    if not _PLANNED_LINKS:
+        return {os.path.realpath(path)}
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+    found: set[str] = {os.path.realpath(path)}
+    _resolve_planned("/", path.split("/"), 0, found)
+    return found
+
+
+def _resolve_planned(resolved: str, pending: list[str], hops: int, found: set[str]) -> None:
+    """`_resolutions`, from ``resolved``, a directory with no link in it, with ``pending`` left.
+
+    As the kernel resolves: a link before the `..` after it, and a relative target from the
+    directory that holds the link.
+    """
+    while pending:
+        component, pending = pending[0], pending[1:]
+        if component in ("", "."):
+            continue
+        if component == "..":
+            resolved = os.path.dirname(resolved)
+            continue
+        candidate = os.path.join(resolved, component)
+        if hops >= MAX_LINK_HOPS:
+            return  # the kernel's `ELOOP`: no file is opened through it
+        for target in _PLANNED_LINKS.get(candidate, ()):
+            _resolve_planned("/", target.split("/") + pending, hops + 1, found)
+        if os.path.islink(candidate):
+            target = os.readlink(candidate)
+            start = "/" if target.startswith("/") else resolved
+            _resolve_planned(start, target.split("/") + pending, hops + 1, found)
+            return
+        resolved = candidate
+    found.add(resolved)
+    if len(found) > MAX_RESOLUTIONS:
+        raise OSError("too many places one path can lead")
+
+
+def _record_planned_links(
+    segments: list[list[str]], parts: list[tuple[str, str]], bases: list[str]
+) -> None:
+    """Add to `_PLANNED_LINKS` each link an `ln` in these segments makes, from each of ``bases``.
+
+    An `ln` whose operands this module can't place, or one that another program runs, as
+    `xargs ln` does, leaves the command to the user: no rule approves a read through a link it
+    can't see. Other programs make links too, `tar x`, `unzip`, `cp -s` and `git worktree add`
+    among them; they are the gap `AGENTS.md`'s threat model names.
+    """
+    for segment in segments:
+        start = _command_index(segment, refuse=False)
+        if start is None:
+            continue
+        words = segment[start:]
+        if not words:
+            continue
+        program = os.path.basename(_expand(words[0], parts))
+        if program in RUNS_ANOTHER_PROGRAM and any(
+            os.path.basename(_expand(word, parts)) == "ln" for word in words[1:]
+        ):
+            raise NotReadOnly(f"{program} runs ln, which makes a link this module can't place")
+        if program != "ln":
+            continue
+        for key, target in _ln_links(words[1:], parts, bases):
+            _PLANNED_LINKS.setdefault(key, set()).add(target)
+    if sum(len(targets) for targets in _PLANNED_LINKS.values()) > MAX_PLANNED_LINKS:
+        raise NotReadOnly("more links than this module reads")
+
+
+def _ln_links(
+    tokens: list[str], parts: list[tuple[str, str]], bases: list[str]
+) -> list[tuple[str, str]]:
+    """Each link these `ln` arguments make, as the path it will be at and the one it leads to.
+
+    Read from each of ``bases``. Its forms: `ln T` makes `./basename(T)`, `ln T... DIR` and
+    `ln -t DIR T...` make `DIR/basename(T)`, and `ln -T T L` makes `L`. `ln T L` makes `L`, or
+    `L/basename(T)` when `L` is a directory, and both are read. A symbolic link leads where its
+    text does from the directory that holds it, or with `-r` where `T` does from the working
+    directory, as a hard link does. A hard link of a symbolic link is a copy of that link with
+    `-P`, GNU's default, whose text then leads from the new link's directory, and of where it
+    leads with `-L`, BSD's: without either, both are read.
+    """
+    symbolic = relative = no_target_directory = logical = physical = False
+    directory: str | None = None
+    operands: list[str] = []
+    words = [_ln_word(token, parts) for token in tokens]
+    index = 0
+    options = True
+    while index < len(words):
+        word = words[index]
+        index += 1
+        if options and word == "--":
+            options = False
+        elif options and word.startswith("--"):
+            name, equals, value = word.partition("=")
+            if name in LN_LONG_VALUES:
+                if not equals:
+                    if index >= len(words):
+                        raise NotReadOnly(f"ln option without its value: {word}")
+                    value, index = words[index], index + 1
+                if name == "--target-directory":
+                    directory = value
+            elif name == "--backup" or (name in LN_LONG_FLAGS and not equals):
+                symbolic = symbolic or name == "--symbolic"
+                relative = relative or name == "--relative"
+                no_target_directory = no_target_directory or name == "--no-target-directory"
+                logical = logical or name == "--logical"
+                physical = physical or name == "--physical"
+            else:
+                raise NotReadOnly(f"ln option this module doesn't read: {word}")
+        elif options and word.startswith("-") and word != "-":
+            for position, letter in enumerate(word[1:], start=1):
+                if letter in LN_VALUE_LETTERS:
+                    value = word[position + 1 :]
+                    if not value:
+                        if index >= len(words):
+                            raise NotReadOnly(f"ln option without its value: {word}")
+                        value, index = words[index], index + 1
+                    if letter == "t":
+                        directory = value
+                    break
+                if letter not in LN_FLAG_LETTERS:
+                    raise NotReadOnly(f"ln option this module doesn't read: {word}")
+                symbolic = symbolic or letter == "s"
+                relative = relative or letter == "r"
+                no_target_directory = no_target_directory or letter == "T"
+                logical = logical or letter == "L"
+                physical = physical or letter == "P"
+        else:
+            operands.append(word)
+    if not operands:
+        return []
+    places: list[tuple[str, str]] = []  # (where the link goes, what it is made from)
+    if directory is not None:
+        places = [(os.path.join(directory, os.path.basename(t.rstrip("/"))), t) for t in operands]
+    elif len(operands) == 1:
+        places = [(os.path.basename(operands[0].rstrip("/")) or ".", operands[0])]
+    elif len(operands) == 2 and no_target_directory:
+        places = [(operands[1], operands[0])]
+    elif len(operands) == 2:
+        made_from, name = operands
+        places = [
+            (name, made_from),
+            (os.path.join(name, os.path.basename(made_from.rstrip("/"))), made_from),
+        ]
+    else:
+        *sources, last = operands
+        places = [(os.path.join(last, os.path.basename(t.rstrip("/"))), t) for t in sources]
+    links: list[tuple[str, str]] = []
+    for base in bases:
+        for place, made_from in places:
+            parent, name = os.path.split(os.path.join(base, place).rstrip("/"))
+            if name in ("", ".", ".."):
+                continue  # a directory's own entry, which `ln` fails to replace
+            for resolved_parent in _resolutions(parent or "/"):
+                key = os.path.join(resolved_parent, name)
+                if symbolic and not relative:
+                    links.append((key, os.path.join(resolved_parent, made_from)))
+                elif symbolic:
+                    links.append((key, os.path.join(base, made_from)))
+                else:
+                    targets = _hard_link_targets(
+                        os.path.join(base, made_from),
+                        resolved_parent,
+                        logical=logical,
+                        physical=physical,
+                    )
+                    links += [(key, target) for target in targets]
+    if len(links) > MAX_PLANNED_LINKS:
+        raise NotReadOnly("more links than this module reads")
+    return links
+
+
+def _hard_link_targets(source: str, parent: str, *, logical: bool, physical: bool) -> list[str]:
+    """Where a hard link of ``source``, made in ``parent``, leads; see `_ln_links`.
+
+    A source that is a link this command makes is one whose text this module didn't keep, so
+    `NotReadOnly` unless `-L` makes the hard link of where it leads.
+    """
+    directory, name = os.path.split(source)
+    planned = any(
+        os.path.join(resolved, name) in _PLANNED_LINKS for resolved in _resolutions(directory)
+    )
+    if planned and not (logical and not physical):
+        raise NotReadOnly(f"ln hard-links a link this command makes: {source}")
+    targets = []
+    if os.path.islink(source) and not (logical and not physical):
+        text = os.readlink(source)
+        targets.append(text if text.startswith("/") else os.path.join(parent, text))
+    if not os.path.islink(source) or not (physical and not logical):
+        targets.append(source)
+    return targets
+
+
+def _ln_word(token: str, parts: list[tuple[str, str]]) -> str:
+    """An `ln` argument as the program gets it, or `NotReadOnly` for one the shell decides."""
+    if _word_the_shell_builds(token, parts):
+        raise NotReadOnly(f"ln given a word the shell builds: {_expand(token, parts)}")
+    word = _expand(token, parts)
+    if token.startswith("~"):
+        word = _tilde_word(word)
+    if UNREAD_VALUE in word:
+        raise NotReadOnly(f"ln given a directory the shell picks: {token}")
+    return word
 
 
 def _zsh_equals_expansion(token: str, parts: list[tuple[str, str]]) -> bool:
@@ -5897,9 +6184,28 @@ def _check_input_targets(targets: list[str], scope: _ReadScope) -> None:
                 raise NotReadOnly(f"< reads outside the working directories: {target}")
 
 
+# How many times `_classify` reads a command again for the links it found it makes
+MAX_LINK_PASSES = 3
+
+
 def _classify(command: str, depth: int = 0) -> None:
-    """Raise ``NotReadOnly`` with the reason, or return having found none."""
-    _classify_with(command, depth, None)
+    """Raise ``NotReadOnly`` with the reason, or return having found none.
+
+    A link an `ln` in the command makes is known only once that `ln` is read, which can be after
+    a word the link leads through, as in a substitution's body, read last. So the command is
+    read again with the links the last pass found, until a pass finds no new one.
+    """
+    global _PLANNED_LINKS  # noqa: PLW0603 - per command, as `_SESSION_CWD` is per call
+    _PLANNED_LINKS = {}
+    try:
+        for _ in range(MAX_LINK_PASSES):
+            known = {key: set(targets) for key, targets in _PLANNED_LINKS.items()}
+            _classify_with(command, depth, None)
+            if known == _PLANNED_LINKS:
+                return
+        raise NotReadOnly("links that make further links, past what this module reads")
+    finally:
+        _PLANNED_LINKS = {}
 
 
 def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> None:
@@ -6050,6 +6356,10 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # read scope and each substitution's body
     bases, shell_bases = _working_directories(segments, parts, inherited, known_values)
     state = _ShellState(bases, shell_bases, known_values, bindings, backgrounds=backgrounds)
+
+    # The links an `ln` here makes, which every path below is resolved through as if they were
+    # there already: `ln -s ~ k && cat k/.ssh/id_rsa` reads a credential store (#79)
+    _record_planned_links(segments, parts, shell_bases)
 
     # Layer B: no word may name a credential store, whatever program it belongs to and
     # whatever tier would otherwise approve it.

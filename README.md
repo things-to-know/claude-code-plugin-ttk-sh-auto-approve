@@ -46,6 +46,11 @@ A [Claude Code](https://code.claude.com/docs) plugin with 2 hooks:
 > - `Read(//**/.env)` matches only files named `.env`: `.env.local` and the like need a rule of
 >   their own, such as `Read(//**/.env.*)`
 > - `permissions.blockReadsOutsideWorkingDirectories`, for paths outside your working directories
+> - Neither stops a read through a link the same command makes, such as
+>   `ln -s ~ k && cat k/.ssh/id_rsa` under an allow rule for `ln`: Claude Code checks the path
+>   before the link is there. The hook resolves a path through a link an `ln` in the command
+>   makes, but not through one that `tar x`, `unzip`, `git worktree add` or a script makes, so
+>   an allow rule for a program that makes links reaches wherever they lead
 >
 > The hook reads `additionalDirectories` only from the project's `.claude/settings.json` and
 > `.claude/settings.local.json`, and only where Claude Code applies them: in a workspace you

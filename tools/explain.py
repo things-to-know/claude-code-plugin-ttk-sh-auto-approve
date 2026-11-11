@@ -374,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"{parser.prog}: warning: the hook takes no scratchpad from --scratchpad-dir "
             f"{args.scratchpad_dir!r}, only from an absolute, normalized path the shell reads "
-            "as it is: the verdicts are a session's without one",
+            "as it is, that is not itself a link: the verdicts are a session's without one",
             file=sys.stderr,
         )
 

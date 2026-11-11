@@ -40,6 +40,12 @@ insists on its own filename, symlink to this file rather than copying it.
     - The hook approves reading a `.env` file inside the project, an `additionalDirectories`
       entry or the session's scratchpad, `grep -r` included
     - README § "Secrets inside your project" tells users what still stops it
+  - Known gap: a link a command makes before it reads through it
+    - Both layers resolve a path through the links on disk, and through each link an `ln` in
+      the same command makes (`_record_planned_links`)
+    - Not through one that another program makes, under an operator's rule for it: `tar x`,
+      `unzip`, `cp -s`, `git worktree add` or a script
+    - A scratchpad whose own path is a link is none: no command reaches it
   - One approval makes a network call: a `curl` GET of one URL on a listed site
     - What leaves the machine is a URL Claude wrote, which a poisoned context can put a secret in
       - So the request goes to an exact listed host, with no userinfo, redirect, proxy or
