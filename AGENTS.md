@@ -40,6 +40,24 @@ insists on its own filename, symlink to this file rather than copying it.
     - The hook approves reading a `.env` file inside the project, an `additionalDirectories`
       entry or the session's scratchpad, `grep -r` included
     - README § "Secrets inside your project" tells users what still stops it
+  - Known gap: a link a command makes before it reads through it
+    - Both layers resolve a path through the links on disk, and through each link an `ln` in
+      the same command makes (`_record_planned_links`)
+    - Not through one that another program makes, under an operator's rule for it: `tar x`,
+      `unzip`, `cp -s`, `git worktree add` or a script
+    - A scratchpad whose own path is a link is none: no command reaches it
+  - Known gap: git in a repository whose root is out of the read roots, as for a project that
+    is a package of a larger repository
+    - The hook measures each path git takes, but not what a subcommand reads with none:
+      `git log -p` and `git diff` read the whole repository
+  - A reader that follows links while it recurses, such as `grep -R`, reads where they lead
+    - Both layers walk its directory operands for links (`LINK_FOLLOWERS`), every entry,
+      ignore files or not
+    - Past `MAX_WALKED_ENTRIES` the command is refused outright, under any rule
+    - Behind `xargs`, `find -exec` or `parallel`, no word names what it reads: refused outright
+    - An operand below a value the hook didn't read isn't walked: the residual of `grep -r x "$d"`
+    - A wildcard operand is matched every way a startup file can make the shell read it
+      (`_glob_matches`); one it can't bound, such as `**`, is walked from its literal directory
   - One approval makes a network call: a `curl` GET of one URL on a listed site
     - What leaves the machine is a URL Claude wrote, which a poisoned context can put a secret in
       - So the request goes to an exact listed host, with no userinfo, redirect, proxy or
@@ -98,13 +116,11 @@ insists on its own filename, symlink to this file rather than copying it.
   - For a path-based widening, the refusals include a recursive read, such as `grep -r`, of the
     directory holding each credential store: Layer B refuses a word that names a store, not one
     that names its parent
-  - One exception, git's quoted pathspecs, until #48 gives them refusals:
-    - A quoted `'../*'` reaches no further than a literal `..`, which the hook approves too, as it
-      measures none of git's paths
-    - git stops both above the repository's root, which is wider than the project when the
-      project sits inside a larger repository
-    - `test_git_refuses_a_pathspec_above_its_repository` pins git's stop, for a repository whose
-      root is the project
+  - git's quoted pathspecs, such as `'../*'`, reach no further than a literal `..`
+    - Where the repository's root is in the read roots, git stops both there:
+      `test_git_refuses_a_pathspec_above_its_repository` pins that stop
+    - Where it isn't, the hook measures each path git takes (`_check_git_paths`), with
+      `RefusesGitPathsInAnEnclosingRepository`'s refusals
 - **Stdlib only, isolated interpreter.** `-I` ignores `PYTHONPATH` and user
   site-packages, and keeps the script's own directory off `sys.path`. If the
   hook is split into modules, add its directory explicitly:

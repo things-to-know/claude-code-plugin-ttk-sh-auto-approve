@@ -120,7 +120,7 @@ import shlex
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from stat import S_ISDIR, S_ISREG
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import NoReturn
 
 # Maximum command length inspected before defaulting to user prompt (matches host caution)
@@ -448,6 +448,11 @@ _SESSION_CWD: str | None = None
 # directory, and none is while it is unset. See `_scratch_directory`.
 _SCRATCHPAD_DIR: str | None = None
 
+# The symbolic and hard links an `ln` in the command being classified makes: where each will be,
+# with each parent directory resolved, mapped to the absolute paths it may lead to. Set by
+# `_classify` for each command, and read by `_resolutions`; see `_record_planned_links`.
+_PLANNED_LINKS: dict[str, set[str]] = {}
+
 # The setting sources the session loaded. `main()` sets it to None, so the first call that needs
 # it reads them from Claude Code's command line (`_session_setting_sources`). In process, as
 # `tools/explain.py` runs the module, it is every source, as in a session started without
@@ -494,11 +499,15 @@ INDIRECT = re.compile(r"\$\{!(?![A-Za-z_][A-Za-z0-9_]*(?:\[[@*]\]|[@*])\})")
 ZSH_PARAMETER_FLAGS = re.compile(r"\$\{\s*\(")
 ZSH_GLOB_SUBST = re.compile(r"\$\{?~")
 
-# A `printf` conversion whose argument zsh evaluates as arithmetic: a numeric type, or any
-# conversion taking its width or precision from an argument (`%*s`, `%.*f`).
-PRINTF_NUMERIC = re.compile(
-    r"%[-+ #0']*(?:\d+)?(?:\.\d*)?[diouxXeEfFgGaA]|%[-+ #0']*(?:\d*\*|\d*\.\*)"
+# A `printf` conversion: `%%`, or a position (`%1$d`), flags, a width and a precision, each a
+# number or a `*` that takes it from an operand (`%*s`, `%.*f`, `%*2$d`), length modifiers, and
+# the conversion letter. zsh evaluates as arithmetic the operand of a numeric letter, and of
+# each `*`. No letter, at the end of the format, is read as unknown.
+PRINTF_CONVERSION = re.compile(
+    r"%(?:%|(\d+\$)?[-+ #0']*(\*(\d+\$)?|\d+)?(?:\.(\*(\d+\$)?|\d*))?[hlLjzt]*(.)?)", re.DOTALL
 )
+PRINTF_NUMERIC_LETTERS = frozenset("diouxXeEfFgGaA")
+PRINTF_TEXT_LETTERS = frozenset("sbqc")
 
 # A field wider than this is not alignment:
 # - `printf '%099999999d' 1` allocates 100 MB and prints them into Claude's context
@@ -507,7 +516,10 @@ PRINTF_NUMERIC = re.compile(
 PRINTF_WIDTH_CAP = 1000
 PRINTF_WIDTH = re.compile(r"%[-+ #0']*(\d+)?(?:\.(\d+))?")
 PRINTF_STAR = re.compile(r"%[-+ #0']*\d*\.?\*")
-PRINTF_INTEGER_ARGUMENT = re.compile(r"[-+]?\d+")
+# A number spelled out, in the forms zsh's arithmetic reads as a constant: an integer, or a
+# decimal for `%e`, `%f` and `%g`. Anything else is an expression zsh evaluates, and a name, a
+# subscript or a `base#` prefix can run a command: `printf '%d' 'path[`cmd`1]'` runs `cmd`.
+PRINTF_NUMBER_ARGUMENT = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
 # Text that is parameter expansions and nothing else, so that the shell supplies all of it.
 # `$(` never survives the scan, so only the parameter forms are here.
@@ -1266,7 +1278,10 @@ def _is_bare_expansion_of(token: str, parts: list[tuple[str, str]], names: froze
 # body, `for p in a; do p=-i; ...`, or a zsh header that binds it second, `for q p in x -i`,
 # leaves it bound to a value no header spells.
 def _safe_loop_names(
-    segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
+    segments: list[list[str]],
+    parts: list[tuple[str, str]],
+    bindings: dict[str, int],
+    known_values: dict[str, list[str] | None],
 ) -> frozenset[str]:
     safe: dict[str, int] = {}
     for segment in segments:
@@ -1274,7 +1289,7 @@ def _safe_loop_names(
             continue
         name = _expand(segment[1], parts)
         values = segment[3:]
-        if values and all(_value_is_literal_non_flag(word, parts) for word in values):
+        if values and all(_value_is_literal_non_flag(word, parts, known_values) for word in values):
             safe[name] = safe.get(name, 0) + 1
     return frozenset(name for name, count in safe.items() if bindings.get(name) == count)
 
@@ -2068,18 +2083,28 @@ def _arg_variants(
     return [list(variant) for variant in itertools.product(*choices) if list(variant) != args]
 
 
-def _value_is_literal_non_flag(token: str, parts: list[tuple[str, str]]) -> bool:
+def _value_is_literal_non_flag(
+    token: str, parts: list[tuple[str, str]], known_values: dict[str, list[str] | None]
+) -> bool:
     """A single loop-list value that the operator wrote out and that is not a flag.
 
-    It must carry no expansion, substitution, glob or brace the shell would still act on --
-    anything that leaves the final text up to the shell disqualifies it -- and the literal
-    it does spell must not begin with `-`.
+    It must carry no substitution, glob or brace the shell would still act on, and not be
+    nothing but expansions, as `_word_the_shell_decides` reads them. An expansion glued to
+    literal text is read with the values the command sets, as `_word_shapes` reads an
+    argument's: `o=--o; for p in ${o}utput=x` is `--output=x`. No shape may begin with `-`, nor
+    be one `_flag_an_expansion_spells`, and an unquoted expansion must hold a value bash
+    neither splits nor globs, as `_unclean_expansion` reads it.
     """
     if _word_the_shell_decides(token, parts) or _carries_substitution(token, parts):
         return False
     if _carries_live_glob(token) or _carries_brace_expansion(token):
         return False
-    return not _expand(token, parts).startswith("-")
+    if _unclean_expansion(token, known_values) is not None:
+        return False
+    shapes = _word_shapes(token, parts, known_values)
+    return shapes is not None and not any(
+        shape.startswith("-") or _flag_an_expansion_spells(shape) for shape in shapes
+    )
 
 
 def _word_the_shell_decides(token: str, parts: list[tuple[str, str]]) -> bool:
@@ -3839,21 +3864,84 @@ def _check_printf(args: list[str]) -> None:
         raise NotReadOnly("printf assigns to a variable with -v")
 
     # zsh's `printf` evaluates the argument of a numeric conversion -- and of a `*` width
-    # -- as an arithmetic expression, so `printf '%d' "$x"` runs what `$((x))` runs. A
-    # number spelled out is fine; one the shell supplies is a value this module never read.
-    if any(PRINTF_NUMERIC.search(arg) for arg in args) and any(
-        "$" in arg or SUBSTITUTION_MARKER in arg for arg in args
-    ):
-        raise NotReadOnly("printf evaluates an expanded value as arithmetic")
+    # -- as an arithmetic expression, after the shell's quoting is gone: `printf '%d' "$x"`
+    # runs what `$((x))` runs, a quoted `'path[`cmd`1]'` runs `cmd`, and a bare name `x` is
+    # evaluated as the value the command may have assigned it. Only a number spelled out is
+    # read: each operand such a conversion consumes must be one.
+    words = args[1:] if args[:1] == ["--"] else args
+    if words:
+        evaluated = _printf_evaluated_operands(words[0], len(words) - 1)
+        if not all(PRINTF_NUMBER_ARGUMENT.fullmatch(words[1 + i]) for i in evaluated):
+            raise NotReadOnly("printf evaluates an operand that is not a number as arithmetic")
 
     if _exceeds_width_cap(args) or (
         any(PRINTF_STAR.search(arg) for arg in args)
         and any(
-            PRINTF_INTEGER_ARGUMENT.fullmatch(arg) and abs(int(arg)) > PRINTF_WIDTH_CAP
+            PRINTF_NUMBER_ARGUMENT.fullmatch(arg) and abs(float(arg)) > PRINTF_WIDTH_CAP
             for arg in args
         )
     ):
         raise NotReadOnly(f"printf field wider than {PRINTF_WIDTH_CAP}")
+
+
+def _check_printf_unread_format(
+    args: list[str],
+    tokens: list[str],
+    parts: list[tuple[str, str]],
+    known_values: dict[str, list[str] | None],
+) -> None:
+    """Read a `printf` format that holds a value this module didn't read as an unknown conversion.
+
+    Every operand must then be a number. `$_`, a name the command binds to values unread, or one
+    it never binds, such as an environment variable, can be `%d`: in
+    `true %d; printf "a$_" 'path[`cmd`1]'`, zsh runs `cmd`. A value the command sets is read by
+    `_arg_variants` instead.
+    """
+    index = 1 if args[:1] == ["--"] else 0
+    if index >= len(args):
+        return
+    shapes = _word_shapes(tokens[index], parts, known_values)
+    if shapes is None:
+        raise NoOpinion(TOO_MANY_SHAPES)
+    for shape in shapes:
+        if UNREAD_VALUE in shape or OPERATOR_VALUE in shape:
+            unread = shape.replace(UNREAD_VALUE, "%?").replace(OPERATOR_VALUE, "%?")
+            _check_printf([*args[:index], unread, *args[index + 1 :]])
+
+
+def _printf_evaluated_operands(text: str, count: int) -> list[int]:
+    r"""The indexes of the `count` operands that zsh's `printf` evaluates as arithmetic.
+
+    `text` is the format. Each conversion consumes the next operand, and each `*` one before it;
+    the format is reused while operands remain, as in both shells. A position (`%1$d`), or a
+    letter neither table holds, is not mapped: every operand counts as evaluated then, if any
+    conversion is numeric. An escaped `%`, such as `\045`, is literal text in both shells, so
+    only a spelled `%` starts a conversion.
+    """
+    kinds: list[bool] = []
+    unmapped = False
+    for match in PRINTF_CONVERSION.finditer(text):
+        if match.group(0) == "%%":
+            continue
+        position, width, width_position, precision, precision_position, letter = match.groups()
+        if position or width_position or precision_position:
+            unmapped = True
+        if width and width.startswith("*"):
+            kinds.append(True)
+        if precision and precision.startswith("*"):
+            kinds.append(True)
+        if letter in PRINTF_NUMERIC_LETTERS:
+            kinds.append(True)
+        elif letter in PRINTF_TEXT_LETTERS:
+            kinds.append(False)
+        else:
+            unmapped = True
+            kinds.append(True)
+    if not any(kinds):
+        return []
+    if unmapped:
+        return list(range(count))
+    return [i for i in range(count) if kinds[i % len(kinds)]]
 
 
 def _exceeds_width_cap(formats: list[str]) -> bool:
@@ -3961,7 +4049,7 @@ def _check_cd(args: list[str]) -> None:
     # from where the link leads, as `realpath` alone does. `realpath` resolves a link anywhere
     # along the way in either.
     joined = os.path.join(root, target)
-    for resolved in {os.path.realpath(os.path.normpath(joined)), os.path.realpath(joined)}:
+    for resolved in {*_resolutions(os.path.normpath(joined)), *_resolutions(joined)}:
         if resolved != root and not resolved.startswith(root + os.sep):
             raise NotReadOnly(f"cd outside the project: {target}")
 
@@ -4235,6 +4323,8 @@ def _check_command(
                     raise type(error)(
                         f"{error}, with the values this command sets: {' '.join(variant)}"
                     ) from None
+        if program == "printf":
+            _check_printf_unread_format(args, arg_tokens, parts, known_values)
     elif program not in READ_ONLY:
         raise NoOpinion(f"unrecognized program: {program}")
 
@@ -4251,14 +4341,17 @@ def _check_command(
             problem = _read_scope_problem(arg_tokens[position], args[position], parts, scope)
             if problem is not None:
                 raise NoOpinion(f"git -C points at {problem}")
-        # Layer A, below, for the files git opens, which it resolves from the `-C` directory
+        # Layer A, below, for the files git opens, which it resolves from the `-C` directory,
+        # and for the paths it reads in a repository whose root is outside the read roots
         found = _git_file_operands(args, index)
-        if found and scope is not None:
+        if scope is not None:
             files_scope = scope
             if directories:
                 token = arg_tokens[directories[0]]
                 files_scope = _directory_scope(token, parts, known_values, scope)
-            _check_read_scope(f"git {args[index]}", found, args, arg_tokens, parts, files_scope)
+            if found:
+                _check_read_scope(f"git {args[index]}", found, args, arg_tokens, parts, files_scope)
+            _check_git_paths(args, index, arg_tokens, parts, files_scope)
         directory = args[directories[0]] if directories else None
         _check_git_remote_reach(args[index:], directory, scope)
 
@@ -4272,6 +4365,209 @@ def _check_command(
     # own allow rules decide, as they do for any program the module cannot read.
     if program in READER_SPECS:
         _check_read_scope(program, _file_operands(program, args), args, arg_tokens, parts, scope)
+    # And for a link it follows while it recurses, wherever the link is (#63)
+    if program in LINK_FOLLOWERS:
+        links = _followed_links(program, args, arg_tokens, parts, scope.bases, known_values)
+        # The link by its own path, which `_in_scope` resolves as the scratchpad is resolved:
+        # its target alone is out of a scratchpad whose path goes through a link, as on macOS
+        for link, _ in links:
+            if not _in_scope(link, scope):
+                raise NoOpinion(f"{program} follows the link {link} out of the working directories")
+
+
+# The read subcommands whose operands include paths git resolves in its repository: pathspecs,
+# and `<rev>:<path>` and `:<path>`, which it reads from the repository's root
+GIT_PATH_SUBCOMMANDS = frozenset(
+    {
+        "blame",
+        "cat-file",
+        "check-ignore",
+        "diff",
+        "grep",
+        "log",
+        "ls-files",
+        "ls-tree",
+        "rev-list",
+        "shortlog",
+        "show",
+        "stash",
+        "status",
+    }
+)
+
+# The options of `GIT_PATH_SUBCOMMANDS` whose value, the next word, is no path: a pattern, a
+# string, a number or a name. `_check_git_paths` skips that word. Only a value spelled as its own
+# word is listed: one attached, as `--author=x` or `-Sx`, is part of a word that starts with `-`.
+# `--pretty`, whose value is optional, and `--format`, whose value git takes only after `=`, are
+# not: the word after either is a path.
+# `-L`, of `log`, is `<range>:<file>`, whose file is read from where git runs, so it is measured.
+GIT_REVISION_VALUES = frozenset(
+    {
+        "-G",
+        "-I",
+        "-S",
+        "-n",
+        "--after",
+        "--author",
+        "--before",
+        "--committer",
+        "--date",
+        "--diff-filter",
+        "--encoding",
+        "--find-object",
+        "--grep",
+        "--ignore-matching-lines",
+        "--max-count",
+        "--since",
+        "--skip",
+        "--until",
+    }
+)
+GIT_PATH_FLAG_VALUES = {
+    "blame": frozenset({"-L", "--ignore-rev"}),
+    "grep": frozenset({"-e", "-A", "-B", "-C", "-m", "--max-count", "--max-depth", "--threads"}),
+    "ls-files": frozenset({"-x", "--exclude", "--format", "--exclude-per-directory"}),
+    "ls-tree": frozenset({"--format"}),
+    "diff": GIT_REVISION_VALUES,
+    "log": GIT_REVISION_VALUES,
+    "rev-list": GIT_REVISION_VALUES,
+    "shortlog": GIT_REVISION_VALUES,
+    "show": GIT_REVISION_VALUES,
+    "stash": GIT_REVISION_VALUES,
+}
+
+# Pathspec magic: `:(top,icase)path`, or the short `:/!path`, whose `/` is `top`
+PATHSPEC_LONG_MAGIC = re.compile(r":\(([^)]*)\)(.*)", re.DOTALL)
+PATHSPEC_SHORT_MAGIC = re.compile(r":([/!^]*):?(.*)", re.DOTALL)
+
+
+def _check_git_paths(
+    args: list[str],
+    index: int,
+    tokens: list[str],
+    parts: list[tuple[str, str]],
+    scope: _ReadScope,
+) -> None:
+    """Raise ``NoOpinion`` for a path git reads out of the working directories (#48).
+
+    git resolves its paths in the whole repository it runs in, and stops at its root, so where
+    that root is in the read roots, as the project's own is, no path git takes reaches out of
+    them. Where it isn't, as for a project that is a package of a larger repository, or under
+    a dotfiles repository at `~`, each operand of a subcommand in `GIT_PATH_SUBCOMMANDS` is
+    measured from the directory git runs in: a pathspec, and before `--` any word, which git
+    reads as a revision or a path. It has no opinion on magic that starts at the root, `:/` and
+    `:(top)`, on a tree or index path git reads from the root, `<rev>:<path>` and `:<path>`,
+    unless the path starts with `./` or `../`, and on `ls-tree --full-tree`.
+
+    Not measured: what a subcommand reads with no path, as `git log -p` and `git diff` read the
+    whole repository; `AGENTS.md` names that gap.
+    """
+    subcommand = args[index]
+    if subcommand not in GIT_PATH_SUBCOMMANDS:
+        return
+    if not any(_repository_root_out_of_scope(base, scope) for base in scope.bases):
+        return
+    values = GIT_PATH_FLAG_VALUES.get(subcommand, frozenset())
+    # `git grep`'s first operand is its pattern, unless an `-e` or `-f` gave one
+    pattern_pending = subcommand == "grep" and not any(
+        arg in ("-e", "-f") or (arg[:1] == "-" and arg[1:2] != "-" and set("ef") & set(arg))
+        for arg in args[index + 1 :]
+    )
+    after_dashes = False
+    skip = False
+    for position in range(index + 1, len(args)):
+        word, token = args[position], tokens[position]
+        if skip:
+            skip = False
+            continue
+        if word == "--" and not after_dashes:
+            after_dashes = True
+            continue
+        if not after_dashes and word.startswith("-"):
+            if word == "--full-tree" and subcommand == "ls-tree":
+                raise NoOpinion(
+                    "git ls-tree --full-tree reads the root of a repository out of scope"
+                )
+            if word == "-L" and subcommand == "log" and position + 1 < len(args):
+                # `-L <range>:<file>`: the file, after the last `:`, is read from where git runs
+                value = args[position + 1]
+                _check_git_path(value.rpartition(":")[2], tokens[position + 1], parts, scope, value)
+                skip = True
+            elif word.startswith("-L") and subcommand == "log":
+                _check_git_path(word.rpartition(":")[2], token, parts, scope, word)
+            else:
+                skip = word in values
+            continue
+        if position == index + 1 and subcommand == "stash":
+            continue  # `show`
+        if pattern_pending and not after_dashes:
+            pattern_pending = False
+            continue
+        path = _git_path_from_cwd(word, after_dashes=after_dashes)
+        _check_git_path(path, token, parts, scope, word)
+
+
+def _check_git_path(
+    path: str, token: str, parts: list[tuple[str, str]], scope: _ReadScope, word: str
+) -> None:
+    """Raise ``NoOpinion`` unless ``path``, which git reads from where it runs, is in ``scope``."""
+    if _word_the_shell_builds(token, parts):
+        raise NoOpinion(f"git given a path the shell builds: {word}")
+    for base in scope.bases:
+        if not _in_scope(os.path.join(base, path or "."), scope):
+            raise NoOpinion(f"git reads out of the working directories: {word}")
+
+
+def _git_path_from_cwd(word: str, *, after_dashes: bool) -> str:
+    """The path in ``word`` that git resolves from its working directory.
+
+    Raises ``NoOpinion`` for one it resolves from its repository's root, which
+    `_check_git_paths` reads only where that root is out of scope.
+    """
+    root_reason = f"git reads {word} from the root of a repository out of the working directories"
+    if word.startswith(":"):
+        long_magic = PATHSPEC_LONG_MAGIC.fullmatch(word)
+        if long_magic is not None:
+            names = {name.strip().split(":")[0] for name in long_magic.group(1).split(",")}
+            if "top" in names:
+                raise NoOpinion(root_reason)
+            return long_magic.group(2)
+        short_magic = PATHSPEC_SHORT_MAGIC.fullmatch(word)
+        magic, rest = short_magic.group(1), short_magic.group(2)
+        if "/" in magic:
+            raise NoOpinion(root_reason)
+        # Before `--`, a word with no magic can be the index's `:<path>` or `:<stage>:<path>`
+        if not after_dashes and not magic and not rest.startswith(("./", "../")):
+            raise NoOpinion(root_reason)
+        return rest
+    if not after_dashes and ":" in word:
+        _, _, path = word.partition(":")
+        if path in (".", "..") or path.startswith(("./", "../")):
+            return path
+        raise NoOpinion(root_reason)
+    return word
+
+
+def _repository_root_out_of_scope(base: str, scope: _ReadScope) -> bool:
+    """Whether git, run in ``base``, finds a repository whose root is out of ``scope``.
+
+    The nearest directory with a `.git`, from ``base``'s real path up, as git looks for one.
+    `GIT_DIR` or `GIT_WORK_TREE` in the environment the hook shares with the shell puts the
+    repository anywhere, and so out of scope. No repository is none to read paths in.
+    """
+    if os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE"):
+        return True
+    try:
+        directory = os.path.realpath(base)
+    except (OSError, ValueError):
+        return True
+    while True:
+        if os.path.lexists(os.path.join(directory, ".git")):
+            return not _in_scope(directory, scope)
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return False
+        directory = parent
 
 
 def _check_read_scope(
@@ -4819,7 +5115,7 @@ def _names_a_credential_unguarded(
     special = PATH_SPECIAL.search(text)
     if special is None:
         for absolute in spellings:
-            for candidate in {os.path.normpath(absolute), os.path.realpath(absolute)}:
+            for candidate in {os.path.normpath(absolute), *_resolutions(absolute)}:
                 if PROCESS_SECRETS.match(candidate):
                     return True
                 if any(_is_under(candidate, root) for root in roots):
@@ -4851,12 +5147,13 @@ def _names_a_credential_unguarded(
     if not text.startswith("/") and not relative_partial and relative_directory in ("", "."):
         # The wildcard or expansion reads the base itself, as `*` and `"$f"` do: the read
         # scope's question. No base is in a credential store, `_working_directories` sees to
-        # that, and a link in one is read by neither layer, as for `grep -R x .`
+        # that, and a link in one that the wildcard matches is read by neither layer (#54); one
+        # a reader follows while it recurses is `_refuse_followed_credential_links`'
         return False
     for absolute in spellings:
         prefix = absolute[: len(absolute) - len(text) + special.start()]
         directory, _, partial = prefix.rpartition("/")
-        for resolved in {os.path.normpath(directory or "/"), os.path.realpath(directory or "/")}:
+        for resolved in {os.path.normpath(directory or "/"), *_resolutions(directory or "/")}:
             # `dir/` keeps its slash, so a root that starts with it is one the wildcard can
             # reach; `dir/.ss` is a root's own name in part. A `.` or `..` is a directory
             # too, as in `/..*`, which is `/` and every name under it.
@@ -5288,8 +5585,11 @@ def _in_scope_unguarded(absolute: str, scope: _ReadScope) -> bool:
     # Resolved as given, not as `normpath` reads it: the kernel resolves a link before the `..`
     # after it, so `l/../x` is the `x` beside where `l` leads, and `realpath` does the same.
     # The scratchpad's check above is given the path as it is for the same reason.
-    resolved = os.path.realpath(absolute)
-    return any(_is_under(normal, root) and _is_under(resolved, root) for root in scope.roots)
+    resolutions = _resolutions(absolute)
+    return all(
+        any(_is_under(normal, root) and _is_under(resolved, root) for root in scope.roots)
+        for resolved in resolutions
+    )
 
 
 VARIABLE_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -5610,14 +5910,17 @@ def _short_flag(arg: str, takes_value: set[str], *, bundles: bool) -> tuple[str,
     return arg, 0
 
 
-def _file_operands(program: str, args: list[str]) -> list[tuple[int, int]]:
+def _file_operands(
+    program: str, args: list[str], spec: dict | None = None
+) -> list[tuple[int, int]]:
     """Where in `args` the words this reader will open as files are.
 
     Each entry is an index into `args`, and where the path starts in that word: past
     `--from-file=` or `-rf` when it is attached to its flag, 0 when the word is all path.
-    Raises `NoOpinion` for a flag in `file_lists`, whose files no word names.
+    Raises `NoOpinion` for a flag in `file_lists`, whose files no word names. `spec` is the
+    reader's `READER_SPECS` entry, unless given.
     """
-    spec = READER_SPECS[program]
+    spec = READER_SPECS[program] if spec is None else spec
     values = spec.get("values", set())
     attached_values = spec.get("attached_values", set())
     files = spec.get("files", set())
@@ -5685,6 +5988,520 @@ def _file_operands(program: str, args: list[str]) -> list[tuple[int, int]]:
     return found
 
 
+# The readers that follow a link they meet while they recurse, and so read wherever it leads
+# from a directory that is in scope: `grep -R x .` with `k -> ~/.ssh` in it prints the key (#63).
+# `grep -r`, `rg`, `find`, `ls -R` and `du` without these follow only a link the command line
+# names, which both layers resolve. Each with the spec its operands are read by, and:
+# - `short` and `long`: the flags that make it follow; a long one by any prefix of at least
+#   `long_prefix` letters, as getopt_long reads it
+# - `recursive`: the flags it needs as well, unless it always recurses
+# - `stop`: the long flags that stop it, `diff --no-dereference`
+# - `default`: whether no operand is the working directory
+# - `pattern_free`: the flags that leave no pattern operand, as `rg --files` does
+RG_SPEC = {
+    "pattern": True,
+    "script_flags": {"-e", "--regexp", "-f", "--file", "--files", "--type-list"},
+    "values": {
+        "-A",
+        "-B",
+        "-C",
+        "-E",
+        "-M",
+        "-T",
+        "-d",
+        "-e",
+        "-f",
+        "-g",
+        "-j",
+        "-m",
+        "-r",
+        "-t",
+        "--after-context",
+        "--before-context",
+        "--color",
+        "--colors",
+        "--context",
+        "--context-separator",
+        "--dfa-size-limit",
+        "--encoding",
+        "--engine",
+        "--field-context-separator",
+        "--field-match-separator",
+        "--file",
+        "--glob",
+        "--hostname-bin",
+        "--hyperlink-format",
+        "--iglob",
+        "--ignore-file",
+        "--max-columns",
+        "--max-count",
+        "--max-depth",
+        "--max-filesize",
+        "--path-separator",
+        "--pre",
+        "--pre-glob",
+        "--regex-size-limit",
+        "--regexp",
+        "--replace",
+        "--sort",
+        "--sortr",
+        "--threads",
+        "--type",
+        "--type-add",
+        "--type-clear",
+        "--type-not",
+    },
+}
+LINK_FOLLOWERS = {
+    "grep": {
+        "spec": READER_SPECS["grep"],
+        "short": "RS",  # `-S` is ugrep's, which Claude Code's `grep` runs: links to files
+        "long": ("--dereference-recursive", "--dereference-files"),
+        # `--der`: `--de` is ambiguous with `--devices` and `--directories`, `--der` is not
+        "long_prefix": 5,
+        "default": True,
+    },
+    "rg": {"spec": RG_SPEC, "short": "L", "long": ("--follow",), "default": True},
+    "diff": {
+        "spec": READER_SPECS["diff"],
+        "follows_by_default": True,
+        "stop": ("--no-dereference",),
+        "long_prefix": 5,
+    },
+    "find": {"short": "L", "default": True},
+    "ls": {
+        "spec": READER_SPECS["ls"],
+        "short": "L",
+        "long": ("--dereference",),
+        "recursive": ("R", "--recursive"),
+        "default": True,
+    },
+    "du": {"spec": READER_SPECS["du"], "short": "L", "long": ("--dereference",), "default": True},
+}
+for _name in ("egrep", "fgrep", "ugrep", "ug"):
+    LINK_FOLLOWERS[_name] = LINK_FOLLOWERS["grep"]
+
+# Programs that hand the program after them operands no word of the command spells: from the
+# input, or each file a search finds
+OPERANDS_FROM_ELSEWHERE = frozenset({"find", "parallel", "xargs"})
+
+# The most directory entries the walk for `LINK_FOLLOWERS` reads for one command. Past it, the
+# command is refused outright: a link it didn't reach could lead into a credential store, and
+# an operator's rule for the reader would approve it.
+MAX_WALKED_ENTRIES = 50000
+
+
+def _short_letters(word: str, values: set[str]) -> str:
+    """The flag letters a single-dash ``word`` sets, up to the first that takes a value."""
+    letters = ""
+    for letter in word[1:]:
+        letters += letter
+        if "-" + letter in values:
+            break
+    return letters
+
+
+def _follow_depth(program: str, args: list[str]) -> int | None:
+    """How deep the reader `program` follows the links in its directory operands.
+
+    None where it doesn't follow one, 0 where it follows them all the way down, and 1 where it
+    reads only a directory's own entries, as `diff` without `-r` does.
+    """
+    follower = LINK_FOLLOWERS[program]
+    spec = follower.get("spec", {})
+    values = spec.get("values", set()) | spec.get("files", set())
+    long_prefix = follower.get("long_prefix", 0)
+    follows = recursive = False
+    stopped = False
+    always_recursive = "recursive" not in follower and program != "diff"
+
+    def long_match(name: str, flags: tuple[str, ...]) -> bool:
+        return any(
+            name == flag or (long_prefix and len(name) >= long_prefix and flag.startswith(name))
+            for flag in flags
+        )
+
+    expression = False
+    for index, arg in enumerate(args):
+        if arg == "--":
+            break
+        if program == "find":
+            # Its options come before the paths; `-follow` is an expression anywhere after them
+            if arg == "-follow":
+                follows = True
+            elif not expression and arg.startswith("-") and arg not in ("-H", "-L", "-P"):
+                expression = True
+            elif not expression and arg == "-L":
+                follows = True
+            continue
+        if not arg.startswith("-") or arg == "-":
+            continue
+        if index and args[index - 1] in values:
+            continue  # the value of the flag before it
+        if arg.startswith("--"):
+            name = arg.partition("=")[0]
+            follows = follows or long_match(name, follower.get("long", ()))
+            stopped = stopped or long_match(name, follower.get("stop", ()))
+            recursive = recursive or long_match(name, follower.get("recursive", ("",))[1:])
+            if program == "diff":
+                recursive = recursive or long_match(name, ("--recursive",))
+        else:
+            letters = _short_letters(arg, values)
+            follows = follows or any(letter in letters for letter in follower.get("short", ""))
+            recursive = recursive or any(
+                letter in letters for letter in follower.get("recursive", ("",))[0]
+            )
+            if program == "diff":
+                recursive = recursive or "r" in letters
+    if program == "diff":
+        if stopped:
+            return None
+        return 0 if recursive else 1
+    if not follows or not (always_recursive or recursive):
+        return None
+    return 0
+
+
+def _follower_operands(program: str, args: list[str]) -> list[int]:
+    """The indexes in `args` of the directories a `LINK_FOLLOWERS` reader reads."""
+    if program == "find":
+        operands = []
+        for index, arg in enumerate(args):
+            if arg in ("-H", "-L", "-P"):
+                continue
+            if arg.startswith(("-", "(", "!")):
+                break
+            operands.append(index)
+        return operands
+    spec = LINK_FOLLOWERS[program].get("spec", {})
+    return [index for index, start in _file_operands(program, args, spec) if not start]
+
+
+def _followed_links(
+    program: str,
+    args: list[str],
+    tokens: list[str],
+    parts: list[tuple[str, str]],
+    bases: list[str],
+    values: dict[str, list[str] | None],
+    *,
+    operands_elsewhere: bool = False,
+) -> list[tuple[str, str]]:
+    """Each link a `LINK_FOLLOWERS` reader follows in its directory operands, and where it leads.
+
+    Each place it leads to is one of its `_resolutions`, and the links the command makes count,
+    `_PLANNED_LINKS`. An operand is each of its `_spellings`, with ``values`` as `_known_values`
+    reads them, and a wildcard the shell expands is each name it matches. An operand, or a
+    working directory, below a value this module didn't read is the residual a recursive read of
+    it is, as `grep -r x "$d"`: not walked. Raises `NotReadOnly` for operands that come from
+    elsewhere, as `xargs grep -R x` takes them, and for a walk past `MAX_WALKED_ENTRIES`.
+
+    The walk reads every entry, ignore files or not, and follows each link into where it leads
+    as the reader does, so a link in a directory outside the project is found too.
+    """
+    depth = _follow_depth(program, args)
+    if depth is None:
+        return []
+    if operands_elsewhere:
+        raise NotReadOnly(f"{program} follows links below directories no word of the command names")
+    indexes = _follower_operands(program, args)
+    directories: list[str] = []
+    for index in indexes:
+        token, text = tokens[index], args[index]
+        whole = PLACEHOLDER.fullmatch(token)
+        if whole is not None and parts[int(whole.group(1))][0] == PROCESS_SUBSTITUTION:
+            continue  # `<(...)`: a pipe, not a directory
+        if token.startswith("~"):
+            text = _tilde_word(text)
+        spellings = _spellings(text, values, bases, before=False)
+        if not _carries_live_glob(token):
+            directories += spellings
+            continue
+        # A wildcard is matched once the shell has put each value in place: `d=a/b; ... "$d"/*`
+        for spelled in spellings:
+            if UNREAD_VALUE in spelled:
+                directories.append(spelled)  # the residual: see the docstring
+                continue
+            if GLOB_FROM_ITS_DIRECTORY.search(spelled) and depth:
+                depth = 0  # the literal directory holds the matches at any depth
+            directories += _glob_matches(spelled, bases)
+    if not indexes and LINK_FOLLOWERS[program].get("default"):
+        directories.append(".")
+    roots: list[str] = []
+    for directory in directories:
+        for base in bases if not directory.startswith("/") else [""]:
+            if UNREAD_VALUE in base or UNREAD_VALUE in directory:
+                continue  # the residual: see the docstring
+            if directory in ("", "."):
+                roots.append(base)
+            else:
+                roots.append(os.path.join(base, directory) if base else directory)
+    return _walk_for_links(roots, depth)
+
+
+# A wildcard `_glob_matches` doesn't match by its parts: `**`, which zsh, and bash with
+# `globstar`, read as any depth, and zsh's `***`, which follows links as it recurses; a collating
+# element, `[[.ch.]]`, which can be several characters; and the operators of bash's `extglob` and
+# zsh's `EXTENDED_GLOB`, which a startup file can set, `[^...]` among them. Such a pattern is
+# walked from the directory its literal part names instead, which holds every name it matches:
+# the walk follows each link below it anyway.
+GLOB_FROM_ITS_DIRECTORY = re.compile(r"\*\*|\[\[\.|[()|#^<>]|(?<!^)~")
+
+# How many bytes of UTF-8 a character can take: in the C locale, `?` and `[...]` match one byte
+MAX_CHARACTER_BYTES = 4
+
+
+def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
+    """Each path a wildcard the shell expands may match, from each of ``bases``: more, never fewer.
+
+    Every reading a startup file can choose is taken at once, so that none is missed: dot files
+    match, as with `dotglob` or zsh's `GLOB_DOTS`; a name matches whatever its case, as with
+    `nocaseglob` or zsh's `NO_CASE_GLOB`, which reads a literal component that way too; and a run
+    of `?` and `[...]`, each a byte in the C locale, matches from a quarter as many characters to
+    as many. A set, `[[:alpha:]]` and `[!x]` included, is any one of them. A pattern
+    `GLOB_FROM_ITS_DIRECTORY` holds is its literal directory instead, which a recursive walk
+    covers. Past `MAX_WALKED_ENTRIES` names, `NotReadOnly`.
+    """
+    if GLOB_FROM_ITS_DIRECTORY.search(pattern):
+        head = PATH_SPECIAL.split(pattern, 1)[0]
+        return [head.rsplit("/", 1)[0] or "/" if "/" in head else "."]
+    components = [component for component in pattern.split("/") if component]
+    starts = ["/"] if pattern.startswith("/") else [b for b in bases if UNREAD_VALUE not in b]
+    matches: list[str] = []
+    for start in starts:
+        current = [start]
+        for index, component in enumerate(components):
+            regex = _glob_component_regex(component)
+            last = index == len(components) - 1
+            found: list[str] = []
+            for directory in current:
+                try:
+                    names = os.listdir(directory)
+                except (OSError, ValueError):
+                    names = []
+                if regex is None:
+                    chosen = [name for name in names if name.casefold() == component.casefold()]
+                    if component in (".", ".."):
+                        chosen.append(component)
+                else:
+                    chosen = [name for name in names if regex.fullmatch(name)]
+                    # bash before 5.2 matches `.` and `..` with a pattern that starts with `.`
+                    if component.startswith("."):
+                        chosen += [name for name in (".", "..") if regex.fullmatch(name)]
+                for name in dict.fromkeys(chosen):
+                    path = os.path.join(directory, name)
+                    if last or os.path.isdir(path):
+                        found.append(path)
+                if len(found) + len(matches) > MAX_WALKED_ENTRIES:
+                    raise NotReadOnly(
+                        f"a wildcard that matches more than {MAX_WALKED_ENTRIES} names"
+                    )
+            current = found
+        matches += current
+    return matches
+
+
+def _glob_component_regex(component: str) -> re.Pattern[str] | None:
+    """The names one component of a wildcard may match, as `_glob_matches` reads them.
+
+    None for a component with no wildcard.
+    """
+    parts: list[str] = []
+    singles = 0
+    wildcard = False
+
+    def flush() -> None:
+        nonlocal singles
+        if singles:
+            parts.append(f".{{{-(-singles // MAX_CHARACTER_BYTES)},{singles}}}")
+            singles = 0
+
+    index = 0
+    while index < len(component):
+        character = component[index]
+        if character == "*":
+            flush()
+            parts.append(".*")
+            wildcard = True
+            index += 1
+        elif character == "?":
+            singles += 1
+            wildcard = True
+            index += 1
+        elif character == "[":
+            end = _bracket_end(component, index)
+            singles += 1  # a set is one character; an unmatched `[` is the character itself
+            wildcard = True
+            index = index + 1 if end is None else end + 1
+        else:
+            flush()
+            parts.append(re.escape(character))
+            index += 1
+    flush()
+    if not wildcard:
+        return None
+    return re.compile("".join(parts), re.DOTALL | re.IGNORECASE)
+
+
+def _bracket_end(text: str, start: int) -> int | None:
+    """The index of the `]` that ends the set opening at ``start``, or None for a literal `[`.
+
+    A `]` right after the `[`, or after its `!` or `^`, is a member, and so is each `[:...:]`
+    and `[=...=]` class whole.
+    """
+    index = start + 1
+    if index < len(text) and text[index] in "!^":
+        index += 1
+    if index < len(text) and text[index] == "]":
+        index += 1
+    while index < len(text):
+        if text[index] == "]":
+            return index
+        if text.startswith(("[:", "[="), index):
+            close = text.find(text[index + 1] + "]", index + 2)
+            if close < 0:
+                return None
+            index = close + 2
+            continue
+        index += 1
+    return None
+
+
+# The walks `_walk_for_links` made for the command being classified, by roots, depth and the
+# links the command makes: Layer B and Layer A each ask, and `_classify` may read a command more
+# than once. Reset by `_classify`.
+_WALKS: dict[tuple, list[tuple[str, str]]] = {}
+
+
+def _walk_for_links(roots: list[str], depth: int) -> list[tuple[str, str]]:
+    """`_followed_links`' walk, from each of ``roots``, to ``depth`` levels, or all with 0.
+
+    A root is each of its `_resolutions`, so one an `ln` in the command makes, or one whose
+    path goes through a link, is walked where it leads, and reported as a link to there.
+    """
+    key = (
+        tuple(roots),
+        depth,
+        tuple(sorted((link, tuple(sorted(targets))) for link, targets in _PLANNED_LINKS.items())),
+    )
+    if key not in _WALKS:
+        _WALKS[key] = _walk_for_links_uncached(roots, depth)
+    return _WALKS[key]
+
+
+def _walk_for_links_uncached(roots: list[str], depth: int) -> list[tuple[str, str]]:
+    """`_walk_for_links`, without the cache.
+
+    Each directory is listed where it resolves, and its entries are named below the path the walk
+    came by, so that a link is reported by a path the read scope places as the shell does: one in
+    a scratchpad under macOS's `/tmp -> /private/tmp` is in the scratchpad. A directory is listed
+    once, by where it resolves.
+    """
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    count = 0
+    stack: list[tuple[str, int]] = []
+    for root in roots:
+        try:
+            resolutions = _resolutions(root)
+        except (OSError, ValueError):
+            raise NotReadOnly(f"a directory this module can't resolve: {root}") from None
+        found += [
+            (root, resolved) for resolved in resolutions if resolved != os.path.normpath(root)
+        ]
+        stack.append((root, 1))
+    while stack:
+        directory, level = stack.pop()
+        try:
+            reals = _resolutions(directory)
+        except (OSError, ValueError):
+            raise NotReadOnly(f"a directory this module can't resolve: {directory}") from None
+        entries: list[tuple[str, bool, bool]] = []
+        for real in reals:
+            if real in seen or not os.path.isdir(real):
+                continue
+            seen.add(real)
+            try:
+                with os.scandir(real) as listing:
+                    entries += [
+                        (
+                            os.path.join(directory, entry.name),
+                            entry.is_symlink(),
+                            entry.is_dir(follow_symlinks=False),
+                        )
+                        for entry in listing
+                    ]
+            except (OSError, ValueError):
+                continue  # what the walk can't list, the reader can't either
+            entries += [
+                (os.path.join(directory, os.path.basename(key)), True, False)
+                for key in _PLANNED_LINKS
+                if os.path.dirname(key) == real
+            ]
+        count += len(entries)
+        if count > MAX_WALKED_ENTRIES:
+            raise NotReadOnly(
+                f"a read that follows links below more than {MAX_WALKED_ENTRIES} entries"
+            )
+        deeper = depth == 0 or level < depth
+        for path, is_link, is_directory in entries:
+            if is_link:
+                try:
+                    targets = _resolutions(path)
+                except (OSError, ValueError):
+                    raise NotReadOnly(f"a link this module can't resolve: {path}") from None
+                found += [(path, target) for target in targets]
+            if (is_link or is_directory) and deeper:
+                stack.append((path, level + 1))
+    return found
+
+
+def _refuse_followed_credential_links(
+    segments: list[list[str]], parts: list[tuple[str, str]], state: _ShellState
+) -> None:
+    """Layer B, for the links a reader follows while it recurses.
+
+    Refuses the command outright if one leads into a credential store, or to a directory that
+    holds one, as `~` does.
+
+    Every segment, whatever tier approves it: under `Bash(grep *)`, `grep -R x .` reads `~/.ssh`
+    through `k -> ~`, and no word names it. The reader is the program, or any word after one
+    that runs another, `RUNS_ANOTHER_PROGRAM`. A reader behind a program that gives it operands
+    of its own, as `xargs grep -R x` is, is refused: no word names what it reads.
+    """
+    stores = [os.path.realpath(store) for store in _credential_roots()]
+    for segment in segments:
+        start = _command_index(segment, refuse=False)
+        if start is None:
+            continue
+        tokens = segment[start:]
+        words = [_expand(token, parts) for token in tokens]
+        # The program, or any word after one that runs another, as `timeout 5 grep -R` does
+        wrapper = os.path.basename(words[0]) if words else ""
+        runs_another = wrapper in RUNS_ANOTHER_PROGRAM or wrapper in OPERANDS_FROM_ELSEWHERE
+        for index, word in enumerate(words if runs_another else words[:1]):
+            program = os.path.basename(word)
+            if program not in LINK_FOLLOWERS:
+                continue
+            elsewhere = index > 0 and wrapper in OPERANDS_FROM_ELSEWHERE
+            links = _followed_links(
+                program,
+                words[index + 1 :],
+                tokens[index + 1 :],
+                parts,
+                state.shell_bases,
+                state.values,
+                operands_elsewhere=elsewhere,
+            )
+            for link, target in links:
+                if _names_a_credential(target, tilde=False, bases=[], live_glob=False) or any(
+                    _is_under(store, target) for store in stores
+                ):
+                    raise NotReadOnly(
+                        f"{program} follows the link {link} to a credential store: {target}"
+                    )
+
+
 def _scratch_directory() -> str | None:
     """This session's scratch directory, as a pattern; `None` when there is none.
 
@@ -5705,7 +6522,19 @@ def _scratch_root() -> str | None:
     if _SCRATCHPAD_DIR is None:
         return None
     directory = _SCRATCHPAD_DIR.rstrip("/")
-    return directory if SCRATCH_DIRECTORY.fullmatch(directory) is not None else None
+    if SCRATCH_DIRECTORY.fullmatch(directory) is None:
+        return None
+    # A scratchpad whose own path is a link takes in wherever the link leads, as one an earlier
+    # command replaced with `ln -s ~` would (#79). A link above it, as macOS's `/tmp` is, is not
+    # its own path.
+    try:
+        if S_ISLNK(os.lstat(directory).st_mode):
+            return None
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return None
+    return directory
 
 
 def _scratch_redirect() -> re.Pattern[str] | None:
@@ -5734,9 +6563,276 @@ def _resolves_into_scratch(path: str) -> bool:
     if root is None:
         return False
     try:
-        return _is_under(os.path.realpath(path), os.path.realpath(root))
+        resolved_root = os.path.realpath(root)
+        return all(_is_under(resolved, resolved_root) for resolved in _resolutions(path))
     except (OSError, ValueError):
         return False  # a path that cannot be resolved is not one to vouch for
+
+
+# The links one `ln` makes, and all of a command's, past which it is one this module doesn't
+# read: each is a branch of every path resolved through it
+MAX_PLANNED_LINKS = 32
+
+# The most places one path can lead to through the planned links, and the most links one
+# resolution follows, as the kernel's own limit on a path is 40
+MAX_RESOLUTIONS = 64
+MAX_LINK_HOPS = 40
+
+# `ln`'s options, GNU's and BSD's: those that take nothing, and those that take the next word
+LN_FLAG_LETTERS = frozenset("bdfFhiLnPrsTvw")
+LN_VALUE_LETTERS = frozenset("St")
+LN_LONG_FLAGS = frozenset(
+    {
+        "--backup",
+        "--directory",
+        "--force",
+        "--interactive",
+        "--logical",
+        "--no-dereference",
+        "--no-target-directory",
+        "--physical",
+        "--relative",
+        "--symbolic",
+        "--verbose",
+    }
+)
+LN_LONG_VALUES = frozenset({"--suffix", "--target-directory"})
+
+# Programs that run the program their words name, `ln` among them, where its operands are not
+# words this module reads in order: from the input, as `xargs ln`, or among others, as
+# `find -exec ln`
+RUNS_ANOTHER_PROGRAM = frozenset(
+    {
+        "busybox",
+        "command",
+        "doas",
+        "env",
+        "exec",
+        "find",
+        "nice",
+        "nohup",
+        "setsid",
+        "stdbuf",
+        "sudo",
+        "time",
+        "timeout",
+        "xargs",
+    }
+)
+
+
+def _resolutions(path: str) -> set[str]:
+    """Where ``path`` leads, through the links on disk and those the command makes.
+
+    `os.path.realpath`, when the command makes none. Otherwise each planned link is taken and
+    not taken, since an `ln` may fail and leave what was there, and each target it may have, so
+    a path through one is each place it may be once the command has run. A branch that follows
+    more than `MAX_LINK_HOPS` links is a loop, through which the kernel opens nothing. Raises
+    `OSError` past `MAX_RESOLUTIONS`, which each caller reads as a path it can't place.
+    """
+    if not _PLANNED_LINKS:
+        return {os.path.realpath(path)}
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+    found: set[str] = {os.path.realpath(path)}
+    _resolve_planned("/", path.split("/"), 0, found)
+    return found
+
+
+def _resolve_planned(resolved: str, pending: list[str], hops: int, found: set[str]) -> None:
+    """`_resolutions`, from ``resolved``, a directory with no link in it, with ``pending`` left.
+
+    As the kernel resolves: a link before the `..` after it, and a relative target from the
+    directory that holds the link.
+    """
+    while pending:
+        component, pending = pending[0], pending[1:]
+        if component in ("", "."):
+            continue
+        if component == "..":
+            resolved = os.path.dirname(resolved)
+            continue
+        candidate = os.path.join(resolved, component)
+        if hops >= MAX_LINK_HOPS:
+            return  # the kernel's `ELOOP`: no file is opened through it
+        for target in _PLANNED_LINKS.get(candidate, ()):
+            _resolve_planned("/", target.split("/") + pending, hops + 1, found)
+        if os.path.islink(candidate):
+            target = os.readlink(candidate)
+            start = "/" if target.startswith("/") else resolved
+            _resolve_planned(start, target.split("/") + pending, hops + 1, found)
+            return
+        resolved = candidate
+    found.add(resolved)
+    if len(found) > MAX_RESOLUTIONS:
+        raise OSError("too many places one path can lead")
+
+
+def _record_planned_links(
+    segments: list[list[str]], parts: list[tuple[str, str]], bases: list[str]
+) -> None:
+    """Add to `_PLANNED_LINKS` each link an `ln` in these segments makes, from each of ``bases``.
+
+    An `ln` whose operands this module can't place, or one that another program runs, as
+    `xargs ln` does, leaves the command to the user: no rule approves a read through a link it
+    can't see. Other programs make links too, `tar x`, `unzip`, `cp -s` and `git worktree add`
+    among them; they are the gap `AGENTS.md`'s threat model names.
+    """
+    for segment in segments:
+        start = _command_index(segment, refuse=False)
+        if start is None:
+            continue
+        words = segment[start:]
+        if not words:
+            continue
+        program = os.path.basename(_expand(words[0], parts))
+        if program in RUNS_ANOTHER_PROGRAM and any(
+            os.path.basename(_expand(word, parts)) == "ln" for word in words[1:]
+        ):
+            raise NotReadOnly(f"{program} runs ln, which makes a link this module can't place")
+        if program != "ln":
+            continue
+        for key, target in _ln_links(words[1:], parts, bases):
+            _PLANNED_LINKS.setdefault(key, set()).add(target)
+    if sum(len(targets) for targets in _PLANNED_LINKS.values()) > MAX_PLANNED_LINKS:
+        raise NotReadOnly("more links than this module reads")
+
+
+def _ln_links(
+    tokens: list[str], parts: list[tuple[str, str]], bases: list[str]
+) -> list[tuple[str, str]]:
+    """Each link these `ln` arguments make, as the path it will be at and the one it leads to.
+
+    Read from each of ``bases``. Its forms: `ln T` makes `./basename(T)`, `ln T... DIR` and
+    `ln -t DIR T...` make `DIR/basename(T)`, and `ln -T T L` makes `L`. `ln T L` makes `L`, or
+    `L/basename(T)` when `L` is a directory, and both are read. A symbolic link leads where its
+    text does from the directory that holds it, or with `-r` where `T` does from the working
+    directory, as a hard link does. A hard link of a symbolic link is a copy of that link with
+    `-P`, GNU's default, whose text then leads from the new link's directory, and of where it
+    leads with `-L`, BSD's: without either, both are read.
+    """
+    symbolic = relative = no_target_directory = logical = physical = False
+    directory: str | None = None
+    operands: list[str] = []
+    words = [_ln_word(token, parts) for token in tokens]
+    index = 0
+    options = True
+    while index < len(words):
+        word = words[index]
+        index += 1
+        if options and word == "--":
+            options = False
+        elif options and word.startswith("--"):
+            name, equals, value = word.partition("=")
+            if name in LN_LONG_VALUES:
+                if not equals:
+                    if index >= len(words):
+                        raise NotReadOnly(f"ln option without its value: {word}")
+                    value, index = words[index], index + 1
+                if name == "--target-directory":
+                    directory = value
+            elif name == "--backup" or (name in LN_LONG_FLAGS and not equals):
+                symbolic = symbolic or name == "--symbolic"
+                relative = relative or name == "--relative"
+                no_target_directory = no_target_directory or name == "--no-target-directory"
+                logical = logical or name == "--logical"
+                physical = physical or name == "--physical"
+            else:
+                raise NotReadOnly(f"ln option this module doesn't read: {word}")
+        elif options and word.startswith("-") and word != "-":
+            for position, letter in enumerate(word[1:], start=1):
+                if letter in LN_VALUE_LETTERS:
+                    value = word[position + 1 :]
+                    if not value:
+                        if index >= len(words):
+                            raise NotReadOnly(f"ln option without its value: {word}")
+                        value, index = words[index], index + 1
+                    if letter == "t":
+                        directory = value
+                    break
+                if letter not in LN_FLAG_LETTERS:
+                    raise NotReadOnly(f"ln option this module doesn't read: {word}")
+                symbolic = symbolic or letter == "s"
+                relative = relative or letter == "r"
+                no_target_directory = no_target_directory or letter == "T"
+                logical = logical or letter == "L"
+                physical = physical or letter == "P"
+        else:
+            operands.append(word)
+    if not operands:
+        return []
+    places: list[tuple[str, str]] = []  # (where the link goes, what it is made from)
+    if directory is not None:
+        places = [(os.path.join(directory, os.path.basename(t.rstrip("/"))), t) for t in operands]
+    elif len(operands) == 1:
+        places = [(os.path.basename(operands[0].rstrip("/")) or ".", operands[0])]
+    elif len(operands) == 2 and no_target_directory:
+        places = [(operands[1], operands[0])]
+    elif len(operands) == 2:
+        made_from, name = operands
+        places = [
+            (name, made_from),
+            (os.path.join(name, os.path.basename(made_from.rstrip("/"))), made_from),
+        ]
+    else:
+        *sources, last = operands
+        places = [(os.path.join(last, os.path.basename(t.rstrip("/"))), t) for t in sources]
+    links: list[tuple[str, str]] = []
+    for base in bases:
+        for place, made_from in places:
+            parent, name = os.path.split(os.path.join(base, place).rstrip("/"))
+            if name in ("", ".", ".."):
+                continue  # a directory's own entry, which `ln` fails to replace
+            for resolved_parent in _resolutions(parent or "/"):
+                key = os.path.join(resolved_parent, name)
+                if symbolic and not relative:
+                    links.append((key, os.path.join(resolved_parent, made_from)))
+                elif symbolic:
+                    links.append((key, os.path.join(base, made_from)))
+                else:
+                    targets = _hard_link_targets(
+                        os.path.join(base, made_from),
+                        resolved_parent,
+                        logical=logical,
+                        physical=physical,
+                    )
+                    links += [(key, target) for target in targets]
+    if len(links) > MAX_PLANNED_LINKS:
+        raise NotReadOnly("more links than this module reads")
+    return links
+
+
+def _hard_link_targets(source: str, parent: str, *, logical: bool, physical: bool) -> list[str]:
+    """Where a hard link of ``source``, made in ``parent``, leads; see `_ln_links`.
+
+    A source that is a link this command makes is one whose text this module didn't keep, so
+    `NotReadOnly` unless `-L` makes the hard link of where it leads.
+    """
+    directory, name = os.path.split(source)
+    planned = any(
+        os.path.join(resolved, name) in _PLANNED_LINKS for resolved in _resolutions(directory)
+    )
+    if planned and not (logical and not physical):
+        raise NotReadOnly(f"ln hard-links a link this command makes: {source}")
+    targets = []
+    if os.path.islink(source) and not (logical and not physical):
+        text = os.readlink(source)
+        targets.append(text if text.startswith("/") else os.path.join(parent, text))
+    if not os.path.islink(source) or not (physical and not logical):
+        targets.append(source)
+    return targets
+
+
+def _ln_word(token: str, parts: list[tuple[str, str]]) -> str:
+    """An `ln` argument as the program gets it, or `NotReadOnly` for one the shell decides."""
+    if _word_the_shell_builds(token, parts):
+        raise NotReadOnly(f"ln given a word the shell builds: {_expand(token, parts)}")
+    word = _expand(token, parts)
+    if token.startswith("~"):
+        word = _tilde_word(word)
+    if UNREAD_VALUE in word:
+        raise NotReadOnly(f"ln given a directory the shell picks: {token}")
+    return word
 
 
 def _zsh_equals_expansion(token: str, parts: list[tuple[str, str]]) -> bool:
@@ -5812,9 +6908,30 @@ def _check_input_targets(targets: list[str], scope: _ReadScope) -> None:
                 raise NotReadOnly(f"< reads outside the working directories: {target}")
 
 
+# How many times `_classify` reads a command again for the links it found it makes
+MAX_LINK_PASSES = 3
+
+
 def _classify(command: str, depth: int = 0) -> None:
-    """Raise ``NotReadOnly`` with the reason, or return having found none."""
-    _classify_with(command, depth, None)
+    """Raise ``NotReadOnly`` with the reason, or return having found none.
+
+    A link an `ln` in the command makes is known only once that `ln` is read, which can be after
+    a word the link leads through, as in a substitution's body, read last. So the command is
+    read again with the links the last pass found, until a pass finds no new one.
+    """
+    global _PLANNED_LINKS  # noqa: PLW0603 - per command, as `_SESSION_CWD` is per call
+    _PLANNED_LINKS = {}
+    _WALKS.clear()
+    try:
+        for _ in range(MAX_LINK_PASSES):
+            known = {key: set(targets) for key, targets in _PLANNED_LINKS.items()}
+            _classify_with(command, depth, None)
+            if known == _PLANNED_LINKS:
+                return
+        raise NotReadOnly("links that make further links, past what this module reads")
+    finally:
+        _PLANNED_LINKS = {}
+        _WALKS.clear()
 
 
 def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> None:
@@ -5940,12 +7057,6 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     for name, count in (inherited.bindings if inherited else {}).items():
         bindings[name] = bindings.get(name, 0) + count
 
-    # Loop variables whose `in` list is all literal non-flag words. Collected across every
-    # segment first, because the header that binds a name and the body that uses it are
-    # separate segments, and `_strip_structure` discards the header. A bare `"$name"` of
-    # one of these is exempt from the flag check inside `_check_command`; nothing else is.
-    safe_names = _safe_loop_names(segments, parts, bindings)
-
     # Variables assigned a fully literal value in this command. A `$name`/`${name}`/`${=name}`
     # that uses one is spliced into its words and checked as the flags it is, which is how a
     # `_p='--profile x --region y'` hoisted out of repeated vendor calls stops prompting.
@@ -5960,14 +7071,26 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         else:
             known_values[name] = [*values, *known_values[name]]
 
+    # Loop variables whose `in` list is all literal non-flag words, with the values the command
+    # sets in place. Collected across every segment first, because the header that binds a name
+    # and the body that uses it are separate segments, and `_strip_structure` discards the
+    # header. A bare `"$name"` of one of these is exempt from the flag check inside
+    # `_check_command`; nothing else is.
+    safe_names = _safe_loop_names(segments, parts, bindings, known_values)
+
     # Where a relative word may be resolved from, worked out once for the credential check, the
     # read scope and each substitution's body
     bases, shell_bases = _working_directories(segments, parts, inherited, known_values)
     state = _ShellState(bases, shell_bases, known_values, bindings, backgrounds=backgrounds)
 
+    # The links an `ln` here makes, which every path below is resolved through as if they were
+    # there already: `ln -s ~ k && cat k/.ssh/id_rsa` reads a credential store (#79)
+    _record_planned_links(segments, parts, shell_bases)
+
     # Layer B: no word may name a credential store, whatever program it belongs to and
-    # whatever tier would otherwise approve it.
+    # whatever tier would otherwise approve it, nor may a link a reader follows lead to one.
     _refuse_credential_paths(reduced, parts, state)
+    _refuse_followed_credential_links(segments, parts, state)
 
     # Where readers may read. A relative path must be in scope from each working directory: a
     # `cd` inside a pipeline does not move the shell that runs the next command, so the module
