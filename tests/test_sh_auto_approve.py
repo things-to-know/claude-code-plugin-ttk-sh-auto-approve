@@ -1586,6 +1586,26 @@ class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
             (project / ".git" / "config").write_bytes(b"\xff")
             self.assert_refused("git ls-remote origin", "a config git refuses")
 
+    def test_a_project_that_holds_the_repository(self):
+        """#75: git runs in the session's working directory, so it is asked from there, and not
+        from the project as well. Here the project is a plain directory holding the repository,
+        where git takes `origin` for a path: no opinion from there, as the controls show."""
+        with remotes_configured(self.ORIGIN) as repository:
+            parent = repository.parent
+            with unittest.mock.patch.object(hook, "REPO_ROOT", parent):
+                for command in ("git ls-remote origin", "git remote show origin"):
+                    with self.subTest(command=command):
+                        with unittest.mock.patch.object(hook, "_SESSION_CWD", str(repository)):
+                            self.assert_allowed(command, "git runs in the repository")
+                        with unittest.mock.patch.object(hook, "_SESSION_CWD", str(parent)):
+                            self.assert_no_opinion(command, "git takes `origin` for a path")
+                        with unittest.mock.patch.object(hook, "_SESSION_CWD", None):
+                            self.assert_no_opinion(command, "no cwd: git runs in the project")
+                with unittest.mock.patch.object(hook, "_SESSION_CWD", str(parent)):
+                    self.assert_allowed(f"git -C {repository} ls-remote origin", "git runs there")
+                    # A `cd` may not move the shell, so git may still run where it was
+                    self.assert_no_opinion(f"cd {repository} && git ls-remote origin")
+
     def test_a_directory_outside_the_read_roots_is_not_asked(self):
         """git runs what a repository's config names, so it is asked only where the read
         scope allows `-C`, which is checked first."""
@@ -7192,7 +7212,8 @@ class RefusesGitReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         the shell had not chosen yet. It refuses a variable too, which it reads as the
         credential check does, `_changed_directories`: as each value the command sets, and as
         the value the shell had before. The control: a directory spelled out."""
-        scope = hook._ReadScope([str(hook.REPO_ROOT)], [str(hook.REPO_ROOT)], {}, {})
+        root = str(hook.REPO_ROOT)
+        scope = hook._ReadScope([root], [root], {}, {}, run_bases=[root])
         for command in ("git -C <(echo docs) diff a b", "git -C doc* diff a b"):
             with self.subTest(command=command):
                 self.assert_refused(command, "the shell finishes the directory")
