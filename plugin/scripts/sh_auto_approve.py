@@ -855,14 +855,14 @@ GIT_READ_SUBCOMMANDS = {
 # `names` value must be a plain file name: `GIT_FILE_NAME`.
 # The order file has no long option, and git takes it only attached to its letter.
 # `_check_git` refuses a word that starts with `-O`, as `grep`'s runs a program, so here it is
-# read bundled after another letter: `git log -pO<file>`. `-G`, `-I` and `-S` take the rest of
-# the word, so an `O` after them is part of their value; git stops on most other letters
+# read bundled after another letter: `git log -pO<file>`. `-G`, `-I`, `-S` and `-l` take the rest
+# of the word, so an `O` after them is part of their value; git stops on most other letters
 # before it reads the file, which costs this table no more than a prompt.
 # `_check_git` reads `grep`'s `short` and `values` too, to find its `-O` in a bundle, so a letter
 # there that takes nothing would hide an `O` after it: `grep -nO<cmd>` runs `<cmd>`.
 # Checked against git 2.48.1 (`builtin/blame.c`, `builtin/grep.c`, `builtin/ls-files.c`), and
 # the order file by running each subcommand with a FIFO as the file.
-GIT_ORDER_FILE = {"short": "O", "values": "GIS"}
+GIT_ORDER_FILE = {"short": "O", "values": "GISl"}
 GIT_FILE_OPTIONS = {
     "blame": {
         "long": frozenset({"--contents", "--ignore-revs-file"}),
@@ -889,13 +889,14 @@ GIT_FILE_OPTIONS = {
 # and `..` match, and name a directory, which git cannot read as a file.
 GIT_FILE_NAME = re.compile(r"[A-Za-z0-9._-]+")
 
-# `diff`'s short options that take the rest of their word as their value. `-S` and `-G` take the
-# next word when nothing is left: the string or the regex git searches the changes for, which
-# it never opens. An `S` or a `G` after one of these is that one's value, so the next word is an
-# operand again: `-IS <path>`. Checked against git 2.48.1, with a file outside the repository
-# as the next word, after each letter.
-GIT_DIFF_VALUE_LETTERS = frozenset({"-G", "-I", "-O", "-S"})
-GIT_DIFF_SEARCHES = frozenset({"-G", "-S"})
+# `diff`'s short options that take the rest of their word as their value. All but `-O` take the
+# next word when nothing is left, which git never opens: the string or the regex `-S` and `-G`
+# search the changes for, the regex of lines `-I` ignores, and `-l`'s rename limit. A letter
+# after one of these is that one's value, so the next word is an operand again: `-IS <path>`.
+# The long options whose next word git never opens are `GIT_REVISION_VALUES`. Checked against
+# git 2.48.1, with a file outside the repository as the next word, after each letter.
+GIT_DIFF_VALUE_LETTERS = frozenset({"-G", "-I", "-O", "-S", "-l"})
+GIT_DIFF_NEXT_WORD_VALUES = frozenset({"-G", "-I", "-S", "-l"})
 
 # `git branch` lists unless it is handed a name, which creates a branch, or a flag that
 # deletes, moves, copies, or sets an upstream. So only the listing flags are read, and
@@ -2894,8 +2895,9 @@ def _git_file_operands(args: list[str], index: int) -> list[tuple[int, int]]:
     either is outside the working tree, so a revision such as ``HEAD~1`` is read as a path too,
     which resolves inside the working directory git runs in. That is every word not starting
     with ``-``, and every word after the first ``--``: a word an option takes as its value, the
-    ``--`` included, is read as a path at worst. The one value left out is the string or regex
-    of ``-S`` and ``-G`` in the next word, ``GIT_DIFF_SEARCHES``, which git never opens.
+    ``--`` included, is read as a path at worst. Left out is the next word after an option whose
+    value git takes from it and never opens: ``GIT_REVISION_VALUES``, as a word of its own, and
+    ``GIT_DIFF_NEXT_WORD_VALUES``, at the end of a bundle too.
 
     Each subcommand in ``GIT_FILE_OPTIONS``, ``diff`` included, opens the values of its options
     there. Every word is read for one, the ones after a ``--`` too: an option that takes the next
@@ -2906,17 +2908,19 @@ def _git_file_operands(args: list[str], index: int) -> list[tuple[int, int]]:
     found: list[tuple[int, int]] = []
     if subcommand == "diff":
         after_terminator = False
-        searched = False
+        value_next = False
         for position in range(index + 1, len(args)):
             arg = args[position]
-            if searched:
-                searched = False
+            if value_next:
+                value_next = False
                 continue
             if after_terminator or not arg.startswith("-"):
                 found.append((position, 0))
+            elif arg in GIT_REVISION_VALUES:
+                value_next = True
             elif not arg.startswith("--") and arg != "-":
                 flag, start = _short_flag(arg, GIT_DIFF_VALUE_LETTERS, bundles=True)
-                searched = flag in GIT_DIFF_SEARCHES and not start
+                value_next = flag in GIT_DIFF_NEXT_WORD_VALUES and not start
             after_terminator = after_terminator or arg == "--"
     spec = GIT_FILE_OPTIONS.get(subcommand)
     if spec is None:
@@ -4444,26 +4448,45 @@ GIT_PATH_SUBCOMMANDS = frozenset(
 # `--pretty`, whose value is optional, and `--format`, whose value git takes only after `=`, are
 # not: the word after either is a path.
 # `-L`, of `log`, is `<range>:<file>`, whose file is read from where git runs, so it is measured.
+# `_git_file_operands` skips the same words after `diff`, where git opens its operands: an entry
+# that took no next word would hide one. Each was run on git 2.48.1 in `diff` and `log`, where it
+# takes the next word, and in `diff`, with a FIFO outside the repository as that word, which git
+# never opened, `--no-index` or not: in that mode it rejects the revision options, and the rest
+# take the word as their value. Left out: the options whose value git takes only attached, so
+# that the next word is an operand, such as `-U`, `--unified`, `--relative`, `--word-diff` and
+# `--abbrev`.
 GIT_REVISION_VALUES = frozenset(
     {
         "-G",
         "-I",
         "-S",
+        "-l",
         "-n",
         "--after",
+        "--anchored",
         "--author",
         "--before",
         "--committer",
         "--date",
+        "--diff-algorithm",
         "--diff-filter",
+        "--dst-prefix",
         "--encoding",
         "--find-object",
         "--grep",
         "--ignore-matching-lines",
+        "--inter-hunk-context",
+        "--line-prefix",
         "--max-count",
         "--since",
         "--skip",
+        "--src-prefix",
+        "--stat-count",
+        "--stat-graph-width",
+        "--stat-name-width",
+        "--stat-width",
         "--until",
+        "--word-diff-regex",
     }
 )
 GIT_PATH_FLAG_VALUES = {
