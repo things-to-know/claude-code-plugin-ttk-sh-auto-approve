@@ -913,6 +913,28 @@ GIT_BRANCH_LIST_MODE = frozenset(
     {"--list", "--points-at", "--contains", "--no-contains", "--merged", "--no-merged"}
 )
 
+# `git tag` likewise: it creates a tag from a name unless one of these flags, anywhere in the
+# command, puts it in list mode, where every operand is a pattern, and the word after a flag
+# that takes a commit is that commit or a pattern. So does a short flag with `l` or `n` in it,
+# `GIT_TAG_SHORTS`. Every other flag is refused: the ones that create (`-a`, `-m`, `-e` and the
+# rest), `-d`, and `-v`, which verifies. Checked against git 2.48.1, `git tag v9 --contains HEAD`
+# included, which creates nothing.
+# Not stopped here: a `--format` with a `%(signature)` atom runs the program `gpg.program` names,
+# as `git branch --format` and `git log --show-signature` do. A repository config that names a
+# program is #104's.
+# A set of its own, not `GIT_BRANCH_LIST_MODE`: a flag added there for `git branch` would make
+# every operand of `git tag` a pattern, though git may read that flag otherwise in `git tag`.
+GIT_TAG_LIST_MODE = frozenset(
+    {"--list", "--points-at", "--contains", "--no-contains", "--merged", "--no-merged"}
+)
+GIT_TAG_BARE_FLAGS = frozenset({"--ignore-case", "--no-column", "--no-color", "--omit-empty"})
+# Optional values git reads only when attached: `git tag --column v9` creates `v9`
+GIT_TAG_ATTACHED_ONLY = frozenset({"--column", "--color"})
+GIT_TAG_VALUE_FLAGS = frozenset({"--sort", "--format"})
+# `-i`, `-l` and `-n` alone or bundled, as `-ln5`: `-n` takes a number only attached, so it ends
+# the bundle, and git stops at its usage message on `-nl`
+GIT_TAG_SHORTS = re.compile(r"-(?:[il]+(?:n[0-9]*)?|n[0-9]*)")
+
 # `git ls-remote` flags that only shape what is printed. `--sort` is read too, attached only,
 # as `--sort=<key>`. Left out on purpose:
 # - `--upload-pack` (`-u`), which names a program to run
@@ -2530,15 +2552,7 @@ def _check_git(args: list[str]) -> None:
         return
 
     if subcommand == "tag":
-        # Tag is only read-only when listing (no tag creation or deletion arguments)
-        if any(
-            a in ("-d", "-a", "-s", "-u", "-f", "--delete", "--force") or a.startswith(("-d", "-f"))
-            for a in sub_args
-        ):
-            raise NotReadOnly("git tag mutation flag")
-        operands = [a for a in sub_args if not a.startswith("-")]
-        if operands:
-            raise NotReadOnly("git tag creation")
+        _check_git_tag(sub_args)
         return
 
     if subcommand == "worktree":
@@ -2592,6 +2606,39 @@ def _check_git_branch(args: list[str]) -> None:
         list_mode = list_mode or name in GIT_BRANCH_LIST_MODE
     if names and not list_mode:
         raise NotReadOnly("git branch given a name outside list mode, which creates a branch")
+
+
+def _check_git_tag(args: list[str]) -> None:
+    """Validate ``git tag``: the listing forms only, flags from an allowlist.
+
+    See ``GIT_TAG_LIST_MODE``. A flag is matched exactly, as for ``git branch``, and after
+    ``--`` every word is a name.
+    """
+    list_mode = False
+    names = 0
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "--":
+            names += len(args) - index
+            break
+        if not arg.startswith("-"):
+            names += 1
+            continue
+        name, equals, _ = arg.partition("=")
+        if arg in GIT_TAG_BARE_FLAGS or name in GIT_TAG_ATTACHED_ONLY:
+            pass
+        elif name in GIT_TAG_VALUE_FLAGS:
+            index += 0 if equals else 1
+        elif name in GIT_TAG_LIST_MODE:
+            list_mode = True  # an optional commit, attached or next, is read either way
+        elif not GIT_TAG_SHORTS.fullmatch(arg):
+            raise NotReadOnly(f"git tag flag that is not a listing flag: {arg}")
+        else:
+            list_mode = list_mode or "l" in arg or "n" in arg
+    if names and not list_mode:
+        raise NotReadOnly("git tag given a name outside list mode, which creates a tag")
 
 
 def _check_git_remote(args: list[str]) -> None:
