@@ -823,6 +823,7 @@ GIT_READ_SUBCOMMANDS = {
     "ls-files",
     "ls-tree",
     "merge-base",
+    "range-diff",
     "rev-list",
     "rev-parse",
     "shortlog",
@@ -879,6 +880,7 @@ GIT_FILE_OPTIONS = {
     },
     "diff": GIT_ORDER_FILE,
     "log": GIT_ORDER_FILE,
+    "range-diff": GIT_ORDER_FILE,
     "show": GIT_ORDER_FILE,
     "stash": GIT_ORDER_FILE,
 }
@@ -4387,6 +4389,7 @@ GIT_PATH_SUBCOMMANDS = frozenset(
         "log",
         "ls-files",
         "ls-tree",
+        "range-diff",
         "rev-list",
         "shortlog",
         "show",
@@ -4430,6 +4433,8 @@ GIT_PATH_FLAG_VALUES = {
     "ls-tree": frozenset({"--format"}),
     "diff": GIT_REVISION_VALUES,
     "log": GIT_REVISION_VALUES,
+    # `range-diff` stops at its usage message on the options of `log` it doesn't take
+    "range-diff": GIT_REVISION_VALUES | {"--creation-factor"},
     "rev-list": GIT_REVISION_VALUES,
     "shortlog": GIT_REVISION_VALUES,
     "show": GIT_REVISION_VALUES,
