@@ -111,6 +111,7 @@ tool call. Test it by hand from the repository root with the payload Claude Code
 
 from __future__ import annotations
 
+import copy
 import itertools
 import json
 import math
@@ -2923,21 +2924,26 @@ def _git_remote_names(args: list[str]) -> list[str] | None:
     return None
 
 
-def _check_git_remote_reach(
-    args: list[str], directory: str | None, scope: _ReadScope | None
-) -> None:
+def _check_git_remote_reach(args: list[str], scope: _ReadScope | None) -> None:
     """Require each remote a ``git`` command contacts to be reached over the network.
 
-    ``args`` run from the subcommand on, and ``directory`` is the one ``-C`` names, if any; the
-    read scope has already cleared it. git reads a name it has no URL for as a path, a URL in
-    the config may be a path too, and either opens a repository on this machine with ``git
-    upload-pack``, whose config this module never read. ``url.<base>.insteadOf``, the current
-    branch's remote, ``safe.directory`` and the ``GIT_`` variables all decide which it is.
+    ``args`` run from the subcommand on. ``scope`` has the ``-C`` directory, if any, joined to
+    each of its bases by `_directory_scope`, after the read scope cleared that directory. git reads
+    a name it has no URL for as a path, a URL in the config may be a path too, and either opens a
+    repository on this machine with ``git upload-pack``, whose config this module never read.
+    ``url.<base>.insteadOf``, the current branch's remote, ``safe.directory`` and the ``GIT_``
+    variables all decide which it is.
 
-    So git is asked, from every directory the command may run in: ``git ls-remote --get-url``
-    prints the URL the command would reach, every one of those applied, and contacts nothing.
-    A remote with ``remote.<name>.vcs`` is fetched by a ``git-remote-<vcs>`` program, which no
-    URL shows, so any one configured is no opinion as well.
+    So git is asked, from every directory the command may run in, ``scope.run_bases``: ``git
+    ls-remote --get-url`` prints the URL the command would reach, every one of those applied,
+    and contacts nothing. Not from the project as well, where the session's working directory
+    is another: in a directory that holds the repository, git there takes the name for a path.
+    A directory below `UNREAD_VALUE` is no opinion, before git runs anywhere: git may run where
+    no base says, as after a `cd` that `CDPATH` may redirect, whose reason names the ``./``
+    spelling `CDPATH` never redirects. Such a `cd` counts wherever it stands, as for the read
+    scope: one after git too, since a loop can run git again after it. A remote with
+    ``remote.<name>.vcs`` is fetched by a ``git-remote-<vcs>`` program, which no URL shows, so
+    any one configured is no opinion as well.
 
     Each failure is no opinion, which an operator's rule can still grant. With no scope there is
     no directory to ask from.
@@ -2947,8 +2953,18 @@ def _check_git_remote_reach(
         return
     if scope is None:
         raise NoOpinion("git given a remote, and no directory to resolve it from")
-    for base in scope.bases:
-        cwd = os.path.join(base, directory) if directory is not None else base
+    # `_working_directories` puts each target `CDPATH` may redirect below `UNREAD_VALUE` itself
+    redirected = next((cwd for cwd in scope.run_bases if cwd.startswith(UNREAD_VALUE)), None)
+    if redirected is not None:
+        place = _shown(redirected, first="$CDPATH")
+        raise NoOpinion(
+            f"git may run where CDPATH takes a cd, which this module can't read: {place}; "
+            "a cd target spelled ./<dir> is never looked up in CDPATH"
+        )
+    unplaced = next((cwd for cwd in scope.run_bases if UNREAD_VALUE in cwd), None)
+    if unplaced is not None:
+        raise NoOpinion(f"git may run in a directory this module can't place: {_shown(unplaced)}")
+    for cwd in scope.run_bases:
         for name in names or [None]:
             url = _git_remote_url(cwd, name, scope)
             if url is None:
@@ -4593,16 +4609,15 @@ def _check_command(
         # Layer A, below, for the files git opens, which it resolves from the `-C` directory,
         # and for the paths it reads in a repository whose root is outside the read roots
         found = _git_file_operands(args, index)
+        files_scope = scope
         if scope is not None:
-            files_scope = scope
             if directories:
                 token = arg_tokens[directories[0]]
                 files_scope = _directory_scope(token, parts, known_values, scope)
             if found:
                 _check_read_scope(f"git {args[index]}", found, args, arg_tokens, parts, files_scope)
             _check_git_paths(args, index, arg_tokens, parts, files_scope)
-        directory = args[directories[0]] if directories else None
-        _check_git_remote_reach(args[index:], directory, scope)
+        _check_git_remote_reach(args[index:], files_scope)
 
     # The read scope comes after the validator, so a write the validator found keeps its
     # verdict whatever a rule says: `sort -o out /etc/hostname` writes `out` wherever it reads.
@@ -4872,29 +4887,32 @@ def _directory_scope(
     values: dict[str, list[str] | None],
     scope: _ReadScope,
 ) -> _ReadScope:
-    """``scope``, with the directory ``token`` names, from each base, as the bases.
+    """``scope``, with the directory ``token`` names joined to each of its bases and run bases.
 
     For the paths a program resolves from a directory it changes to, as ``git -C`` does:
     ``git -C sub diff --no-index ../x y`` reads the ``x`` beside ``sub``. The directory is read
     as the credential check reads a program's directory: `_directory_word`, then
     `_changed_directories`, with ``values`` as `_known_values` reads them.
 
-    Raises ``NoOpinion`` for a directory below `UNREAD_VALUE`, where no path can be placed: a
-    glob or a substitution, which ``_check_command`` has already refused in its place, and a
-    variable, which may still hold the value the shell had before.
+    Raises ``NoOpinion`` for a directory below `UNREAD_VALUE` among the bases, where no path can
+    be placed: a glob or a substitution, which ``_check_command`` has already refused in its
+    place, and a variable, which may still hold the value the shell had before. The run bases
+    may keep one, from a `cd` that `CDPATH` may redirect, for `_check_git_remote_reach` to judge:
+    refused here, ``cd sub && git -C . log -1`` would be no opinion where ``cd sub && git log
+    -1`` is approved, #118's gap closed for one spelling only.
     """
-    bases = _changed_directories(_directory_word(token, parts), values, scope.bases)
+    directory = _directory_word(token, parts)
+    bases = _changed_directories(directory, values, scope.bases)
     if any(UNREAD_VALUE in base for base in bases):
         raise NoOpinion(
             f"a path relative to a directory this module cannot resolve: {_expand(token, parts)}"
         )
-    return _ReadScope(
-        scope.roots,
-        bases,
-        scope.splice_vars,
-        scope.loop_values,
-        spells_escape=scope.spells_escape,
-    )
+    # A copy, so that every other field carries over, the dict of what git said once per
+    # command included, which `_check_git_remote_reach` reads through this scope
+    joined = copy.copy(scope)
+    joined.bases = bases
+    joined.run_bases = _changed_directories(directory, values, scope.run_bases)
+    return joined
 
 
 class _GlobRule:
@@ -5567,12 +5585,14 @@ def _changed_directories(
     ``directory`` is read as each of its `_spellings`, as a `cd` target is, so one the shell
     supplies gives a directory below `UNREAD_VALUE`. The program changes to it through the
     kernel, which climbs a `..` after a link from where the link leads: `_joined_physically`.
+    Once each, since an absolute directory is the same one from every base.
     """
-    return [
+    changed = [
         _joined_physically(base, spelled)
         for spelled in _spellings(directory, values, bases)
         for base in bases
     ]
+    return list(dict.fromkeys(changed))
 
 
 # The most spellings of a word the credential check reads; past it, the variables still in it
@@ -5621,8 +5641,9 @@ def _spellings(
 class _ShellState:
     """What the words of a command are read against.
 
-    ``bases`` are the directories the shell may be in, and ``shell_bases`` those and the ones
-    `CDPATH` may take it to, `_working_directories`; ``values`` are the ones its variables may
+    ``bases`` are the directories a relative word may be resolved from, ``shell_bases`` those and
+    the ones `CDPATH` may take the shell to, and ``run_bases`` the ones a program may run in,
+    `_working_directories`; ``values`` are the ones its variables may
     hold, as `_known_values` reads them; ``bindings`` how many times it binds each name,
     `_bindings`, with the bindings of the commands around it; ``backgrounds`` whether the shell
     may not wait for it, which ``curl`` reads: it runs a job behind `&`, or sits in a process
@@ -5630,7 +5651,7 @@ class _ShellState:
     so it is read against that one's.
     """
 
-    __slots__ = ("backgrounds", "bases", "bindings", "shell_bases", "values")
+    __slots__ = ("backgrounds", "bases", "bindings", "run_bases", "shell_bases", "values")
 
     def __init__(
         self,
@@ -5639,10 +5660,12 @@ class _ShellState:
         values: dict[str, list[str] | None],
         bindings: dict[str, int],
         *,
+        run_bases: list[str],
         backgrounds: bool = False,
     ) -> None:
         self.bases = bases
         self.shell_bases = shell_bases
+        self.run_bases = run_bases
         self.values = values
         self.bindings = bindings
         self.backgrounds = backgrounds
@@ -5653,8 +5676,8 @@ def _working_directories(
     parts: list[tuple[str, str]],
     inherited: _ShellState | None,
     values: dict[str, list[str] | None],
-) -> tuple[list[str], list[str]]:
-    """Every directory a relative word in this command may be resolved from, and with `CDPATH`.
+) -> tuple[list[str], list[str], list[str]]:
+    """The directories a relative word may be resolved from, with `CDPATH`, and where programs run.
 
     The project and the session's working directory, or for a substitution's body the
     directories of the command it sits in, then each `cd` or `pushd` target from each of those,
@@ -5662,7 +5685,10 @@ def _working_directories(
     since a `cd` in a pipeline or after `||` may never move it, and the read scope and the
     credential check read a relative word from each, which costs a no-opinion or a refusal.
     The second list adds the directories `CDPATH` may take the shell to, which only the
-    credential check reads.
+    credential check reads. The third starts from `_run_bases` instead, the directory the shell
+    is in, and takes each target as the first does, with `$PWD` each of its own: where a program
+    may run. A target `CDPATH` may redirect adds a directory below `UNREAD_VALUE` to it, since
+    `CDPATH` can lead anywhere.
 
     A target is read as each of its `_spellings`, so one the shell supplies, such as `"$d"`,
     gives a directory below `UNREAD_VALUE`, and so does a target the shell picks, as `pushd -`
@@ -5674,21 +5700,31 @@ def _working_directories(
     A target with a `..` after a link is placed both ways from each base, `_placements`:
     `_check_cd` reads it both ways too, but only from the project root.
 
-    Both shells look a target up in each directory `CDPATH` lists first, unless it starts with
-    `/`, `./` or `../`. A startup file the hook can't read sets it, and the credential stores are
-    in the home directory, so for the credential check each such target is read from there too.
+    Either shell may look a target up in a directory `CDPATH` lists, unless it starts with `/`,
+    `./` or `../`: with a `sub` in both, bash 5.2.37 took `CDPATH`'s, and zsh 5.9 (`-f`) the
+    current directory's. A startup file the hook can't read sets it, and the credential stores
+    are in the home directory, so for the credential check each such target is read from there
+    too.
     A directory that is in a store, as `cd .ssh` can be, refuses the command outright.
     """
     if inherited is not None:
         bases, shell_bases = list(inherited.bases), list(inherited.shell_bases)
+        run_bases = list(inherited.run_bases)
     else:
         bases = _session_bases()
         shell_bases = list(bases)
+        run_bases = _run_bases()
     for segment in segments:
         for target in _directory_targets(segment, parts):
             spellings = _spellings(target, values, shell_bases)
             placed = _spellings(target, values, shell_bases, before=False)
             bases = _and_moved(bases, placed)
+            # `$PWD` is where the shell is, one of the run bases, and not the project as well
+            run_placed = _spellings(target, values, run_bases, before=False)
+            redirected = [
+                _joined(UNREAD_VALUE, path) for path in run_placed if _searches_cdpath(path)
+            ]
+            run_bases = list(dict.fromkeys(_and_moved(run_bases, run_placed) + redirected))
             moved = [
                 placement
                 for path in spellings
@@ -5704,7 +5740,7 @@ def _working_directories(
                 ):
                     raise NotReadOnly(f"cd into a credential store, through CDPATH: {target}")
             shell_bases += added
-    return bases, shell_bases
+    return bases, shell_bases, run_bases
 
 
 def _and_moved(bases: list[str], placed: list[str]) -> list[str]:
@@ -5733,6 +5769,17 @@ def _session_bases() -> list[str]:
     return bases
 
 
+def _run_bases() -> list[str]:
+    """The directory a command runs in: the session's working directory, the shell's.
+
+    The last of `_session_bases`, so that both read the payload's ``cwd`` by one rule. The
+    project stands in for it only when the payload gives none: a relative word has to be
+    in scope from each of `_session_bases`, but a program runs in one directory, which is what
+    `_check_git_remote_reach` asks git from (#75).
+    """
+    return _session_bases()[-1:]
+
+
 def _unvouched_directory(bases: list[str], scope: _ReadScope) -> str | None:
     """A directory the shell may move to that the read scope doesn't vouch for, or None.
 
@@ -5745,8 +5792,17 @@ def _unvouched_directory(bases: list[str], scope: _ReadScope) -> str | None:
     session = _session_bases()
     for base in bases:
         if base not in session and (UNREAD_VALUE in base or not _in_scope(base, scope)):
-            return base.replace(UNREAD_VALUE, "$")
+            return _shown(base)
     return None
+
+
+def _shown(directory: str, *, first: str = "$") -> str:
+    """``directory`` as a reason names it.
+
+    Each value this module didn't read is `$`, but the first, which is ``first``, such as the
+    `$CDPATH` a `cd` may be redirected below.
+    """
+    return directory.replace(UNREAD_VALUE, first, 1).replace(UNREAD_VALUE, "$")
 
 
 def _check_where_it_runs(unvouched: str | None) -> None:
@@ -5838,6 +5894,7 @@ class _ReadScope:
         "git_runs",
         "loop_values",
         "roots",
+        "run_bases",
         "settings",
         "spells_escape",
         "splice_vars",
@@ -5850,12 +5907,18 @@ class _ReadScope:
         splice_vars: dict[str, list[str]],
         loop_values: dict[str, list[str]],
         *,
+        run_bases: list[str],
         spells_escape: bool = False,
         settings: tuple[list[dict], bool] | None = None,
         backgrounds: bool = False,
     ) -> None:
         self.roots = roots
         self.bases = bases
+        # The directories a program may run in: the session's working directory and each `cd`
+        # target from it, and a directory below `UNREAD_VALUE` for a target `CDPATH` may
+        # redirect; see `_working_directories`. No default: `bases` would put the project back,
+        # where the session's working directory is another (#75)
+        self.run_bases = run_bases
         self.splice_vars = splice_vars
         self.loop_values = loop_values
         # Whether any word of the command spells a terminal escape, which makes every value
@@ -7411,8 +7474,10 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
 
     # Where a relative word may be resolved from, worked out once for the credential check, the
     # read scope and each substitution's body
-    bases, shell_bases = _working_directories(segments, parts, inherited, known_values)
-    state = _ShellState(bases, shell_bases, known_values, bindings, backgrounds=backgrounds)
+    bases, shell_bases, run_bases = _working_directories(segments, parts, inherited, known_values)
+    state = _ShellState(
+        bases, shell_bases, known_values, bindings, backgrounds=backgrounds, run_bases=run_bases
+    )
 
     # The links an `ln` here makes, which every path below is resolved through as if they were
     # there already: `ln -s ~ k && cat k/.ssh/id_rsa` reads a credential store (#79)
@@ -7434,6 +7499,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         spells_escape=bool(TERMINAL_CONTROL_SPELLED.search(command)),
         settings=settings,
         backgrounds=backgrounds,
+        run_bases=state.run_bases,
     )
     _check_input_targets(input_targets, scope)
 
@@ -7442,7 +7508,9 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # Everything above refuses outright or not at all, and the segments below can have no
     # opinion, so a body's refusal still comes first. The shell runs a process substitution
     # without waiting for it, as it runs a job behind `&`: `true <(curl x)` returns at once.
-    detached = _ShellState(bases, shell_bases, known_values, bindings, backgrounds=True)
+    detached = _ShellState(
+        bases, shell_bases, known_values, bindings, backgrounds=True, run_bases=run_bases
+    )
     for kind, value in parts:
         if kind in RUNS_A_COMMAND:
             _classify_with(value, depth + 1, detached if kind == PROCESS_SUBSTITUTION else state)
