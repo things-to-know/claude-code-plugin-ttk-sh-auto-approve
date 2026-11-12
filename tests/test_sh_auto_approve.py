@@ -2694,6 +2694,56 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
         self.assert_refused("git tag 'v*'", "an operand creates a tag")
         self.assert_refused("git stash drop '*'", "drops a stash")
 
+    def test_a_git_tag_listing_reads_its_operands_as_patterns(self):
+        """#65: in list mode, which a listing flag turns on wherever it stands, `git tag` reads
+        each operand as a pattern, or as the commit of the flag before it. Outside it, an operand
+        creates a tag, whatever shapes the listing beside it. Each pair as git 2.48.1 ran it, in
+        a repository holding `v1`: no approval left a new tag, and each refusal created `v9`,
+        except where git stopped at its usage message: `git tag -l -m x v9`, and a bundle with a
+        letter after `-n`, which takes only a number."""
+        for approved, refused in (
+            ("git tag -l v9", "git tag v9"),
+            ("git tag --contains HEAD", "git tag v9 HEAD"),
+            ("git tag v9 --contains HEAD", "git tag -- v9"),
+            ("git tag -l --sort=refname v9", "git tag --sort=refname v9"),
+            ("git tag --sort refname", "git tag --sort refname v9"),
+            ("git tag -l --format='%(refname)' v9", "git tag --format='%(refname)' v9"),
+            ("git tag -l -i v9", "git tag -i v9"),
+            ("git tag -l --column v9", "git tag --column v9"),
+            ("git tag -l --omit-empty v9", "git tag --omit-empty v9"),
+            ("git tag -n3 'v*'", "git tag --sort -- v9"),
+            ("git tag -li V1", "git tag -l -m x v9"),
+            ("git tag -ln", "git tag -nl"),
+            ("git tag -ln5", "git tag -n5l"),
+            ("git tag -iln2 'v*'", "git tag -nli"),
+            ("git tag -lin v9", "git tag -lnd v9"),
+        ):
+            with self.subTest(approved=approved):
+                self.assert_allowed(approved, "a listing only reads")
+                self.assert_refused(refused, "creates a tag, or git stops at its usage message")
+        for refused in ("git tag -mfoo", "git tag -e", "git tag -v", "git tag -"):
+            with self.subTest(refused=refused):
+                self.assert_refused(refused, "a flag outside the listing ones")
+
+    def test_git_range_diff_reads_as_log_does(self):
+        """#38: `range-diff` compares two series of commits and writes nothing. It takes the
+        diff options, so it stops where `diff` and `log` stop: at an option that writes a file
+        or runs a program, and at its order file, which it opens, as git 2.48.1 did with a FIFO
+        as `-pO<file>`."""
+        for refused, approved in (
+            ("git range-diff --output=x a..b c..d", "git range-diff a..b c..d"),
+            ("git range-diff --ext-diff a..b c..d", "git range-diff A...B"),
+            ("git range-diff --textconv a..b c..d", "git range-diff base old new"),
+            ("git range-diff -Oorder.txt a..b c..d", "git range-diff --remerge-diff a..b c..d"),
+        ):
+            with self.subTest(refused=refused):
+                self.assert_refused(refused, "writes a file, runs a program, or opens one")
+                self.assert_allowed(approved, "range-diff only reads")
+        self.assert_no_opinion(
+            "git range-diff -pO/usr/lib/os-release a..b c..d", "opens a file outside"
+        )
+        self.assert_allowed("git range-diff -pOdocs/a.md a..b c..d", "the control: in the project")
+
     @unittest.skipUnless(GIT, "needs git on PATH")
     def test_git_refuses_a_pathspec_above_its_repository(self):
         """Where the widening above stops, where the repository's root is the project: the hook
@@ -7079,6 +7129,7 @@ class RefusesGitReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             ("git log -pO/usr/lib/os-release -1", "git log -pSO/usr/lib/os-release -1"),
             ("git diff -RO/usr/lib/os-release HEAD~1", "git diff -RGO/usr/lib/os-release HEAD~1"),
             ("git show -RO/usr/lib/os-release", "git show -RIO/usr/lib/os-release"),
+            ("git diff -pO/usr/lib/os-release HEAD~1", "git diff -lO/usr/lib/os-release HEAD~1"),
         ):
             with self.subTest(refused=refused):
                 self.assert_no_opinion(refused, "reads a file outside the working directories")
@@ -7112,6 +7163,40 @@ class RefusesGitReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         self.assert_no_opinion(
             "git diff -- -S /usr/lib/os-release", "after `--`, every word is a path"
         )
+
+    def test_the_value_of_an_option_in_the_next_word(self):
+        """#78: `-I`, `--word-diff-regex` and the other options in `GIT_REVISION_VALUES` take the
+        next word as their value, which git never opens, as for `-S`. Each approval but `-l`'s
+        is a value the read scope can't place, or places outside, which had no opinion before.
+        Beside it, the same option before its value and an operand git reads, as git 2.48.1 did
+        with a FIFO as that operand. An option whose value git takes only attached, such as
+        `-U`, leaves the next word an operand."""
+        for approved, refused in (
+            (
+                "git diff -I '^\\s*$' HEAD~1",
+                "git diff --no-index -I x /usr/lib/os-release tracked.txt",
+            ),
+            (
+                "git diff --ignore-matching-lines '^\\s*$' HEAD~1",
+                "git diff --no-index --ignore-matching-lines x /usr/lib/os-release tracked.txt",
+            ),
+            (
+                "git diff --word-diff-regex '[^ ]+$' HEAD~1",
+                "git diff --no-index --word-diff-regex x /usr/lib/os-release tracked.txt",
+            ),
+            (
+                "git diff --src-prefix /a/ --dst-prefix /b/ HEAD~1",
+                "git diff --no-index --src-prefix x /usr/lib/os-release tracked.txt",
+            ),
+            ("git diff -pl 5 HEAD~1", "git diff --no-index -pl 5 /usr/lib/os-release tracked.txt"),
+            (
+                "git diff --anchored /api HEAD~1",
+                "git diff --no-index -U /usr/lib/os-release tracked.txt",
+            ),
+        ):
+            with self.subTest(approved=approved):
+                self.assert_allowed(approved, "a value git never opens")
+                self.assert_no_opinion(refused, "reads a file outside the working directories")
 
     def test_a_revision_in_a_scratchpad_worktree(self):
         """`diff` reads a revision as a path, which lands in the directory git runs in: in a
@@ -7227,6 +7312,7 @@ class RefusesGitPathsInAnEnclosingRepository(Verdicts, unittest.TestCase):
         ("git grep -e x -- ':(top)sibling'", "git grep -e x -- ':(exclude)a.txt'"),
         ("git grep -e x -- ':(top,icase)sibling'", "git grep -e x -- ':(icase)A.txt'"),
         ("git log -p -- ../sibling", "git log -p -- a.txt"),
+        ("git range-diff a..b c..d -- ../sibling", "git range-diff a..b c..d -- a.txt"),
         ("git show HEAD:sibling/data", "git show HEAD:./a.txt"),
         ("git show HEAD:../sibling/data", "git show HEAD:../project/a.txt"),
         ("git show :sibling/data", "git show :./a.txt"),
@@ -7291,20 +7377,24 @@ class RefusesGitPathsInAnEnclosingRepository(Verdicts, unittest.TestCase):
         with self._repository():
             for command in (
                 "git grep -e foo:bar",
+                "git range-diff --creation-factor ../sibling a b",
                 "git grep -e ../x",
                 "git grep foo:bar",
                 "git log -S a:b",
                 'git log --author "x <a:b>"',
                 "git log -L 1,2:a.txt",
                 "git log --since ../x a.txt",
+                "git log --word-diff-regex ../sibling -1",
             ):
                 with self.subTest(command=command):
                     self.assert_allowed(command, "no path out of the project")
             for command in (
+                "git range-diff --creation-factor 50 a..b c..d -- ../sibling",
                 "git log -L 1,2:../sibling/data",
                 "git log -L1,2:../sibling/data",
                 "git grep foo ../sibling",
                 "git grep -n -e x ../sibling",
+                "git log --word-diff-regex x ../sibling",
                 # `--pretty`'s value is optional: the next word is a path
                 "git log -p --pretty ../sibling",
             ):
