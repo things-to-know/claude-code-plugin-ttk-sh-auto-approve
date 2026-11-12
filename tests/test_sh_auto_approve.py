@@ -7144,6 +7144,7 @@ class RefusesGitReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             ("git log -pO/usr/lib/os-release -1", "git log -pSO/usr/lib/os-release -1"),
             ("git diff -RO/usr/lib/os-release HEAD~1", "git diff -RGO/usr/lib/os-release HEAD~1"),
             ("git show -RO/usr/lib/os-release", "git show -RIO/usr/lib/os-release"),
+            ("git diff -pO/usr/lib/os-release HEAD~1", "git diff -lO/usr/lib/os-release HEAD~1"),
         ):
             with self.subTest(refused=refused):
                 self.assert_no_opinion(refused, "reads a file outside the working directories")
@@ -7177,6 +7178,49 @@ class RefusesGitReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         self.assert_no_opinion(
             "git diff -- -S /usr/lib/os-release", "after `--`, every word is a path"
         )
+
+    def test_the_value_of_an_option_in_the_next_word(self):
+        """#78: `-I`, `--word-diff-regex` and the other options in `GIT_REVISION_VALUES` take the
+        next word as their value, which git never opens, as for `-S`. Each approval is a value
+        the read scope can't place, or places outside, which had no opinion before. Beside it,
+        the same option before its value and an operand git reads, as git 2.48.1 did with a FIFO
+        as that operand. An option whose value git takes only attached, such as `-U`, leaves the
+        next word an operand, and so does `-l`, which took its value only attached before git
+        2.22."""
+        for approved, refused in (
+            (
+                "git diff -I '^\\s*$' HEAD~1",
+                "git diff --no-index -I x /usr/lib/os-release tracked.txt",
+            ),
+            (
+                "git diff --ignore-matching-lines '^\\s*$' HEAD~1",
+                "git diff --no-index --ignore-matching-lines x /usr/lib/os-release tracked.txt",
+            ),
+            (
+                "git diff --word-diff-regex '[^ ]+$' HEAD~1",
+                "git diff --no-index --word-diff-regex x /usr/lib/os-release tracked.txt",
+            ),
+            (
+                "git diff --src-prefix /a/ --dst-prefix /b/ HEAD~1",
+                "git diff --no-index --src-prefix x /usr/lib/os-release tracked.txt",
+            ),
+            (
+                "git diff --anchored /api HEAD~1",
+                "git diff --no-index -U /usr/lib/os-release tracked.txt",
+            ),
+        ):
+            with self.subTest(approved=approved):
+                self.assert_allowed(approved, "a value git never opens")
+                self.assert_no_opinion(refused, "reads a file outside the working directories")
+        for refused in (
+            "git diff --no-index -l /usr/lib/os-release tracked.txt",
+            "git diff --no-index -pl /usr/lib/os-release tracked.txt",
+        ):
+            with self.subTest(refused=refused):
+                self.assert_no_opinion(refused, "a git before 2.22 opens the word after `-l`")
+        for approved in ("git diff -l5 HEAD~1", "git diff -l 5 HEAD~1", "git diff -pl 5 HEAD~1"):
+            with self.subTest(approved=approved):
+                self.assert_allowed(approved, "the control: a number placed in the project")
 
     def test_a_revision_in_a_scratchpad_worktree(self):
         """`diff` reads a revision as a path, which lands in the directory git runs in: in a
@@ -7364,6 +7408,9 @@ class RefusesGitPathsInAnEnclosingRepository(Verdicts, unittest.TestCase):
                 'git log --author "x <a:b>"',
                 "git log -L 1,2:a.txt",
                 "git log --since ../x a.txt",
+                "git log --word-diff-regex ../sibling -1",
+                "git log --diff-merges ../sibling -1",
+                "git log -l 5 -1",
             ):
                 with self.subTest(command=command):
                     self.assert_allowed(command, "no path out of the project")
@@ -7373,6 +7420,10 @@ class RefusesGitPathsInAnEnclosingRepository(Verdicts, unittest.TestCase):
                 "git log -L1,2:../sibling/data",
                 "git grep foo ../sibling",
                 "git grep -n -e x ../sibling",
+                "git log --word-diff-regex x ../sibling",
+                "git log --diff-merges m ../sibling",
+                # Before git 2.22, `-l` took its value only attached: the next word is a path
+                "git log -l ../sibling -1",
                 # `--pretty`'s value is optional: the next word is a path
                 "git log -p --pretty ../sibling",
             ):
