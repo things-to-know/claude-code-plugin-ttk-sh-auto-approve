@@ -7293,6 +7293,9 @@ class RefusesGitPathsInAnEnclosingRepository(Verdicts, unittest.TestCase):
                 "git grep -e foo:bar",
                 "git grep -e ../x",
                 "git grep foo:bar",
+                "git shortlog --author ../x HEAD",
+                "git shortlog HEAD -n a.txt",
+                "git shortlog HEAD --committer a.txt",
                 "git log -S a:b",
                 'git log --author "x <a:b>"',
                 "git log -L 1,2:a.txt",
@@ -7303,6 +7306,9 @@ class RefusesGitPathsInAnEnclosingRepository(Verdicts, unittest.TestCase):
             for command in (
                 "git log -L 1,2:../sibling/data",
                 "git log -L1,2:../sibling/data",
+                # `shortlog`'s `-n` and `--committer` take no value: the next word is a path (#115)
+                "git shortlog HEAD -n ../sibling",
+                "git shortlog HEAD --committer ../sibling",
                 "git grep foo ../sibling",
                 "git grep -n -e x ../sibling",
                 # `--pretty`'s value is optional: the next word is a path

@@ -4431,7 +4431,9 @@ GIT_PATH_FLAG_VALUES = {
     "diff": GIT_REVISION_VALUES,
     "log": GIT_REVISION_VALUES,
     "rev-list": GIT_REVISION_VALUES,
-    "shortlog": GIT_REVISION_VALUES,
+    # `shortlog`'s own `-n` (`--numbered`) and `--committer` (`-c`) take no value: the next word
+    # is an operand, as git 2.48.1 read it
+    "shortlog": GIT_REVISION_VALUES - {"-n", "--committer"},
     "show": GIT_REVISION_VALUES,
     "stash": GIT_REVISION_VALUES,
 }
