@@ -2694,6 +2694,37 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
         self.assert_refused("git tag 'v*'", "an operand creates a tag")
         self.assert_refused("git stash drop '*'", "drops a stash")
 
+    def test_a_git_tag_listing_reads_its_operands_as_patterns(self):
+        """#65: in list mode, which a listing flag turns on wherever it stands, `git tag` reads
+        each operand as a pattern, or as the commit of the flag before it. Outside it, an operand
+        creates a tag, whatever shapes the listing beside it. Each pair as git 2.48.1 ran it, in
+        a repository holding `v1`: no approval left a new tag, and each refusal created `v9`,
+        except where git stopped at its usage message: `git tag -l -m x v9`, and a bundle with a
+        letter after `-n`, which takes only a number."""
+        for approved, refused in (
+            ("git tag -l v9", "git tag v9"),
+            ("git tag --contains HEAD", "git tag v9 HEAD"),
+            ("git tag v9 --contains HEAD", "git tag -- v9"),
+            ("git tag -l --sort=refname v9", "git tag --sort=refname v9"),
+            ("git tag --sort refname", "git tag --sort refname v9"),
+            ("git tag -l --format='%(refname)' v9", "git tag --format='%(refname)' v9"),
+            ("git tag -l -i v9", "git tag -i v9"),
+            ("git tag -l --column v9", "git tag --column v9"),
+            ("git tag -l --omit-empty v9", "git tag --omit-empty v9"),
+            ("git tag -n3 'v*'", "git tag --sort -- v9"),
+            ("git tag -li V1", "git tag -l -m x v9"),
+            ("git tag -ln", "git tag -nl"),
+            ("git tag -ln5", "git tag -n5l"),
+            ("git tag -iln2 'v*'", "git tag -nli"),
+            ("git tag -lin v9", "git tag -lnd v9"),
+        ):
+            with self.subTest(approved=approved):
+                self.assert_allowed(approved, "a listing only reads")
+                self.assert_refused(refused, "creates a tag, or git stops at its usage message")
+        for refused in ("git tag -mfoo", "git tag -e", "git tag -v", "git tag -"):
+            with self.subTest(refused=refused):
+                self.assert_refused(refused, "a flag outside the listing ones")
+
     def test_git_range_diff_reads_as_log_does(self):
         """#38: `range-diff` compares two series of commits and writes nothing. It takes the
         diff options, so it stops where `diff` and `log` stop: at an option that writes a file
