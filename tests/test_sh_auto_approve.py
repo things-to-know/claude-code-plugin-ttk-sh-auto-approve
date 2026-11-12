@@ -2694,6 +2694,25 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
         self.assert_refused("git tag 'v*'", "an operand creates a tag")
         self.assert_refused("git stash drop '*'", "drops a stash")
 
+    def test_git_range_diff_reads_as_log_does(self):
+        """#38: `range-diff` compares two series of commits and writes nothing. It takes the
+        diff options, so it stops where `diff` and `log` stop: at an option that writes a file
+        or runs a program, and at its order file, which it opens, as git 2.48.1 did with a FIFO
+        as `-pO<file>`."""
+        for refused, approved in (
+            ("git range-diff --output=x a..b c..d", "git range-diff a..b c..d"),
+            ("git range-diff --ext-diff a..b c..d", "git range-diff A...B"),
+            ("git range-diff --textconv a..b c..d", "git range-diff base old new"),
+            ("git range-diff -Oorder.txt a..b c..d", "git range-diff --remerge-diff a..b c..d"),
+        ):
+            with self.subTest(refused=refused):
+                self.assert_refused(refused, "writes a file, runs a program, or opens one")
+                self.assert_allowed(approved, "range-diff only reads")
+        self.assert_no_opinion(
+            "git range-diff -pO/usr/lib/os-release a..b c..d", "opens a file outside"
+        )
+        self.assert_allowed("git range-diff -pOdocs/a.md a..b c..d", "the control: in the project")
+
     @unittest.skipUnless(GIT, "needs git on PATH")
     def test_git_refuses_a_pathspec_above_its_repository(self):
         """Where the widening above stops, where the repository's root is the project: the hook
@@ -7227,6 +7246,7 @@ class RefusesGitPathsInAnEnclosingRepository(Verdicts, unittest.TestCase):
         ("git grep -e x -- ':(top)sibling'", "git grep -e x -- ':(exclude)a.txt'"),
         ("git grep -e x -- ':(top,icase)sibling'", "git grep -e x -- ':(icase)A.txt'"),
         ("git log -p -- ../sibling", "git log -p -- a.txt"),
+        ("git range-diff a..b c..d -- ../sibling", "git range-diff a..b c..d -- a.txt"),
         ("git show HEAD:sibling/data", "git show HEAD:./a.txt"),
         ("git show HEAD:../sibling/data", "git show HEAD:../project/a.txt"),
         ("git show :sibling/data", "git show :./a.txt"),
@@ -7291,6 +7311,7 @@ class RefusesGitPathsInAnEnclosingRepository(Verdicts, unittest.TestCase):
         with self._repository():
             for command in (
                 "git grep -e foo:bar",
+                "git range-diff --creation-factor ../sibling a b",
                 "git grep -e ../x",
                 "git grep foo:bar",
                 "git log -S a:b",
@@ -7301,6 +7322,7 @@ class RefusesGitPathsInAnEnclosingRepository(Verdicts, unittest.TestCase):
                 with self.subTest(command=command):
                     self.assert_allowed(command, "no path out of the project")
             for command in (
+                "git range-diff --creation-factor 50 a..b c..d -- ../sibling",
                 "git log -L 1,2:../sibling/data",
                 "git log -L1,2:../sibling/data",
                 "git grep foo ../sibling",
