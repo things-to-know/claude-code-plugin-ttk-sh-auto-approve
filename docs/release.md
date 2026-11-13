@@ -72,7 +72,8 @@ From the clone's root, with `<sha>` the merge commit and `<installPath>` the plu
 - The copy gives a verdict the release changed. For `d315e2c`, which refuses `cat =ls`:
 
   ```sh
-  printf '%s\n' 'cat =ls' | make -s explain HOOK=<installPath>/scripts/sh_auto_approve.py
+  python3 -I -B tools/explain.py --project "$PWD" \
+    --hook <installPath>/scripts/sh_auto_approve.py 'cat =ls'
   ```
 
   prints `refused`, with `zsh replaces a word with the path of a command: =ls`
