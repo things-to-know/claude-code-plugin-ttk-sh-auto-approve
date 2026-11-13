@@ -66,27 +66,6 @@ TEST_ARGS ?=
 # Warning: keep in sync with `.github/workflows/ci.yml` (`jobs.test.strategy.matrix.python`)
 TEST_PYTHON_VERSIONS ?= 3.12 3.13 3.14
 
-# The session to explain a verdict for, and the copy of the hook to ask, e.g.
-# `make explain PROJECT=$HOME/ws/app CWD=$HOME/ws/app/sub < commands.txt`.
-# `TRANSCRIPT` explains every Bash call of a session instead, each from its own directory, so it
-# replaces `CWD`:
-# `make -s explain PROJECT=$HOME/ws/app TRANSCRIPT=<session-id>.jsonl`
-# `SCRATCHPAD_DIR` is the session's scratchpad, with or without `TRANSCRIPT`: without it, the hook
-# approves no command that reaches one.
-# `SETTINGS` (settings files, separated by `:`) and `NO_RULES=1` (none) replace the project's
-# settings files, to audit an allow rule: see "Develop" in `AGENTS.md`.
-# `SETTING_SOURCES` is the session's `--setting-sources`, such as `user`: without it, every source.
-# `$HOME`, not `~`: zsh leaves a `~` after `=` in an argument as it is
-# (unless `magic_equal_subst` is set)
-PROJECT ?= ${CURDIR}
-CWD ?= ${PROJECT}
-TRANSCRIPT ?=
-SCRATCHPAD_DIR ?=
-SETTINGS ?=
-NO_RULES ?=
-SETTING_SOURCES ?=
-HOOK ?= plugin/scripts/sh_auto_approve.py
-
 # The git revision whose hook `verdict-diff` compares the working copy's with. Empty: where HEAD
 # left `origin/main`, fetched first, as a pull request's diff compares
 BASE ?=
@@ -263,20 +242,6 @@ lint-json: ## Check that every JSON file parses
 	@for file in ${JSON_FILES}; do \
 		${PYTHON} -m json.tool "$${file}" >/dev/null || { echo "invalid JSON: $${file}" >&2; exit 1; }; \
 	done
-
-# - `-B`: as for `test`, though `tools/explain.py` also sees to it for the hook it loads
-# - `--transcript=`: so that a path that starts with `-`, as each directory under
-#   `~/.claude/projects/` does, is not read as an option
-# - `CWD_ARGS`: with `TRANSCRIPT`, `CWD` goes only when it was given, not this file's default:
-#   `tools/explain.py` then refuses the pair, rather than `CWD` being dropped without a word
-.PHONY: explain
-explain: CWD_ARGS = $(if $(and ${TRANSCRIPT},$(filter file,$(origin CWD))),,--cwd "${CWD}")
-explain: ## Print the hook's verdict and reason for each command on stdin, or in TRANSCRIPT
-	${PYTHON} -I -B tools/explain.py --project "${PROJECT}" --hook "${HOOK}" \
-		$(if ${TRANSCRIPT},--transcript="${TRANSCRIPT}") ${CWD_ARGS} \
-		$(if ${SCRATCHPAD_DIR},--scratchpad-dir="${SCRATCHPAD_DIR}") \
-		$(if ${SETTINGS},--settings="${SETTINGS}") $(if ${NO_RULES},--no-rules) \
-		$(if ${SETTING_SOURCES},--setting-sources="${SETTING_SOURCES}")
 
 .PHONY: verdict-diff
 verdict-diff: ## List the test commands whose verdict differs from the hook at BASE

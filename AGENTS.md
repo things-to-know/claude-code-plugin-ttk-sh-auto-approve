@@ -207,8 +207,8 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
     - It takes the commands as arguments, or one per line on stdin
     - `--project` takes an absolute path: `.` is refused, `no project root`
     - `--help` lists the options below
-  - Run it directly, not through `make explain`: `make` is for the repository's standard
-    operations, such as the checks CI runs
+  - It has no `make` target: `make` is for the repository's standard operations, such as the
+    checks CI runs
   - To count the git runs behind a verdict, run it with `GIT_TRACE=<file>` and count the file's
     `built-in: git` lines
     - Not `GIT_TRACE_SETUP`, which writes nothing for a run outside a repository: on 2026-11-15
@@ -244,6 +244,9 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   - Replay with `tools/explain.py`:
     - Every Bash call of the session, each from its entry's `cwd`, which each line shows before
       the command: `python3 -I -B tools/explain.py --project <dir> --transcript <transcript>`
+      - A relative path to a transcript starts with `-`, which reads as an option: prefix it
+        with `./`, or give the absolute path
+      - No `--cwd` beside it: each call runs in its entry's `cwd`, and the script refuses the pair
       - Count the calls by reason: append `| cut -f1,2 | sort | uniq -c | sort -rn`
       - `uncertain`: the call came after another in its message, and the transcript doesn't
         record whether Claude Code ran the two together or in turn; the reason gives the verdict
