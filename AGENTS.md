@@ -215,6 +215,10 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
     `BASE=<revision>` compares with another
   - Past a dozen rows: a summary table, one example per issue or cause with its count, and
     every row below it in a collapsed `<details>`
+  - Until #93 is fixed, a test that patches a hook function lists its commands as changed, and
+    fails under the earlier hook
+    - On `b9ed9c5`: 7 failures in `CurlStopsAtTheListedSites`, and 3 curl verdicts, all listed
+      in #93; a run against the branch's own `HEAD` lists the same
 - Reproduce a gap that reaches a credential store against a fake store, never the real `~/.ssh`,
   `~/.aws` or another
   - While a link to a real store sits in a directory the hook approves reads from, such as the
