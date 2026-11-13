@@ -202,8 +202,13 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
 - Live debugging: start with `claude --debug`; `~/.claude/debug/<session-id>.txt`
   records which hooks matched and their exit codes.
 - Before saying the hook approves, refuses or has no opinion on a command, run the command
-  through `make explain` and quote the verdict it prints: reading the code is not a verdict
-  - e.g. `printf '%s\n' 'grep -rf /etc/os-release .' | make explain`
+  through `tools/explain.py` and quote the verdict it prints: reading the code is not a verdict
+  - e.g. `python3 -I -B tools/explain.py --project "$PWD" 'grep -rf /etc/os-release .'`
+    - It takes the commands as arguments, or one per line on stdin
+    - `--project` takes an absolute path: `.` is refused, `no project root`
+    - `--help` lists the options below
+  - It has no `make` target: `make` is for the repository's standard operations, such as the
+    checks CI runs
 - A hook change ends with `make verdict-diff`, and its pull request lists every verdict that
   changed
   - A refactor changes none
@@ -224,31 +229,34 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   - While a link to a real store sits in a directory the hook approves reads from, such as the
     scratchpad, the gap under test can read through it with no prompt
   - Make a scratch home holding the fake store, with the project inside it; the hook reads `HOME`
-    at call time: `HOME=<home> make explain PROJECT=<home>/proj CWD=<home>/proj NO_RULES=1`
+    at call time: `HOME=<home> python3 -I -B tools/explain.py --project <home>/proj --no-rules`
 - Triage a command that prompted by replaying it in its session's context, never a guessed one:
   - Find the session's transcript by its id: `ls ~/.claude/projects/*/<session-id>.jsonl`. It
     moves when the session is resumed elsewhere, and every directory there starts with `-`, so
     pass paths after `--` or prefixed with `./`
   - The transcript records the shell's working directory as `cwd` on each entry. The project
     directory is the one in the session's scratchpad path, or in "Shell cwd was reset to ..."
-  - Replay with `make explain` (i.e. `tools/explain.py`):
+  - Replay with `tools/explain.py`:
     - Every Bash call of the session, each from its entry's `cwd`, which each line shows before
-      the command: `make -s explain PROJECT=<dir> TRANSCRIPT=<transcript>`
+      the command: `python3 -I -B tools/explain.py --project <dir> --transcript <transcript>`
+      - A relative path to a transcript starts with `-`, which reads as an option: prefix it
+        with `./`, or give the absolute path
+      - No `--cwd` beside it: each call runs in its entry's `cwd`, and the script refuses the pair
       - Count the calls by reason: append `| cut -f1,2 | sort | uniq -c | sort -rn`
       - `uncertain`: the call came after another in its message, and the transcript doesn't
         record whether Claude Code ran the two together or in turn; the reason gives the verdict
         from each directory
       - A subagent's calls are in a transcript of its own, under `<session-id>/subagents/`
-    - Chosen commands: `make explain PROJECT=<dir> CWD=<dir> < commands.txt`
-    - Add `SCRATCHPAD_DIR=<dir>`, the session's scratchpad, for a command that reaches it
+    - Chosen commands: `python3 -I -B tools/explain.py --project <dir> --cwd <dir> < commands.txt`
+    - Add `--scratchpad-dir <dir>`, the session's scratchpad, for a command that reaches it
       - The hook reads it from its payload's `scratchpad_dir`
-      - No transcript entry records it, so it goes with `TRANSCRIPT` too
+      - No transcript entry records it, so it goes with `--transcript` too
       - Without it, the hook approves no command that reaches a scratchpad
       - A value the hook takes no scratchpad from, such as a relative path, gets a warning
       - It is `<temp>/claude-<uid>/<project>/<session-id>/scratchpad`, with `<temp>` per platform
         as in the "Session scratchpad directory" section of Claude Code's docs
-    - Add `HOOK=<path>` to ask the installed copy instead of the working copy
-- Audit an allow rule with `make explain`
+    - Add `--hook <path>` to ask the installed copy instead of the working copy
+- Audit an allow rule with `tools/explain.py`
   - The hook reads allow and deny rules, and `additionalDirectories`, only from the project's
     `.claude/settings.json` and `.claude/settings.local.json`; Claude Code alone applies a rule
     from any other settings file
@@ -258,16 +266,16 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
     - `claude -p` and the SDK run hooks in a workspace never trusted; an interactive session asks
       for trust first
     - The hook reads `--setting-sources` from Claude Code's command line, its parent process's
-    - `make explain` reads this machine's trust records; `SETTING_SOURCES=user` explains a
+    - `tools/explain.py` reads this machine's trust records; `--setting-sources user` explains a
       session started with `--setting-sources user`
-  - `NO_RULES=1` and `SETTINGS=<file>` replace those 2 files, `additionalDirectories` included
-  - `NO_RULES=1`: whether the hook approves the rule's command without the rule
+  - `--no-rules` and `--settings <file>` replace those 2 files, `additionalDirectories` included
+  - `--no-rules`: whether the hook approves the rule's command without the rule
     - If it does, the rule is redundant wherever the hook runs. It stays silent below
       `MINIMUM_PYTHON`, outside Linux and macOS, and on any error, and there the rule decides
-    - For a command that reads an `additionalDirectories` entry, use `SETTINGS` instead, with a
+    - For a command that reads an `additionalDirectories` entry, use `--settings` instead, with a
       file that holds only the entries
-  - `SETTINGS=<file>`: what else the rule approves
-    - First a command the rule matches and `NO_RULES=1` doesn't approve. It has to come back
+  - `--settings <file>`: what else the rule approves
+    - First a command the rule matches and `--no-rules` doesn't approve. It has to come back
       `allow`: a file that doesn't exist reads as no rules, without a word
     - Then the writing forms of the same program, such as `make lint-fix` for `Bash(make lint-*)`
     - The hook approves a pipeline, or a list joined by `;`, `&&` or `||`, whose segments each

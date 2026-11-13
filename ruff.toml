@@ -14,7 +14,7 @@ select = ["ALL"]
 ignore = [
     # Conflicts with the formatter, as ruff's documentation warns
     "COM812",
-    # The hook's verdicts are exceptions whose message is the reason `make explain` prints
+    # The hook's verdicts are exceptions whose message is the reason `tools/explain.py` prints
     "EM101",
     "EM102",
     "TRY003",

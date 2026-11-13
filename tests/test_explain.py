@@ -405,8 +405,8 @@ class ExplainsATranscript(unittest.TestCase):
         )
 
     def test_stdin_is_not_read(self):
-        """Commands come from the transcript alone. Were stdin read as well, `make explain
-        TRANSCRIPT=...` run at a terminal would wait for input that never comes."""
+        """Commands come from the transcript alone. Were stdin read as well, `tools/explain.py
+        --transcript ...` run at a terminal would wait for input that never comes."""
         with tempfile.TemporaryDirectory(prefix="readonly_hook_transcript_") as directory:
             path = write_transcript(directory, bash_call("ls"))
             lines = explain("--transcript", path, stdin="git push\n")
