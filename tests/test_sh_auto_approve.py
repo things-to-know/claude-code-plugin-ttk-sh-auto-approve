@@ -2700,7 +2700,11 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
         approves `git grep -e one -- '../*'`, as it approves a literal `..`, and git refuses both
         above the repository's root. Run here, so that a git that stopped refusing fails this
         test. In a project inside a larger repository, the hook measures git's paths itself:
-        `RefusesGitPathsInAnEnclosingRepository`."""
+        `RefusesGitPathsInAnEnclosingRepository`.
+
+        The hook is asked from `work`, where git runs, so that both read `'../*'` from the same
+        directory: from the clone, it would reach the clone's parent, which is, or holds, the
+        account's home directory, and the hook refuses that, rightly."""
         with scratch_tree() as root:
             # `LC_ALL=C`: git translates its "outside repository" message
             env = sandbox_env(root) | {"GIT_CONFIG_NOSYSTEM": "1", "LC_ALL": "C"}
@@ -2715,29 +2719,40 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
                 [GIT, "-C", str(work), "commit", "-q", "--allow-empty", "-m", "init"],
             ):
                 subprocess.run(argv, env=env, capture_output=True, check=True, timeout=10)
-            for command, argv in (
-                ("git grep -e one -- '../*'", ["grep", "-e", "one", "--", "../*"]),
-                ("git log --oneline -- '../*'", ["log", "--oneline", "--", "../*"]),
-                ("git ls-files -- '../*'", ["ls-files", "--", "../*"]),
-                (
-                    "git grep --no-index -e one -- '../*'",
-                    ["grep", "--no-index", "-e", "one", "--", "../*"],
-                ),
+            with (
+                unittest.mock.patch.object(hook, "REPO_ROOT", work),
+                unittest.mock.patch.object(hook, "_SESSION_CWD", None),
             ):
-                with self.subTest(command=command):
-                    self.assert_allowed(command, "a quoted pathspec is git's to match")
-                    run = subprocess.run(
-                        [GIT, *argv],
-                        cwd=work,
-                        env=env,
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        timeout=10,
-                    )
-                    self.assertNotIn("one", run.stdout, "git read AGENTS.md, above the repository")
-                    self.assertNotEqual(0, run.returncode, run.stderr)
-                    self.assertIn("outside", run.stderr)
+                self._git_stops_a_pathspec_above(root, work, env)
+
+    def _git_stops_a_pathspec_above(self, root: str, work: Path, env: dict[str, str]) -> None:
+        # The control: in the same layout, the hook refuses the pattern where it reaches a home
+        # directory
+        with unittest.mock.patch.dict(os.environ, {"HOME": str(Path(root, "home"))}):
+            self.assert_refused_outright("git grep -e one -- '../*'", "the pattern reaches `HOME`")
+        for command, argv in (
+            ("git grep -e one -- '../*'", ["grep", "-e", "one", "--", "../*"]),
+            ("git log --oneline -- '../*'", ["log", "--oneline", "--", "../*"]),
+            ("git ls-files -- '../*'", ["ls-files", "--", "../*"]),
+            (
+                "git grep --no-index -e one -- '../*'",
+                ["grep", "--no-index", "-e", "one", "--", "../*"],
+            ),
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "a quoted pathspec is git's to match")
+                run = subprocess.run(
+                    [GIT, *argv],
+                    cwd=work,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertNotIn("one", run.stdout, "git read AGENTS.md, above the repository")
+                self.assertNotEqual(0, run.returncode, run.stderr)
+                self.assertIn("outside", run.stderr)
 
     def test_the_output_form_of_process_substitution(self):
         """`<(...)` runs a command. `>(...)` runs one and hands it a stream to write."""
