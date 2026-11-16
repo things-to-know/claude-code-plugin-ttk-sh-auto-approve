@@ -209,6 +209,11 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
     - `--help` lists the options below
   - Run it directly, not through `make explain`: `make` is for the repository's standard
     operations, such as the checks CI runs
+  - To count the git runs behind a verdict, run it with `GIT_TRACE=<file>` and count the file's
+    `built-in: git` lines
+    - Not `GIT_TRACE_SETUP`, which writes nothing for a run outside a repository: on 2026-11-15
+      it showed none where `main` ran `git ls-remote --get-url origin` once, in a project that
+      holds the repository
 - A hook change ends with `make verdict-diff`, and its pull request lists every verdict that
   changed
   - A refactor changes none
