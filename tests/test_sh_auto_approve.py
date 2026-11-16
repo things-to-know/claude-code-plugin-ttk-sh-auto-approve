@@ -5045,12 +5045,16 @@ class RefusesALinkARecursiveReadFollows(Verdicts, unittest.TestCase):
 
     def test_a_link_the_command_makes(self):
         """#79's links count: `j` isn't there when the hook runs, as an entry of a directory
-        walked or as the operand itself."""
+        walked, as the operand itself, or as a name a wildcard matches."""
         with self._project(), operator_rules(allow=["Bash(ln *)"]):
             self.assert_allowed("ln -s ../src/lib d1/j && grep -R one d1", "the control")
             self.assert_refused_outright("ln -s ~ d1/j && grep -R PRIVATE d1", "reads ~/.ssh")
             self.assert_allowed("ln -s d1 j && grep -R one j", "the control")
             self.assert_refused_outright("ln -s src j && grep -R PRIVATE j", "src/lib2 leads out")
+            self.assert_allowed("ln -s d1 j && grep -R one j*", "the control")
+            self.assert_refused_outright("ln -s ~ j && grep -R PRIVATE j*", "j is ~")
+            self.assert_allowed("ln -s src j && grep -R one j*/l?b", "the control: src/lib")
+            self.assert_refused_outright("ln -s src j && grep -R one j*/l?b?", "src/lib2: ~/.ssh")
 
     def test_an_operand_the_shell_builds(self):
         """A value the command sets, and a wildcard's matches, are walked. One this module

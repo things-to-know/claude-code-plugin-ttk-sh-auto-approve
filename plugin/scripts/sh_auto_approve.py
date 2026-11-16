@@ -6339,6 +6339,10 @@ def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
     as many. A set, `[[:alpha:]]` and `[!x]` included, is any one of them. A pattern
     `GLOB_FROM_ITS_DIRECTORY` holds is its literal directory instead, which a recursive walk
     covers. Past `MAX_WALKED_ENTRIES` names, `NotReadOnly`.
+
+    A link an `ln` in the command makes is a name in its directory, as if it were there already,
+    and a directory is listed wherever it may lead, `_resolutions`: `ln -s ~ j && ... j*` matches
+    `j`, and `j*/.ssh` the store.
     """
     if GLOB_FROM_ITS_DIRECTORY.search(pattern):
         head = PATH_SPECIAL.split(pattern, 1)[0]
@@ -6353,10 +6357,7 @@ def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
             last = index == len(components) - 1
             found: list[str] = []
             for directory in current:
-                try:
-                    names = os.listdir(directory)
-                except (OSError, ValueError):
-                    names = []
+                names = _entry_names(directory)
                 if regex is None:
                     chosen = [name for name in names if name.casefold() == component.casefold()]
                     if component in (".", ".."):
@@ -6368,7 +6369,7 @@ def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
                         chosen += [name for name in (".", "..") if regex.fullmatch(name)]
                 for name in dict.fromkeys(chosen):
                     path = os.path.join(directory, name)
-                    if last or os.path.isdir(path):
+                    if last or _may_be_a_directory(path):
                         found.append(path)
                 if len(found) + len(matches) > MAX_WALKED_ENTRIES:
                     raise NotReadOnly(
@@ -6377,6 +6378,42 @@ def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
             current = found
         matches += current
     return matches
+
+
+def _entry_names(directory: str) -> list[str]:
+    """The names in ``directory``, wherever it may lead, with the links an `ln` makes in it.
+
+    A planned link is keyed by its path in the directory as it resolves, as
+    `_walk_for_links_uncached` lists them. What can't be listed, the shell can't match either.
+    """
+    if not _PLANNED_LINKS:
+        try:
+            return os.listdir(directory)
+        except (OSError, ValueError):
+            return []
+    try:
+        reals = _resolutions(directory)
+    except (OSError, ValueError):
+        raise NotReadOnly(f"a directory this module can't resolve: {directory}") from None
+    names: list[str] = []
+    for real in reals:
+        try:
+            listed = os.listdir(real)
+        except (OSError, ValueError):
+            listed = []
+        names += listed
+        names += [os.path.basename(key) for key in _PLANNED_LINKS if os.path.dirname(key) == real]
+    return list(dict.fromkeys(names))
+
+
+def _may_be_a_directory(path: str) -> bool:
+    """Whether ``path`` is a directory where it may lead, a link an `ln` makes included."""
+    if not _PLANNED_LINKS:
+        return os.path.isdir(path)
+    try:
+        return any(os.path.isdir(real) for real in _resolutions(path))
+    except (OSError, ValueError):
+        raise NotReadOnly(f"a path this module can't resolve: {path}") from None
 
 
 def _glob_component_regex(component: str) -> re.Pattern[str] | None:
