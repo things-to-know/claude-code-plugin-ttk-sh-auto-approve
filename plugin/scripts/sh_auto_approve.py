@@ -1959,6 +1959,9 @@ def _known_values(
 
     A name this command never binds is left out: the residual `_word_the_shell_decides`
     documents.
+
+    These are the values wherever the binding stands: `_classify_with` then reads as unread
+    each name whose value the shell may not hold where a word uses it, `_unsettled_names`.
     """
     values: dict[str, list[str]] = {}
     for segment in segments:
@@ -1978,6 +1981,167 @@ def _known_values(
                     value = _tilde_word(value)
                 values[name] = [value]
     return {name: values.get(name) for name in bindings}
+
+
+# The separators in front of a binding that run it whatever came before: the start of the command
+# or of a line, `;`, and `&`, which puts the command before it in the background
+SETTLING_SEPARATORS = frozenset({"\n", ";", "&"})
+
+# The separators after a binding that run it outside the shell: bash runs each command of a
+# pipeline in a subshell, and `&` runs it in one in the background
+SUBSHELL_SEPARATORS = frozenset({"|", "|&", "&"})
+
+# The words that open a compound command whose body is in the segments after them, and those that
+# close one. The shell may skip a body, as in `false && { d=src; }` and `if false; then d=src; fi`,
+# and runs one in a pipeline or behind `&` in a subshell, as in `{ d=src; } &`. A `for` header
+# opens one where a `do` follows it, `_compound_structure`.
+COMPOUND_OPENERS = frozenset({"{", "if", "while", "until"})
+COMPOUND_CLOSERS = frozenset({"}", "fi", "done"})
+
+
+def _names_used(words: list[str], parts: list[tuple[str, str]]) -> set[str]:
+    """Each name these words expand: unquoted, double-quoted, or in a substitution's body.
+
+    Read wider than the shell reads them, which costs only a name read as unread: a body is
+    searched as its raw text, so a `'$d'` inside it counts too. A part's value holds no
+    placeholder, as the command can't carry `PLACEHOLDER_MARK`, so there is one level to read.
+    """
+    names: set[str] = set()
+    for word in words:
+        names.update(UNQUOTED_EXPANSION.findall(PLACEHOLDER.sub("", word)))
+        for index in map(int, PLACEHOLDER.findall(word)):
+            kind, value = parts[index]
+            if kind == DOUBLE_QUOTED or kind in RUNS_A_COMMAND:
+                names.update(UNQUOTED_EXPANSION.findall(value))
+    return names
+
+
+def _first_bindings(segment: list[str], parts: list[tuple[str, str]]) -> list[str]:
+    """The names this segment binds where `_known_values` reads a value.
+
+    Each assignment that starts the segment, or the name of the `for` header the segment is.
+    """
+    if len(segment) >= 3 and segment[0] in WORD_LIST_HEADS and segment[2] == "in":
+        return [_expand(segment[1], parts)]
+    names = []
+    for word in segment:
+        if not ASSIGNMENT.match(word):
+            break
+        names.append(word.partition("=")[0])
+    return names
+
+
+def _compound_structure(segments: list[list[str]]) -> tuple[list[int], dict[int, int]]:
+    """How many compound commands each segment starts inside, and where each `for` loop ends.
+
+    The structure words in front of each segment's command, as `_command_index` walks them, open
+    and close them: `COMPOUND_OPENERS`, a `for` header a `do` follows, and `COMPOUND_CLOSERS`.
+    zsh's short `for`, `for d in a; true`, which its default `SHORT_LOOPS` allows and bash
+    refuses, has neither `do` nor `done`: every segment after it counts as inside one more, and
+    a later `done` closes the loop around it. The second value maps the segment of each `for`
+    header that opens a loop to the segment of the `done` that closes it.
+    """
+    depths: list[int] = []
+    loop_ends: dict[int, int] = {}
+    # The compounds open at this point, innermost last: the segment of a `for` header, or None
+    opened: list[int | None] = []
+    short_loops = 0
+    for position, segment in enumerate(segments):
+        depths.append(len(opened) + short_loops)
+        index = 0
+        while index < len(segment):
+            word = segment[index]
+            if word in COMPOUND_CLOSERS:
+                header = opened.pop() if opened else None
+                if header is not None and word == "done":
+                    loop_ends[header] = position
+                index += 1
+            elif word in WORD_LIST_HEADS:
+                _, body = _header(segment, index)
+                following = segments[position + 1][:1] if position + 1 < len(segments) else []
+                if body is not None or following == ["do"]:
+                    opened.append(position)
+                else:
+                    short_loops += 1
+                if body is None:
+                    break
+                index = body
+            elif word in COMPOUND_OPENERS:
+                opened.append(None)
+                index += 1
+            elif word in STRUCTURE:
+                index += 1
+            else:
+                break
+    return depths, loop_ends
+
+
+def _unsettled_names(
+    segments: list[list[str]],
+    separators: list[tuple[str, str]],
+    parts: list[tuple[str, str]],
+    names: set[str],
+) -> set[str]:
+    """Each of ``names`` whose value from this command the shell may not hold where it is used.
+
+    `_known_values` reads a name's one binding wherever it stands, but the shell holds that
+    value only once the binding has run, in the shell itself. Before that, or where it never
+    runs, the name holds the value it had before, and an unset one expands to nothing: in
+    `cd $d; d=src`, and in `false && d=src; cd $d`, the `cd` goes to the home directory.
+
+    A name a `for` header binds keeps its values in the loop's body, which runs only once the
+    header has bound it, in the same shell, wherever the loop stands. Anywhere else, a name keeps
+    its values only where its binding:
+
+    - comes before every segment that uses it, `_names_used`, its own included
+    - stands in no compound command, `_compound_structure`: its body may not run, and runs in a
+      subshell in a pipeline or behind `&`
+    - follows a separator that runs it whatever came before, `SETTLING_SEPARATORS`: not `&&`,
+      `||` or a pipe
+    - runs in the shell itself, `SUBSHELL_SEPARATORS`: not in a pipeline, nor behind `&`, by
+      the separator after its segment, or after the `done` of the loop it opens
+    - is no `for` whose list may hold no word, which then runs no turn: one with a word the
+      shell builds, `_word_the_shell_builds`, such as a wildcard, which bash's `nullglob` and
+      zsh's `null_glob` drop where it matches nothing, or a `$(ls)` of an empty directory
+
+    ``separators`` holds the separator before and after each segment, `_segment_separators`.
+    """
+    depths, loop_ends = _compound_structure(segments)
+    binders: dict[str, list[int]] = {}
+    # The first and the last segment that uses each name
+    first_use: dict[str, int] = {}
+    last_use: dict[str, int] = {}
+    for position, segment in enumerate(segments):
+        for name in _first_bindings(segment, parts):
+            binders.setdefault(name, []).append(position)
+        for name in _names_used(segment, parts):
+            first_use.setdefault(name, position)
+            last_use[name] = position
+    unsettled: set[str] = set()
+    for name in names:
+        bound = binders.get(name, [])
+        if len(bound) != 1:
+            unsettled.add(name)
+            continue
+        index = bound[0]
+        first, last = first_use.get(name, len(segments)), last_use.get(name, -1)
+        header = segments[index]
+        # The segment that ends what binds the name: the `done` of a loop, else its own
+        end = loop_ends.get(index) if header[0] in WORD_LIST_HEADS else index
+        if end is None or first <= index:
+            # zsh's short `for`, or one no `done` closes, ends where this module doesn't read
+            unsettled.add(name)
+        elif last > end and (
+            depths[index] > 0
+            or separators[index][0] not in SETTLING_SEPARATORS
+            or separators[end][1] in SUBSHELL_SEPARATORS
+            or (
+                header[0] in WORD_LIST_HEADS
+                and any(_word_the_shell_builds(word, parts) for word in header[3:])
+            )
+        ):
+            unsettled.add(name)
+    return unsettled
 
 
 def _unclean_expansion(token: str, known_values: dict[str, list[str] | None]) -> str | None:
@@ -2237,6 +2401,34 @@ def _segments(tokens: list[str]) -> list[list[str]]:
         else:
             out[-1].append(token)
     return [segment for segment in out if segment]
+
+
+# The separators after which bash reads on to the next line, as the rest of the same list
+CONTINUING_SEPARATORS = frozenset({"&&", "||", "|", "|&"})
+
+
+def _segment_separators(tokens: list[str], before: str) -> tuple[list[tuple[str, str]], str]:
+    """The separator before and after each segment `_segments` makes of ``tokens``, in order.
+
+    ``before`` is the one in front of the first segment: a newline, or the `&&`, `||`, `|` or
+    `|&` that ended the line before, after which bash reads this line as the rest of its list.
+    The end of the line is a newline. Also returns the separator this line hands the next one,
+    by the same rule.
+    """
+    out: list[tuple[str, str]] = []
+    current = False
+    for token in tokens:
+        if token in SEPARATORS and set(token).issubset(PUNCTUATION_CHARS):
+            if current:
+                out.append((before, token))
+                current = False
+            before = token
+        else:
+            current = True
+    if current:
+        out.append((before, "\n"))
+        return out, "\n"
+    return out, before if before in CONTINUING_SEPARATORS else "\n"
 
 
 def _strip_structure(words: list[str]) -> list[str]:
@@ -7111,6 +7303,9 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # whitespace and glues `ls\nrm` into one word, so the split happens here. A newline
     # inside a quoted string is in the table by now, so it no longer reaches this.
     segments: list[list[str]] = []
+    # The separator before and after each segment, for `_unsettled_names`
+    separators: list[tuple[str, str]] = []
+    carried = "\n"
     # A substitution's body inherits the `&` of the command it sits in: in `echo "$(curl x)" &`,
     # the `curl` runs in the job
     backgrounds = inherited is not None and inherited.backgrounds
@@ -7119,8 +7314,12 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         # A `&` token is the separator: `&&`, `|&` and a redirection's `&` are tokens of their own
         backgrounds = backgrounds or "&" in tokens
         segments.extend(_segments(tokens))
+        line_separators, carried = _segment_separators(tokens, carried)
+        separators.extend(line_separators)
     if not segments:
         raise NotReadOnly("no command")
+    if len(separators) != len(segments):
+        raise NotReadOnly("segments this module could not place in the command")
 
     allow, deny = _operator_rules(settings)
 
@@ -7141,6 +7340,16 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     splice_vars = _literal_assignments(segments, parts, bindings)
     loop_values = _literal_loop_values(segments, parts, bindings)
     known_values = _known_values(segments, parts, splice_vars, loop_values, own_bindings)
+    # A value the shell may not hold where a word uses it is no value to read: every reader
+    # takes the name as unread, the value it had before, as for `cd $d; d=src`
+    read = {name for name, values in known_values.items() if values is not None}
+    unsettled = _unsettled_names(
+        segments, separators, parts, read | set(splice_vars) | set(loop_values)
+    )
+    for name in unsettled:
+        known_values[name] = None
+        splice_vars.pop(name, None)
+        loop_values.pop(name, None)
     for name, values in (inherited.values if inherited else {}).items():
         if name not in known_values:
             known_values[name] = values
@@ -7153,8 +7362,9 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # sets in place. Collected across every segment first, because the header that binds a name
     # and the body that uses it are separate segments, and `_strip_structure` discards the
     # header. A bare `"$name"` of one of these is exempt from the flag check inside
-    # `_check_command`; nothing else is.
-    safe_names = _safe_loop_names(segments, parts, bindings, known_values)
+    # `_check_command`; nothing else is. An unsettled name is none: where a word uses it, it holds
+    # a value no header spells.
+    safe_names = _safe_loop_names(segments, parts, bindings, known_values) - unsettled
 
     # Where a relative word may be resolved from, worked out once for the credential check, the
     # read scope and each substitution's body

@@ -62,7 +62,7 @@ from a command that prompted in a real session.
           RefusesDescriptorAndSocketRedirection, RefusesRedirectionAttachedToACompound,
           RefusesReadsOutsideTheWorkingDirectories, ResolvesThroughALinkTheCommandMakes,
           RefusesALinkARecursiveReadFollows, RefusesACredentialStoreAWildcardOrABaseReaches,
-          RefusesAScratchPathThroughALinkOut,
+          ReadsAValueOnlyWhereTheShellHoldsIt, RefusesAScratchPathThroughALinkOut,
           RefusesEgressThroughAnApprovedProgram
      9  Program identity, environment, and session state
           RefusesControlOfTheEnvironmentAndTheProgram, StripsTheWrapperTheHostStrips,
@@ -5390,6 +5390,115 @@ class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase
             ):
                 with self.subTest(command=command):
                     self.assert_refused_outright(command)
+
+
+class ReadsAValueOnlyWhereTheShellHoldsIt(Verdicts, unittest.TestCase):
+    """A name was read as the value the command assigns it wherever the assignment stood, and
+    whether or not it ran in the shell itself, so the read scope placed a `cd $d` and a `$d/x` at
+    that value. The shell holds the value it had before there, and an unset `d` expands to
+    nothing: in bash 5.2 and zsh 5.9, `cd $d && grep -r <key> .; d=docs` grepped a key in a
+    scratch home's `.ssh`, and `cat $d/etc/os-release; d=.` read `/etc/os-release`. Each in
+    `a_project_below_home`, beside a control where the assignment runs first, in the shell."""
+
+    def test_a_cd_before_its_value(self):
+        """A recursive read after it would read the home directory, `~/.ssh` included."""
+        with a_project_below_home():
+            for command in (
+                "d=src; cd $d && grep -rl PRIVATE .",
+                "d=src && cd $d && grep -rl PRIVATE .",
+                "true; d=src; cd $d && grep -rl PRIVATE .",
+                "true\nd=src; cd $d && grep -rl PRIVATE .",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: the assignment runs first")
+            for command in (
+                "cd $d && grep -rl PRIVATE .; d=src",
+                "cd $d; grep -rl PRIVATE .; d=src",
+                # Skipped, or run in a subshell: bash runs each command of a pipeline in one, and
+                # a command behind `&` in one in the background
+                "false && d=src; cd $d && grep -rl PRIVATE .",
+                "true || d=src; cd $d && grep -rl PRIVATE .",
+                "false &&\nd=src; cd $d && grep -rl PRIVATE .",
+                "d=src | cat; cd $d && grep -rl PRIVATE .",
+                "cat /dev/null | d=src; cd $d && grep -rl PRIVATE .",
+                "d=src & cd $d && grep -rl PRIVATE .",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command, "cd went to the home directory")
+
+    def test_a_path_before_its_value(self):
+        """The rest of the path is read from `/`, outside the read roots."""
+        with a_project_below_home():
+            for command in (
+                "d=src; cat $d/lib/x.txt",
+                "for d in src; do cat $d/lib/x.txt; done",
+                "for d in src; do true; done; cat $d/lib/x.txt",
+                "for d in sr*; do cat $d/lib/x.txt; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: the binding runs first")
+            for command in (
+                "cat $d/lib/x.txt; d=src",
+                "false && d=src; cat $d/lib/x.txt",
+                "cat $d/lib/x.txt; for d in src; do true; done",
+                'echo "$(cat $d/lib/x.txt)"; d=src',
+                # A pattern that matches nothing runs no turn under `nullglob` or `null_glob`
+                "for d in sr*; do true; done; cat $d/lib/x.txt",
+                "for d in sr*; do for e in a; do true; done; done; cat $d/lib/x.txt",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "cat read below /")
+
+    def test_a_binding_inside_a_compound(self):
+        """A branch or a body the shell may skip, or run in a subshell: in bash 5.2 and zsh 5.9,
+        each `cd` went to the home directory, and each `cat` read below `/`, except zsh's for the
+        group that ends a pipeline, which zsh runs in the shell itself."""
+        with a_project_below_home():
+            for command in (
+                "{ true; }; d=src; cd $d && grep -rl PRIVATE .",
+                "if true; then true; fi\nd=src; cd $d && grep -rl PRIVATE .",
+                "for f in src; do\ncat $f/lib/x.txt\ndone",
+                "for x in a; do\nfor f in src; do cat $f/lib/x.txt; done\ndone",
+                "false && for d in src; do cat $d/lib/x.txt; done",
+                "for d in src; do cat $d/lib/x.txt; done | cat",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: the binding runs first")
+            for command in (
+                "false && { true; d=src; }; cd $d && grep -rl PRIVATE .",
+                "if false; then true; d=src; fi; cd $d && grep -rl PRIVATE .",
+                "if false; then\nd=src\nfi; cd $d && grep -rl PRIVATE .",
+                "if true; then true; else true; d=src; fi; cd $d && grep -rl PRIVATE .",
+                "false && {\nd=src\n}; cd $d && grep -rl PRIVATE .",
+                "while false; do\nd=src\ndone; cd $d && grep -rl PRIVATE .",
+                "{\nd=src\n} | cat; cd $d && grep -rl PRIVATE .",
+                "{ true; d=src; } & cd $d && grep -rl PRIVATE .",
+                "cat /dev/null | { true; d=src; }; cd $d && grep -rl PRIVATE .",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command, "cd went to the home directory")
+            for command in (
+                "for d in src; do true; done | cat; cat $d/lib/x.txt",
+                "for d in src; do true; done & cat $d/lib/x.txt",
+                "if false; then true; for d in src; do true; done; fi; cat $d/lib/x.txt",
+                "for x in sr*; do\nfor d in src; do true; done\ndone; cat $d/lib/x.txt",
+                # A list of words the shell builds may hold none, with no shell option
+                "for d in $(ls nothing); do true; done; cat $d/lib/x.txt",
+                # zsh's short `for` has no `done`: the one here closes the loop around it
+                "for x in a; do\nfor d in sr*; true; cat $d/lib/x.txt; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "cat read below /")
+
+    def test_a_flag_before_its_loop(self):
+        """A bare `"$p"` of a literal loop's name is exempt from the flag check only where the
+        loop has bound it: before it, `p` holds a value no header spells."""
+        with a_project_below_home():
+            self.assert_allowed('for p in main; do git log "$p"; done', "the control")
+            self.assert_allowed('for p in main; do true; done; git log "$p"', "the control")
+            self.assert_refused_outright(
+                'git log "$p"; for p in main; do true; done', "git got the value p had before"
+            )
 
 
 class RefusesAScratchPathThroughALinkOut(Verdicts, unittest.TestCase):
