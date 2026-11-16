@@ -76,6 +76,22 @@ insists on its own filename, symlink to this file rather than copying it.
   any error, exit 0 with no output. Never exit 2: that blocks the call instead
   of handing it to the user. A crash or timeout also falls back to the normal
   permission prompt, but shows the user a hook error.
+- **One module, in sections**: `sh_auto_approve.py` goes from the shell's grammar, through the
+  read scope, to one section per program, then the dispatch, the classifier and `main`
+  - It stays one file: the tests and `tools/` set its session state and patch its functions by
+    name on that one module, and `tools/verdict_diff.py` reads the earlier hook from git as one
+    file
+- **A new program**:
+  - Its tables and its `_check_<program>(args)` go in a section of its own, under "Programs"
+  - It is registered in `PROGRAMS`, as a `_Program`, which brings the checks on a word the shell
+    supplies, splits or globs
+    - What it reads from the call itself, such as how a word was spelled or the read scope, is
+      its `then`, which takes the `_Call`
+    - One that leaves what it doesn't approve to the operator's rules, as `gh` and `curl` do, is
+      a `WORD_READERS` entry instead
+  - One that only ever reads, with no flag that writes or runs a program, goes in `READ_ONLY`
+  - One that opens the files its operands name goes in `READER_SPECS`, and in `LINK_FOLLOWERS`
+    if it follows links while it recurses
 - **`gh`**
   - The hook reads `gh api` GETs itself
   - It reads these subcommands itself, flag by flag (`GH_READ_SPECS`): `pr view|list|diff|checks`,
