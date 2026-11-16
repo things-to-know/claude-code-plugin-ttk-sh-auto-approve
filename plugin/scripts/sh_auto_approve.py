@@ -2938,12 +2938,13 @@ def _check_git_remote_reach(args: list[str], scope: _ReadScope | None) -> None:
     ls-remote --get-url`` prints the URL the command would reach, every one of those applied,
     and contacts nothing. Not from the project as well, where the session's working directory
     is another: in a directory that holds the repository, git there takes the name for a path.
-    A directory below `UNREAD_VALUE` is no opinion, before git runs anywhere: git may run where
-    no base says, as after a `cd` that `CDPATH` may redirect, whose reason names the ``./``
-    spelling `CDPATH` never redirects. Such a `cd` counts wherever it stands, as for the read
-    scope: one after git too, since a loop can run git again after it. A remote with
-    ``remote.<name>.vcs`` is fetched by a ``git-remote-<vcs>`` program, which no URL shows, so
-    any one configured is no opinion as well.
+    Before git runs anywhere, a directory `_unvouched_directory` finds is no opinion: one below
+    `UNREAD_VALUE`, where git may run though no base says, as after a `cd` that `CDPATH` may
+    redirect, whose reason names the ``./`` spelling `CDPATH` never redirects, and one the read
+    scope doesn't hold, whose config may name a program git runs, as for ``-C``. A `cd` counts
+    wherever it stands, as for the read scope: one after git too, since a loop can run git again
+    after it. A remote with ``remote.<name>.vcs`` is fetched by a ``git-remote-<vcs>`` program,
+    which no URL shows, so any one configured is no opinion as well.
 
     Each failure is no opinion, which an operator's rule can still grant. With no scope there is
     no directory to ask from.
@@ -2961,9 +2962,7 @@ def _check_git_remote_reach(args: list[str], scope: _ReadScope | None) -> None:
             f"git may run where CDPATH takes a cd, which this module can't read: {place}; "
             "a cd target spelled ./<dir> is never looked up in CDPATH"
         )
-    unplaced = next((cwd for cwd in scope.run_bases if UNREAD_VALUE in cwd), None)
-    if unplaced is not None:
-        raise NoOpinion(f"git may run in a directory this module can't place: {_shown(unplaced)}")
+    _check_where_it_runs(_unvouched_directory(scope.run_bases, scope))
     for cwd in scope.run_bases:
         for name in names or [None]:
             url = _git_remote_url(cwd, name, scope)
@@ -3000,6 +2999,10 @@ def _run_git(scope: _ReadScope, directory: str, *args: str) -> tuple[int, str] |
     startup file changes. git still does whatever that config has it do on every call, such as
     writing a ``trace2`` target. None where git cannot run, does not finish within
     ``GIT_RESOLVE_TIMEOUT`` (a FIFO it opens blocks it), or prints other than UTF-8.
+
+    The caller vouches for ``directory`` first, as `_check_git_remote_reach` does with
+    `_unvouched_directory`: git reads that directory's config, which may name a program it runs,
+    and `_classify_with` applies its own such check only after `_check_command`, where this runs.
     """
     key = (directory, *args)
     if key not in scope.git_runs:

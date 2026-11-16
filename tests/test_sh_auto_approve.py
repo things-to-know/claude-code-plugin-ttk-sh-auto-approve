@@ -1706,17 +1706,24 @@ class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
 
     def test_a_directory_outside_the_read_roots_is_not_asked(self):
         """git runs what a repository's config names, so it is asked only where the read
-        scope allows `-C`, which is checked first."""
+        scope allows `-C`, which is checked first, and each `cd` target: one after git too,
+        since a loop can run git again after it."""
         with (
-            remotes_configured(self.ORIGIN),
+            remotes_configured(self.ORIGIN) as project,
             unittest.mock.patch.object(
                 hook, "_run_git_uncached", wraps=hook._run_git_uncached
             ) as run,
         ):
+            (project / "docs").mkdir()
             self.assert_allowed("git -C . ls-remote origin", "the control")
             self.assertTrue(run.called)
             run.reset_mock()
             self.assert_refused("git -C /etc ls-remote origin", "outside the read roots")
+            run.assert_not_called()
+            self.assert_allowed("git ls-remote origin && cd ./docs && ls", "the control")
+            self.assertTrue(run.called)
+            run.reset_mock()
+            self.assert_no_opinion("git ls-remote origin && cd /etc && ls", "the same, by cd")
             run.assert_not_called()
 
     def test_where_git_cannot_answer(self):
