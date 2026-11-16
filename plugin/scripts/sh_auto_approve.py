@@ -121,7 +121,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 from stat import S_ISDIR, S_ISLNK, S_ISREG
-from typing import NoReturn
+from typing import NamedTuple, NoReturn, Optional
 
 # --------------------------------------------------------------------------------------
 # Limits, and where the module runs
@@ -212,7 +212,7 @@ _PLANNED_LINKS: dict[str, set[str]] = {}
 # The walks `_walk_for_links` made for the command being classified, by roots, depth and the
 # links the command makes: Layer B and Layer A each ask, and `_classify` may read a command more
 # than once. Reset by `_classify`.
-_WALKS: dict[tuple, list[tuple[str, str]]] = {}
+_WALKS: dict[tuple, Parts] = {}
 
 
 def _home() -> str:
@@ -269,6 +269,23 @@ ARITHMETIC = "arithmetic"
 # Both substitution kinds run a command; `RUNS_A_COMMAND` is what must be recursed into,
 # refused in a program-name position, and counted as work that was inspected.
 RUNS_A_COMMAND = (SUBSTITUTION, PROCESS_SUBSTITUTION)
+
+
+class Part(NamedTuple):
+    """One span `_scan` took out of the command: its kind, and its text or its body."""
+
+    kind: str
+    value: str
+
+
+# The table a reduced command's placeholders index: placeholder `n` stands for `parts[n]`.
+# A plain assignment, like the alias below, and not a `type` statement, which an interpreter
+# older than `MINIMUM_PYTHON` cannot compile: `main` could not stay silent there.
+Parts = list[Part]
+
+# Each name a command binds, with the values it can hold, or None where they are unread:
+# see `_known_values`
+KnownValues = dict[str, Optional[list[str]]]  # noqa: UP045 - `X | None` runs from 3.10 on
 
 # What a substitution contributes to the word it sits in. A value the module never read
 # cannot be argued about, so it must be text no validator can mistake for permission.
@@ -419,7 +436,7 @@ def _scan_double_quoted(text: str, index: int, emit: Callable[[str, str], None])
     raise NotReadOnly("unbalanced double quote")
 
 
-def _scan(command: str) -> tuple[str, list[tuple[str, str]]]:
+def _scan(command: str) -> tuple[str, Parts]:
     """Separate what the shell will read as syntax from what it will pass through.
 
     Returns the command with every quoted span, escape, arithmetic expansion and command
@@ -433,12 +450,12 @@ def _scan(command: str) -> tuple[str, list[tuple[str, str]]]:
     compares with ``>`` is indistinguishable from a redirection. Resolving quoting first is
     what lets both be read correctly rather than both be refused.
     """
-    parts: list[tuple[str, str]] = []
+    parts: Parts = []
     out: list[str] = []
     index, length = 0, len(command)
 
     def emit(kind: str, value: str) -> None:
-        parts.append((kind, value))
+        parts.append(Part(kind, value))
         out.append(f"{PLACEHOLDER_MARK}{len(parts) - 1}{PLACEHOLDER_MARK}")
 
     while index < length:
@@ -489,14 +506,25 @@ def _scan(command: str) -> tuple[str, list[tuple[str, str]]]:
     return "".join(out), parts
 
 
-def _expand(token: str, parts: list[tuple[str, str]]) -> str:
+def _expand(token: str, parts: Parts) -> str:
     """The word bash will hand the program, with substitutions standing in for themselves."""
 
     def replace(match: re.Match) -> str:
-        kind, value = parts[int(match.group(1))]
-        return SUBSTITUTION_MARKER if kind in RUNS_A_COMMAND else value
+        part = parts[int(match.group(1))]
+        return SUBSTITUTION_MARKER if part.kind in RUNS_A_COMMAND else part.value
 
     return PLACEHOLDER.sub(replace, token)
+
+
+def _parts_in(token: str, parts: Parts) -> list[Part]:
+    """The part each placeholder in this word stands for, in order."""
+    return [parts[int(index)] for index in PLACEHOLDER.findall(token)]
+
+
+def _whole_part(token: str, parts: Parts) -> Part | None:
+    """The part this word is, when it is one placeholder and nothing else, or None."""
+    match = PLACEHOLDER.fullmatch(token)
+    return None if match is None else parts[int(match.group(1))]
 
 
 # --------------------------------------------------------------------------------------
@@ -582,7 +610,7 @@ ZSH_GLOB_SUBST = re.compile(r"\$\{?~")
 BRACE_SUBSTITUTION = re.compile(r"\$\{\s*\||\$\{\s+[a-zA-Z0-9_]")
 
 
-def _zsh_equals_expansion(token: str, parts: list[tuple[str, str]]) -> bool:
+def _zsh_equals_expansion(token: str, parts: Parts) -> bool:
     """Whether zsh replaces part of this word with the path of a command, `=ls` with `/usr/bin/ls`.
 
     zsh does so for an unquoted `=` that starts a word and has more after it, and in an
@@ -619,14 +647,14 @@ def _zsh_equals_expansion(token: str, parts: list[tuple[str, str]]) -> bool:
 EXPANSION_ONLY = re.compile(r"(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[^{}]*\}|\$[0-9@*#?$!-])+")
 
 
-def _carries_substitution(token: str, parts: list[tuple[str, str]]) -> bool:
+def _carries_substitution(token: str, parts: Parts) -> bool:
     """Whether any part of this word is produced by running a command."""
-    return any(parts[int(index)][0] in RUNS_A_COMMAND for index in PLACEHOLDER.findall(token))
+    return any(part.kind in RUNS_A_COMMAND for part in _parts_in(token, parts))
 
 
-def _carries_arithmetic(token: str, parts: list[tuple[str, str]]) -> bool:
+def _carries_arithmetic(token: str, parts: Parts) -> bool:
     """Whether any part of this word is an arithmetic expansion, which reads as `0` here."""
-    return any(parts[int(index)][0] == ARITHMETIC for index in PLACEHOLDER.findall(token))
+    return any(part.kind == ARITHMETIC for part in _parts_in(token, parts))
 
 
 def _has_wildcard(text: str) -> bool:
@@ -679,7 +707,7 @@ def _carries_brace_expansion(token: str) -> bool:
     return BRACE_EXPANSION.search(PLACEHOLDER.sub("", token)) is not None
 
 
-def _has_bare_variable(token: str, parts: list[tuple[str, str]]) -> bool:
+def _has_bare_variable(token: str, parts: Parts) -> bool:
     """Whether the value itself contains an unresolved `$var`, in or out of quotes.
 
     A value like `--profile $other` cannot be spliced, because `$other` is a word this
@@ -689,14 +717,10 @@ def _has_bare_variable(token: str, parts: list[tuple[str, str]]) -> bool:
     """
     if "$" in PLACEHOLDER.sub("", token):
         return True
-    return any(
-        kind == DOUBLE_QUOTED and "$" in value
-        for index in PLACEHOLDER.findall(token)
-        for kind, value in [parts[int(index)]]
-    )
+    return any(part.kind == DOUBLE_QUOTED and "$" in part.value for part in _parts_in(token, parts))
 
 
-def _word_the_shell_builds(token: str, parts: list[tuple[str, str]]) -> bool:
+def _word_the_shell_builds(token: str, parts: Parts) -> bool:
     """Whether the shell still builds this word.
 
     An expansion, a substitution, a wildcard it expands or a brace.
@@ -709,7 +733,7 @@ def _word_the_shell_builds(token: str, parts: list[tuple[str, str]]) -> bool:
     )
 
 
-def _word_the_shell_decides(token: str, parts: list[tuple[str, str]]) -> bool:
+def _word_the_shell_decides(token: str, parts: Parts) -> bool:
     """Whether the shell, not the operator, decides what kind of word this is.
 
     Every flag table reads a word that is already complete. Two shapes are not:
@@ -761,13 +785,10 @@ def _word_the_shell_decides(token: str, parts: list[tuple[str, str]]) -> bool:
 # * **One expansion, nothing glued.** `"${f}-x"` and `"$f$g"` are handled by
 #   `_word_the_shell_decides` already (the suffix idiom), and are not this exemption's job.
 # * **A name a literal-list loop binds**, which is the caller's `names` set.
-def _is_bare_expansion_of(token: str, parts: list[tuple[str, str]], names: frozenset[str]) -> bool:
-    match = PLACEHOLDER.fullmatch(token)
-    if match is None:
+def _is_bare_expansion_of(token: str, parts: Parts, names: frozenset[str]) -> bool:
+    whole = _whole_part(token, parts)
+    if whole is None or whole.kind != DOUBLE_QUOTED:
         return False  # not a single quoted word; an unquoted `$f` fails here
-    kind, _ = parts[int(match.group(1))]
-    if kind != DOUBLE_QUOTED:
-        return False
     expanded = _expand(token, parts)
     return any(expanded == f"${name}" or expanded == "${" + name + "}" for name in names)
 
@@ -785,9 +806,7 @@ def _carries_tilde_or_equals(token: str) -> bool:
     return "~" in PLACEHOLDER.sub("", token) or token.startswith("=")
 
 
-def _rewritten_words(
-    tokens: list[str], live_globs: list[bool], parts: list[tuple[str, str]]
-) -> list[bool]:
+def _rewritten_words(tokens: list[str], live_globs: list[bool], parts: Parts) -> list[bool]:
     """Word by word, whether the shell rewrites or computes it before the program runs.
 
     For the validators that read every word whole and leave the rest to the operator's rules,
@@ -1219,7 +1238,7 @@ ARITHMETIC_NAME = re.compile(r"(?<![A-Za-z0-9_#.])[A-Za-z_][A-Za-z0-9_]*")
 ARITHMETIC_ASSIGNED = re.compile(r"(?<![A-Za-z0-9_#.])([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)")
 
 
-def _bindings(segments: list[list[str]], parts: list[tuple[str, str]]) -> dict[str, int]:
+def _bindings(segments: list[list[str]], parts: Parts) -> dict[str, int]:
     """How many times this command binds each name, counted wherever it does.
 
     A reader takes a name's values only where the bindings it read are every one counted here:
@@ -1273,9 +1292,7 @@ def _binds(program: str) -> bool:
     return any(program in table for table in BINDER_TABLES)
 
 
-def _builtin_names(
-    program: str, args: list[str], parts: list[tuple[str, str]]
-) -> tuple[list[str], list[str]]:
+def _builtin_names(program: str, args: list[str], parts: Parts) -> tuple[list[str], list[str]]:
     """The names a binding builtin binds: those it does, and those it may.
 
     The second are the words zsh's `read` takes for a name where bash's reads an option's
@@ -1333,7 +1350,7 @@ def _builtin_names(
     return bound, maybe
 
 
-def _let_names(args: list[str], parts: list[tuple[str, str]]) -> list[str]:
+def _let_names(args: list[str], parts: Parts) -> list[str]:
     """The names `let` assigns, each with a plain `=`.
 
     Arithmetic reads a variable's value as an expression of its own, so a `let` that reads a
@@ -1356,7 +1373,7 @@ def _let_names(args: list[str], parts: list[tuple[str, str]]) -> list[str]:
     return names
 
 
-def _operand_names(args: list[str], parts: list[tuple[str, str]]) -> list[str]:
+def _operand_names(args: list[str], parts: Parts) -> list[str]:
     """The name each of a builtin's name operands binds.
 
     `p`, `p=x`, `p+=x`, `p[1]=x` and zsh's `'p?prompt'` each bind `p`. One whose name the shell
@@ -1409,7 +1426,7 @@ def _splice_name(token: str, splice_vars: dict[str, list[str]]) -> str | None:
 
 
 def _literal_assignments(
-    segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
+    segments: list[list[str]], parts: Parts, bindings: dict[str, int]
 ) -> dict[str, list[str]]:
     """Variables assigned a fully literal value in a sibling segment, as split words.
 
@@ -1559,7 +1576,7 @@ def _tilde_word(text: str) -> str:
     return UNREAD_VALUE + slash + rest
 
 
-def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | None:
+def _loop_value_shapes(token: str, parts: Parts) -> list[str] | None:
     """What one `for`-list word contributes to the variable, for the read scope.
 
     A literal word is itself. An unquoted glob is a name inside its literal directory. A
@@ -1567,9 +1584,9 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
     parameter expansion, a glob that could match `.` or `..` -- is None: unresolvable.
     """
     expanded = _expand(token, parts)
-    whole = PLACEHOLDER.fullmatch(token)
-    if whole is not None and parts[int(whole.group(1))][0] == SUBSTITUTION:
-        body = parts[int(whole.group(1))][1]
+    whole = _whole_part(token, parts)
+    if whole is not None and whole.kind == SUBSTITUTION:
+        body = whole.value
         if LISTING_BODY.match(body) and not re.search(r"\s-[A-Za-z]*a", body) and ".." not in body:
             return [PATH_COMPONENT]
         return None
@@ -1601,7 +1618,7 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
 
 
 def _literal_loop_values(
-    segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
+    segments: list[list[str]], parts: Parts, bindings: dict[str, int]
 ) -> dict[str, list[str]]:
     """The values each `for` variable can take, for resolving it inside a path.
 
@@ -1642,9 +1659,9 @@ def _literal_loop_values(
 # leaves it bound to a value no header spells.
 def _safe_loop_names(
     segments: list[list[str]],
-    parts: list[tuple[str, str]],
+    parts: Parts,
     bindings: dict[str, int],
-    known_values: dict[str, list[str] | None],
+    known_values: KnownValues,
 ) -> frozenset[str]:
     safe: dict[str, int] = {}
     for segment in segments:
@@ -1657,9 +1674,7 @@ def _safe_loop_names(
     return frozenset(name for name, count in safe.items() if bindings.get(name) == count)
 
 
-def _value_is_literal_non_flag(
-    token: str, parts: list[tuple[str, str]], known_values: dict[str, list[str] | None]
-) -> bool:
+def _value_is_literal_non_flag(token: str, parts: Parts, known_values: KnownValues) -> bool:
     """A single loop-list value that the operator wrote out and that is not a flag.
 
     It must carry no substitution, glob or brace the shell would still act on, and not be
@@ -1683,11 +1698,11 @@ def _value_is_literal_non_flag(
 
 def _known_values(
     segments: list[list[str]],
-    parts: list[tuple[str, str]],
+    parts: Parts,
     splice_vars: dict[str, list[str]],
     loop_values: dict[str, list[str]],
     bindings: dict[str, int],
-) -> dict[str, list[str] | None]:
+) -> KnownValues:
     """Each name this command binds, with the values it can hold, or None where they are unread.
 
     A name's values are known where its one binding is one this module read as literal: an
@@ -1734,7 +1749,7 @@ UNQUOTED_EXPANSION = re.compile(r"\$\{?=?([A-Za-z_][A-Za-z0-9_]*)")
 UNSAFE_IN_A_GLUED_VALUE = frozenset(" \t\n*?[]()")
 
 
-def _unclean_expansion(token: str, known_values: dict[str, list[str] | None]) -> str | None:
+def _unclean_expansion(token: str, known_values: KnownValues) -> str | None:
     """The first expansion in the unquoted part of ``token`` that bash may split or glob.
 
     bash splits and globs what an unquoted expansion expands to, where it is used, so
@@ -1771,9 +1786,7 @@ MAX_WORD_SHAPES = 64
 TOO_MANY_SHAPES = "too many combinations of the values this command sets to read"
 
 
-def _word_shapes(
-    token: str, parts: list[tuple[str, str]], known_values: dict[str, list[str] | None]
-) -> list[str] | None:
+def _word_shapes(token: str, parts: Parts, known_values: KnownValues) -> list[str] | None:
     r"""The words this token can be, each value the command sets put in its expansion's place.
 
     `known_values` gives a name's values. A name it lacks is `UNREAD_VALUE`; one whose values it
@@ -1845,8 +1858,8 @@ def _arg_variants(
     args: list[str],
     arg_tokens: list[str],
     spliced: list[bool],
-    parts: list[tuple[str, str]],
-    known_values: dict[str, list[str] | None],
+    parts: Parts,
+    known_values: KnownValues,
 ) -> list[list[str]]:
     """The argument lists the program can get once each value the command sets is in place.
 
@@ -2600,9 +2613,7 @@ def _below_an_unread_value(path: str, *, live_glob: bool) -> bool:
     )
 
 
-def _refuse_credential_paths(
-    reduced: str, parts: list[tuple[str, str]], state: _ShellState
-) -> None:
+def _refuse_credential_paths(reduced: str, parts: Parts, state: _ShellState) -> None:
     """Layer B: refuse the command if any word in it names a credential store.
 
     Reads the reduced command, its redirections included, so a `< ~/.ssh/id_rsa` target is a
@@ -2655,7 +2666,7 @@ DIRECTORY_CHANGERS = frozenset({"cd", "pushd"})
 DIRECTORY_CHANGER_OPTIONS = frozenset({"-L", "-P", "-e", "-@", "-n", "--"})
 
 
-def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[str]:
+def _directory_targets(words: list[str], parts: Parts) -> list[str]:
     """The target of each `cd` and `pushd` in this segment, wherever it stands.
 
     The first word after it that isn't one of its options, as `_check_cd` reads it. A word
@@ -2700,7 +2711,7 @@ def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[s
 DIRECTORY_OPTIONS = frozenset({"-C", "--directory", "--chdir"})
 
 
-def _program_directories(tokens: list[str], parts: list[tuple[str, str]]) -> list[str]:
+def _program_directories(tokens: list[str], parts: Parts) -> list[str]:
     """The directory each `DIRECTORY_OPTIONS` option in these tokens names.
 
     Whatever program it belongs to: `grep -C 3` adds `3`, which costs a refusal at most.
@@ -2719,7 +2730,7 @@ def _program_directories(tokens: list[str], parts: list[tuple[str, str]]) -> lis
     return directories
 
 
-def _directory_word(token: str, parts: list[tuple[str, str]]) -> str:
+def _directory_word(token: str, parts: Parts) -> str:
     """The directory ``token``, a word of its own, names for a program that changes to it.
 
     A command's output, and a wildcard the shell expands, which picks the directory, are
@@ -2732,9 +2743,7 @@ def _directory_word(token: str, parts: list[tuple[str, str]]) -> str:
     return _tilde_word(text) if token.startswith("~") else text
 
 
-def _changed_directories(
-    directory: str, values: dict[str, list[str] | None], bases: list[str]
-) -> list[str]:
+def _changed_directories(directory: str, values: KnownValues, bases: list[str]) -> list[str]:
     """Each directory a program that changes to ``directory`` may run in, from each of ``bases``.
 
     ``directory`` is read as each of its `_spellings`, as a `cd` target is, so one the shell
@@ -2751,7 +2760,7 @@ MAX_SPELLINGS = 64
 
 
 def _spellings(
-    word: str, values: dict[str, list[str] | None], bases: list[str], *, before: bool = True
+    word: str, values: KnownValues, bases: list[str], *, before: bool = True
 ) -> list[str]:
     """The texts this word can be, for the credential check.
 
@@ -2806,7 +2815,7 @@ class _ShellState:
         self,
         bases: list[str],
         shell_bases: list[str],
-        values: dict[str, list[str] | None],
+        values: KnownValues,
         bindings: dict[str, int],
         *,
         backgrounds: bool = False,
@@ -2820,9 +2829,9 @@ class _ShellState:
 
 def _working_directories(
     segments: list[list[str]],
-    parts: list[tuple[str, str]],
+    parts: Parts,
     inherited: _ShellState | None,
-    values: dict[str, list[str] | None],
+    values: KnownValues,
 ) -> tuple[list[str], list[str]]:
     """Every directory a relative word in this command may be resolved from, and with `CDPATH`.
 
@@ -3087,12 +3096,10 @@ def _resolve_variables(text: str, scope: _ReadScope) -> list[str] | None:
     return None
 
 
-def _read_scope_problem(
-    token: str, text: str, parts: list[tuple[str, str]], scope: _ReadScope
-) -> str | None:
+def _read_scope_problem(token: str, text: str, parts: Parts, scope: _ReadScope) -> str | None:
     """Why a reader's file operand is not in scope, or None when it is."""
-    whole = PLACEHOLDER.fullmatch(token)
-    if whole is not None and parts[int(whole.group(1))][0] == PROCESS_SUBSTITUTION:
+    whole = _whole_part(token, parts)
+    if whole is not None and whole.kind == PROCESS_SUBSTITUTION:
         return None  # `<(...)`: a pipe whose body was classified, not a path on disk
     if text == "-":
         return None
@@ -3130,7 +3137,7 @@ def _check_read_scope(
     found: list[tuple[int, int]],
     args: list[str],
     arg_tokens: list[str],
-    parts: list[tuple[str, str]],
+    parts: Parts,
     scope: _ReadScope,
 ) -> None:
     """Raise ``NoOpinion`` unless each file ``reader`` opens is in ``scope``.
@@ -3153,8 +3160,8 @@ def _check_read_scope(
 
 def _directory_scope(
     token: str,
-    parts: list[tuple[str, str]],
-    values: dict[str, list[str] | None],
+    parts: Parts,
+    values: KnownValues,
     scope: _ReadScope,
 ) -> _ReadScope:
     """``scope``, with the directory ``token`` names, from each base, as the bases.
@@ -3182,7 +3189,7 @@ def _directory_scope(
     )
 
 
-def _input_target(target: str, parts: list[tuple[str, str]]) -> str | None:
+def _input_target(target: str, parts: Parts) -> str | None:
     """The file ``< target`` reads, when the operator wrote it out, not the shell; else None.
 
     The pseudo-device check in ``_classify`` reads literal text, so a target assembled at
@@ -3193,11 +3200,10 @@ def _input_target(target: str, parts: list[tuple[str, str]]) -> str | None:
     """
     if re.search(r"[$*?\[\]{}`\\]", PLACEHOLDER.sub("", target)):
         return None
-    for index in PLACEHOLDER.findall(target):
-        kind, value = parts[int(index)]
-        if kind == SUBSTITUTION or (kind == DOUBLE_QUOTED and "$" in value):
+    for part in _parts_in(target, parts):
+        if part.kind == SUBSTITUTION or (part.kind == DOUBLE_QUOTED and "$" in part.value):
             return None
-    expanded = PLACEHOLDER.sub(lambda match: parts[int(match.group(1))][1], target)
+    expanded = PLACEHOLDER.sub(lambda match: parts[int(match.group(1))].value, target)
     if NETWORK_DEVICE.search(expanded) is not None:
         return None
     if target.startswith("~"):
@@ -3432,9 +3438,7 @@ def _resolve_planned(resolved: str, pending: list[str], hops: int, found: set[st
         raise OSError("too many places one path can lead")
 
 
-def _record_planned_links(
-    segments: list[list[str]], parts: list[tuple[str, str]], bases: list[str]
-) -> None:
+def _record_planned_links(segments: list[list[str]], parts: Parts, bases: list[str]) -> None:
     """Add to `_PLANNED_LINKS` each link an `ln` in these segments makes, from each of ``bases``.
 
     An `ln` whose operands this module can't place, or one that another program runs, as
@@ -3462,9 +3466,7 @@ def _record_planned_links(
         raise NotReadOnly("more links than this module reads")
 
 
-def _ln_links(
-    tokens: list[str], parts: list[tuple[str, str]], bases: list[str]
-) -> list[tuple[str, str]]:
+def _ln_links(tokens: list[str], parts: Parts, bases: list[str]) -> Parts:
     """Each link these `ln` arguments make, as the path it will be at and the one it leads to.
 
     Read from each of ``bases``. Its forms: `ln T` makes `./basename(T)`, `ln T... DIR` and
@@ -3525,7 +3527,7 @@ def _ln_links(
             operands.append(word)
     if not operands:
         return []
-    places: list[tuple[str, str]] = []  # (where the link goes, what it is made from)
+    places: Parts = []  # (where the link goes, what it is made from)
     if directory is not None:
         places = [(os.path.join(directory, os.path.basename(t.rstrip("/"))), t) for t in operands]
     elif len(operands) == 1:
@@ -3541,7 +3543,7 @@ def _ln_links(
     else:
         *sources, last = operands
         places = [(os.path.join(last, os.path.basename(t.rstrip("/"))), t) for t in sources]
-    links: list[tuple[str, str]] = []
+    links: Parts = []
     for base in bases:
         for place, made_from in places:
             parent, name = os.path.split(os.path.join(base, place).rstrip("/"))
@@ -3587,7 +3589,7 @@ def _hard_link_targets(source: str, parent: str, *, logical: bool, physical: boo
     return targets
 
 
-def _ln_word(token: str, parts: list[tuple[str, str]]) -> str:
+def _ln_word(token: str, parts: Parts) -> str:
     """An `ln` argument as the program gets it, or `NotReadOnly` for one the shell decides."""
     if _word_the_shell_builds(token, parts):
         raise NotReadOnly(f"ln given a word the shell builds: {_expand(token, parts)}")
@@ -4124,12 +4126,12 @@ def _followed_links(
     program: str,
     args: list[str],
     tokens: list[str],
-    parts: list[tuple[str, str]],
+    parts: Parts,
     bases: list[str],
-    values: dict[str, list[str] | None],
+    values: KnownValues,
     *,
     operands_elsewhere: bool = False,
-) -> list[tuple[str, str]]:
+) -> Parts:
     """Each link a `LINK_FOLLOWERS` reader follows in its directory operands, and where it leads.
 
     Each place it leads to is one of its `_resolutions`, and the links the command makes count,
@@ -4151,8 +4153,8 @@ def _followed_links(
     directories: list[str] = []
     for index in indexes:
         token, text = tokens[index], args[index]
-        whole = PLACEHOLDER.fullmatch(token)
-        if whole is not None and parts[int(whole.group(1))][0] == PROCESS_SUBSTITUTION:
+        whole = _whole_part(token, parts)
+        if whole is not None and whole.kind == PROCESS_SUBSTITUTION:
             continue  # `<(...)`: a pipe, not a directory
         if token.startswith("~"):
             text = _tilde_word(text)
@@ -4310,7 +4312,7 @@ def _bracket_end(text: str, start: int) -> int | None:
     return None
 
 
-def _walk_for_links(roots: list[str], depth: int) -> list[tuple[str, str]]:
+def _walk_for_links(roots: list[str], depth: int) -> Parts:
     """`_followed_links`' walk, from each of ``roots``, to ``depth`` levels, or all with 0.
 
     A root is each of its `_resolutions`, so one an `ln` in the command makes, or one whose
@@ -4326,7 +4328,7 @@ def _walk_for_links(roots: list[str], depth: int) -> list[tuple[str, str]]:
     return _WALKS[key]
 
 
-def _walk_for_links_uncached(roots: list[str], depth: int) -> list[tuple[str, str]]:
+def _walk_for_links_uncached(roots: list[str], depth: int) -> Parts:
     """`_walk_for_links`, without the cache.
 
     Each directory is listed where it resolves, and its entries are named below the path the walk
@@ -4334,7 +4336,7 @@ def _walk_for_links_uncached(roots: list[str], depth: int) -> list[tuple[str, st
     a scratchpad under macOS's `/tmp -> /private/tmp` is in the scratchpad. A directory is listed
     once, by where it resolves.
     """
-    found: list[tuple[str, str]] = []
+    found: Parts = []
     seen: set[str] = set()
     count = 0
     stack: list[tuple[str, int]] = []
@@ -4394,7 +4396,7 @@ def _walk_for_links_uncached(roots: list[str], depth: int) -> list[tuple[str, st
 
 
 def _refuse_followed_credential_links(
-    segments: list[list[str]], parts: list[tuple[str, str]], state: _ShellState
+    segments: list[list[str]], parts: Parts, state: _ShellState
 ) -> None:
     """Layer B, for the links a reader follows while it recurses.
 
@@ -4811,8 +4813,8 @@ def _check_printf(args: list[str]) -> None:
 def _check_printf_unread_format(
     args: list[str],
     tokens: list[str],
-    parts: list[tuple[str, str]],
-    known_values: dict[str, list[str] | None],
+    parts: Parts,
+    known_values: KnownValues,
 ) -> None:
     """Read a `printf` format that holds a value this module didn't read as an unknown conversion.
 
@@ -4880,6 +4882,11 @@ def _exceeds_width_cap(formats: list[str]) -> bool:
         for match in PRINTF_WIDTH.finditer(text)
         for group in match.groups()
     )
+
+
+def _check_printf_call(call: _Call) -> None:
+    """`_Program.then` for `printf`: a format the validator read with a value still unread."""
+    _check_printf_unread_format(call.args, call.tokens, call.parts, call.known_values)
 
 
 # --------------------------------------------------------------------------------------
@@ -5850,7 +5857,7 @@ def _check_git_paths(
     args: list[str],
     index: int,
     tokens: list[str],
-    parts: list[tuple[str, str]],
+    parts: Parts,
     scope: _ReadScope,
 ) -> None:
     """Raise ``NoOpinion`` for a path git reads out of the working directories (#48).
@@ -5912,9 +5919,7 @@ def _check_git_paths(
         _check_git_path(path, token, parts, scope, word)
 
 
-def _check_git_path(
-    path: str, token: str, parts: list[tuple[str, str]], scope: _ReadScope, word: str
-) -> None:
+def _check_git_path(path: str, token: str, parts: Parts, scope: _ReadScope, word: str) -> None:
     """Raise ``NoOpinion`` unless ``path``, which git reads from where it runs, is in ``scope``."""
     if _word_the_shell_builds(token, parts):
         raise NoOpinion(f"git given a path the shell builds: {word}")
@@ -5973,6 +5978,38 @@ def _repository_root_out_of_scope(base: str, scope: _ReadScope) -> bool:
         if parent == directory:
             return False
         directory = parent
+
+
+def _check_git_call(call: _Call) -> None:
+    """`_Program.then` for `git`: where a call `_check_git` cleared reads, and what it reaches.
+
+    `-C` points git at the repository there, and so at that repository's config, which can name
+    a program git runs: `core.fsmonitor` on `status`, `gpg.program` on a `log` that shows
+    signatures. That is `--git-dir` under another name, so a directory outside the read roots
+    is not this module's to approve. Read before `_check_git_remote_reach`, which runs git in
+    that directory.
+    """
+    args, tokens, parts, scope = call.args, call.tokens, call.parts, call.scope
+    index, directories = _git_global_options(args)
+    if len(directories) > 1:
+        raise NoOpinion("git -C given more than once, each relative to the last")
+    for position in directories if scope is not None else []:
+        problem = _read_scope_problem(tokens[position], args[position], parts, scope)
+        if problem is not None:
+            raise NoOpinion(f"git -C points at {problem}")
+    # Layer A for the files git opens, which it resolves from the `-C` directory, and for the
+    # paths it reads in a repository whose root is outside the read roots
+    found = _git_file_operands(args, index)
+    if scope is not None:
+        files_scope = scope
+        if directories:
+            token = tokens[directories[0]]
+            files_scope = _directory_scope(token, parts, call.known_values, scope)
+        if found:
+            _check_read_scope(f"git {args[index]}", found, args, tokens, parts, files_scope)
+        _check_git_paths(args, index, tokens, parts, files_scope)
+    directory = args[directories[0]] if directories else None
+    _check_git_remote_reach(args[index:], directory, scope)
 
 
 # --------------------------------------------------------------------------------------
@@ -6545,6 +6582,21 @@ def _gh_give_up(words: list[str], rewritten: list[bool], start: int, reason: str
     raise NoOpinion(reason)
 
 
+def _read_gh_call(call: _Call) -> bool:
+    """`WORD_READERS` for `gh`: every subcommand but `gh api`, which `_check_gh` reads.
+
+    The subcommands `GH_READ_SPECS` lists are read, and every other one stays the operator's
+    rules' to grant, as before `gh` had a validator. The `--jq` filter is read on every
+    subcommand: `gh issue view 1 --jq '$ENV.GH_TOKEN'` prints the token, so the hook approves
+    it neither by reading it nor through a rule. A native `Bash(gh issue view *)` rule still
+    lets Claude Code run it without asking; only a native deny rule stops that.
+    """
+    if call.args[:1] == ["api"]:
+        return False
+    _check_gh_read(call.args, call.rewritten())
+    return True
+
+
 # --------------------------------------------------------------------------------------
 # curl
 #
@@ -6831,6 +6883,16 @@ def _may_exist(path: str) -> bool:
     return True
 
 
+def _read_curl_call(call: _Call) -> bool:
+    """`WORD_READERS` for `curl`, every call of it.
+
+    It is no `_Program`, because it needs the scope: the sites the project lists, and whether
+    the shell may not wait for the command.
+    """
+    _check_curl(call.args, call.rewritten(), call.spliced, call.scope)
+    return True
+
+
 # --------------------------------------------------------------------------------------
 # Wrappers: programs that run the rest of the command line
 # --------------------------------------------------------------------------------------
@@ -6911,294 +6973,337 @@ READ_ONLY = {
     "whoami",
 }
 
-# Explicit dispatch table mapping programs to their dedicated validator functions
-PROGRAM_VALIDATORS = {
-    "aws": _check_aws,
-    "awk": _check_awk,
-    "base64": _check_base64,
-    "cd": _check_cd,
-    "command": _check_command_builtin,
-    "date": _check_date,
-    "file": _check_file,
-    "find": _check_find,
-    "gawk": _check_awk,
-    "gcloud": _check_gcloud,
-    "gh": _check_gh,
-    "git": _check_git,
-    "hostname": _check_hostname,
-    "jq": _check_jq,
-    "printf": _check_printf,
-    "sed": _check_sed,
-    "sort": _check_sort,
-    "tail": _check_tail,
-    "uniq": _check_uniq,
-    "xxd": _check_xxd,
+
+class _Call(NamedTuple):
+    """One simple command, past any wrapper: what its program gets, and how it was spelled.
+
+    The four lists run in parallel, one entry per argument. A `$name` the command assigned a
+    literal value is spliced in as that value's words, so ``args`` holds the flags the program
+    will get: `aws ... ${=_p} ...` is read as `aws ... --profile admin --region us-east-1 ...`.
+    """
+
+    program: str
+    # Each argument as bash hands it over: `s|a|b|` and an `awk` program as the single words
+    # they are, and `/tmp/'ls'` as the path it is
+    args: list[str]
+    # Each argument as the reduced command spells it, quoting and placeholders kept. A spliced
+    # word has no token of its own, and stands as itself.
+    tokens: list[str]
+    # Whether the shell expands a wildcard in the argument; never for a spliced word, whose
+    # value `_literal_assignments` cleared of them
+    live_globs: list[bool]
+    # Whether the argument came from a splice: a known literal, which the checks that ask what
+    # the shell still builds skip, and which the validator reads as the flag it is
+    spliced: list[bool]
+    parts: Parts
+    known_values: KnownValues
+    scope: _ReadScope | None
+
+    def rewritten(self) -> list[bool]:
+        """Argument by argument, whether the shell rewrites or computes it: `_rewritten_words`."""
+        return _rewritten_words(self.tokens, self.live_globs, self.parts)
+
+
+class _Program(NamedTuple):
+    """How `_check_command` reads a program that has a validator.
+
+    Such a program's behavior turns on whether a word is a flag, so a word the shell supplies,
+    splits or globs is a word its validator did not read: `_refuse_flags_the_shell_supplies`
+    and `_refuse_words_the_shell_splits` hold every program registered here to that, the day it
+    is added. A program in `READ_ONLY` has no flag worth forging, and gets neither check.
+    """
+
+    # Reads the argument list as the program gets it, and raises for a call it does not clear
+    validate: Callable[[list[str]], None]
+    # How many leading arguments can be an option, where not every one can. `printf`'s format
+    # is argument one and no later word is an option, so that one word is read, which is what
+    # leaves `printf '%s\n' "${var}"` alone.
+    option_words: int | None = None
+    # Reads what ``validate`` cannot, from the call itself: how a word was spelled, or where
+    # the command may read. Runs after ``validate`` has cleared every argument list.
+    then: Callable[[_Call], None] | None = None
+
+
+# Every program with a validator. To add one: write `_check_<program>(args)` in a section of its
+# own above, and register it here; `READER_SPECS` and `LINK_FOLLOWERS` take it too if it opens
+# the files its operands name.
+PROGRAMS: dict[str, _Program] = {
+    "aws": _Program(_check_aws),
+    "awk": _Program(_check_awk),
+    "base64": _Program(_check_base64),
+    "cd": _Program(_check_cd),
+    "command": _Program(_check_command_builtin),
+    "date": _Program(_check_date),
+    "file": _Program(_check_file),
+    "find": _Program(_check_find),
+    "gawk": _Program(_check_awk),
+    "gcloud": _Program(_check_gcloud),
+    "gh": _Program(_check_gh),
+    "git": _Program(_check_git, then=_check_git_call),
+    "hostname": _Program(_check_hostname),
+    "jq": _Program(_check_jq),
+    "printf": _Program(_check_printf, option_words=1, then=_check_printf_call),
+    "sed": _Program(_check_sed),
+    "sort": _Program(_check_sort),
+    "tail": _Program(_check_tail),
+    "uniq": _Program(_check_uniq),
+    "xxd": _Program(_check_xxd),
 }
 
-# Programs whose behavior turns on whether a word is a flag, so a word whose first
-# character the shell supplies is a word this module has not read. Derived rather than
-# listed, so a new validator is covered the day it is added.
-#
-# `printf` is the exception: its format is argument one and no later word can be an
-# option, so `_check_printf` reads that one word and `printf '%s\n' "${var}"` keeps
-# working. Everything without a validator is out by construction --
-# a program in `READ_ONLY` has no flag worth forging.
-EXPANSION_UNSAFE = frozenset(PROGRAM_VALIDATORS) - {"printf"}
+# Programs an operator's rule may have granted before the module read them, and still may. Each
+# reads every word of the call itself and gives no opinion on what it does not approve, where
+# the word checks `_Program` brings refuse outright: those would refuse `gh pr view "$n"`,
+# which `_check_gh_read` leaves to a rule. Each returns whether the call was its to read; a
+# call that was is finished, and one that was not goes on to `PROGRAMS`.
+WORD_READERS: dict[str, Callable[[_Call], bool]] = {
+    "curl": _read_curl_call,
+    "gh": _read_gh_call,
+}
 
 
 def _check_command(
     words: list[str],
-    parts: list[tuple[str, str]],
+    parts: Parts,
     depth: int = 0,
     safe_names: frozenset[str] = frozenset(),
     splice_vars: dict[str, list[str]] | None = None,
     scope: _ReadScope | None = None,
-    known_values: dict[str, list[str] | None] | None = None,
+    known_values: KnownValues | None = None,
 ) -> None:
     """Inspect simple command name and argument list with strict fail-closed dispatch.
 
     ``words`` are the reduced words; the program and its arguments are expanded back to
-    what bash will hand over, so a validator reads ``s|a|b|`` and an ``awk`` program as the
-    single words they are, and ``/tmp/'ls'`` as the path it is.
+    what bash will hand over, as `_Call` holds them. The steps run in this order, and the
+    order is part of the verdict: what refuses outright comes before what has no opinion, so
+    that no allow rule overturns it.
     """
     if depth > MAX_WRAPPER_DEPTH:
         raise NotReadOnly("wrapper nested too deeply")
+    call = _read_call(words, parts, splice_vars or {}, known_values or {}, scope)
+    program = call.program
+    _refuse_words_no_program_reads(call)
 
-    # A word the shell builds is a word this module did not read. As an operand that is
-    # the accepted residual; as the program name it is the whole question, so
-    # `$(echo rm) -rf .` must never reach the dispatch below -- and neither may `"ls"`,
-    # `l''s` or `\ls`, which are the same lookup written so that the token the lexer
-    # returns is one this module assembled rather than one the operator typed.
-    if PLACEHOLDER.search(words[0]):
-        raise NotReadOnly("the program name is quoted, escaped or produced by a substitution")
-
-    program = _expand(words[0], parts)
-
-    # Splice in the words of any `$name`/`${name}`/`${=name}` whose `name` was assigned a
-    # fully literal value earlier in this same command. The value is resolved and its words
-    # take the use's place, so a validator reads the flags the program will actually get --
-    # `aws ... ${=_p} ...` becomes `aws ... --profile admin --region us-east-1 ...` and is
-    # checked as that. `spliced` marks which resulting args came from a splice, so the
-    # flag-position check below skips them: they are known literals, and the validator that
-    # runs on the full list is what actually clears them. An argument that is not a splice
-    # keeps its token, so quoting and placeholders are preserved for every other check.
-    splice_vars = splice_vars or {}
-    known_values = known_values or {}
-    args: list[str] = []
-    arg_tokens: list[str] = []
-    live_globs: list[bool] = []
-    spliced: list[bool] = []
-    for word in words[1:]:
-        name = _splice_name(word, splice_vars)
-        if name is not None:
-            for value_word in splice_vars[name]:
-                args.append(value_word)
-                arg_tokens.append(value_word)
-                live_globs.append(False)  # a resolved literal has no live glob
-                spliced.append(True)
-        else:
-            args.append(_expand(word, parts))
-            arg_tokens.append(word)
-            live_globs.append(_carries_live_glob(word))
-            spliced.append(False)
-
-    # Path spoofing check: program must be a bare command name (e.g. 'ls', not './ls' or '/tmp/ls')
-    if "/" in program or "\\" in program:
-        raise NoOpinion(f"non-bare program path: {program}")
-
-    # bash opens a socket for one of these itself, with no program in the command to
-    # refuse. A word naming one is refused wherever it sits.
-    for word in args:
-        if PSEUDO_DEVICE.search(word):
-            raise NotReadOnly(f"network pseudo-device: {word}")
-
-    # An unquoted brace expansion splits one word into several before the program sees it,
-    # so an operand check that counted this as one word read the wrong command. Refused in
-    # any position -- operand or program -- the way an unquoted glob is: the module reads
-    # words, and this is a word the shell has not finished building. The reduced tokens are
-    # tested so a quoted `'{a,b}'`, a single literal to bash, stays approved. A spliced
-    # value was already cleared of braces when it was accepted as a literal assignment.
-    for word in [words[0]] + [t for t, s in zip(arg_tokens, spliced, strict=True) if not s]:
-        if _carries_brace_expansion(word):
-            raise NotReadOnly(f"unquoted brace expansion: {_expand(word, parts)}")
-
-    # Merge note: this sits below the brace check on purpose. "The word checks below" are
-    # the flag-position checks; a brace is refused for every operator-rule program, `gh`
-    # included, because it is a word the shell has not finished building.
-    # `gh api` is read by its own validator, below. The subcommands `GH_READ_SPECS` lists are
-    # read here, and every other one stays the operator's rules' to grant, as before `gh` had
-    # a validator, so the word checks below must not refuse what those rules would. That is
-    # why this returns: `EXPANSION_UNSAFE` would refuse `gh pr view "$n"` outright, where
-    # `_check_gh_read` gives it no opinion and a rule can still grant it.
-    if program == "gh" and args[:1] != ["api"]:
-        # `_check_gh_read` reads the `--jq` filter on every subcommand: `gh issue view 1 --jq
-        # '$ENV.GH_TOKEN'` prints the token, so the hook approves it neither by reading it nor
-        # through a rule. A native `Bash(gh issue view *)` rule still lets Claude Code run it
-        # without asking; only a native deny rule stops that.
-        _check_gh_read(args, _rewritten_words(arg_tokens, live_globs, parts))
-        return
-
-    # `curl` returns here for the same reason: an operator's `Bash(curl ...)` rule granted it
-    # before it had a validator, and still may, so the validator gives no opinion on what it
-    # does not approve, and reads each word itself rather than leave it to the checks below,
-    # which refuse outright. It is not in `PROGRAM_VALIDATORS` because it needs the scope: the
-    # sites the project lists, and whether the shell may not wait for the command.
-    if program == "curl":
-        _check_curl(args, _rewritten_words(arg_tokens, live_globs, parts), spliced, scope)
+    reader = WORD_READERS.get(program)
+    if reader is not None and reader(call):
         return
 
     # A wrapper's own arguments are not the command; what it runs is checked in its place.
     # The wrapper sees the pre-splice tokens, since its own argument parsing happens before
     # the inner program's; the inner `_check_command` splices again with the same vars.
     if program in WRAPPERS:
-        inner = WRAPPERS[program](words[1:])
-        # The wrapper's own words are read by position, so one the shell splits or globs
-        # moves the command it runs: beside files `5` and `rm`, `timeout [5r]* cat README.md`
-        # is `timeout 5 rm cat README.md`, and under bash `t='5 rm'; timeout $t cat README.md`
-        # is too, with no file needed.
-        for word in words[1 : len(words) - len(inner)]:
-            if _word_the_shell_builds(word, parts):
-                raise NotReadOnly(
-                    f"{program} given a word the shell still builds: {_expand(word, parts)}"
-                )
+        inner = _unwrapped(program, words, parts)
         _check_command(inner, parts, depth + 1, safe_names, splice_vars, scope, known_values)
         return
 
-    # Every flag test below reads a word that is already complete. One that begins with
-    # an expansion is not: its leading `-` arrives after this module has finished, so the
-    # word the validator cleared is not the word the program receives.
-    # For `printf` only argument one can be an option, and it is the format, so that is
-    # the one word read -- which is what leaves `printf '%s\n' "${var}"` alone.
-    if program == "printf":
-        suspect = list(zip(arg_tokens[:1], spliced[:1], strict=True))
-    elif program in EXPANSION_UNSAFE:
-        suspect = list(zip(arg_tokens, spliced, strict=True))
-    else:
-        suspect = []
-    for word, was_spliced in suspect:
-        # A spliced word is a resolved literal from a `name=<literal>` assignment in this
-        # command: its text, leading `-` and all, is known, so it is not a word the shell
-        # still decides. The validator below reads it as the flag it is.
-        if was_spliced:
-            continue
-        if _word_the_shell_decides(word, parts):
+    spec = PROGRAMS.get(program)
+    if spec is not None:
+        _refuse_flags_the_shell_supplies(call, spec, safe_names)
+    _refuse_terminal_escapes(call)
+    if spec is not None:
+        _refuse_words_the_shell_splits(call, spec)
+
+    # Fail-closed dispatch: either a dedicated validator, a purely read-only program, or reject
+    if spec is not None:
+        _validate(call, spec)
+    elif program not in READ_ONLY:
+        raise NoOpinion(f"unrecognized program: {program}")
+
+    # The read scope comes after the validator, so a write the validator found keeps its
+    # verdict whatever a rule says: `sort -o out /etc/hostname` writes `out` wherever it reads.
+    if scope is not None:
+        _check_what_it_reads(call, scope)
+
+
+def _read_call(
+    words: list[str],
+    parts: Parts,
+    splice_vars: dict[str, list[str]],
+    known_values: KnownValues,
+    scope: _ReadScope | None,
+) -> _Call:
+    """The `_Call` these words make, with each value the command assigned spliced in."""
+    # A word the shell builds is a word this module did not read. As an operand that is
+    # the accepted residual; as the program name it is the whole question, so
+    # `$(echo rm) -rf .` must never reach the dispatch -- and neither may `"ls"`,
+    # `l''s` or `\ls`, which are the same lookup written so that the token the lexer
+    # returns is one this module assembled rather than one the operator typed.
+    if PLACEHOLDER.search(words[0]):
+        raise NotReadOnly("the program name is quoted, escaped or produced by a substitution")
+
+    # With no placeholder in it, the program's name is the word as it is spelled
+    call = _Call(words[0], [], [], [], [], parts, known_values, scope)
+    for word in words[1:]:
+        name = _splice_name(word, splice_vars)
+        if name is None:
+            call.args.append(_expand(word, parts))
+            call.tokens.append(word)
+            call.live_globs.append(_carries_live_glob(word))
+            call.spliced.append(False)
+        else:
+            values = splice_vars[name]
+            call.args.extend(values)
+            call.tokens.extend(values)
+            call.live_globs.extend(False for _ in values)
+            call.spliced.extend(True for _ in values)
+    return call
+
+
+def _refuse_words_no_program_reads(call: _Call) -> None:
+    """Refuse a program given by its path, and a word the shell acts on before any program."""
+    # Path spoofing check: program must be a bare command name (e.g. 'ls', not './ls' or '/tmp/ls')
+    if "/" in call.program or "\\" in call.program:
+        raise NoOpinion(f"non-bare program path: {call.program}")
+
+    # bash opens a socket for one of these itself, with no program in the command to
+    # refuse. A word naming one is refused wherever it sits.
+    for arg in call.args:
+        if PSEUDO_DEVICE.search(arg):
+            raise NotReadOnly(f"network pseudo-device: {arg}")
+
+    # An unquoted brace expansion splits one word into several before the program sees it,
+    # so an operand check that counted this as one word read the wrong command. Refused in
+    # any position -- operand or program -- the way an unquoted glob is: the module reads
+    # words, and this is a word the shell has not finished building, for every program, one an
+    # operator's rule grants included. The reduced tokens are tested so a quoted `'{a,b}'`, a
+    # single literal to bash, stays approved. A spliced value was already cleared of braces
+    # when it was accepted as a literal assignment.
+    for token in [call.program, *_unspliced(call, None)]:
+        if _carries_brace_expansion(token):
+            raise NotReadOnly(f"unquoted brace expansion: {_expand(token, call.parts)}")
+
+
+def _unspliced(call: _Call, count: int | None) -> list[str]:
+    """The token of each of the first ``count`` arguments that no splice supplied.
+
+    Every argument, for a ``count`` of None.
+    """
+    words = zip(call.tokens[:count], call.spliced[:count], strict=True)
+    return [token for token, spliced in words if not spliced]
+
+
+def _unwrapped(program: str, words: list[str], parts: Parts) -> list[str]:
+    """The words of the command a wrapper runs, once its own are read."""
+    inner = WRAPPERS[program](words[1:])
+    # The wrapper's own words are read by position, so one the shell splits or globs
+    # moves the command it runs: beside files `5` and `rm`, `timeout [5r]* cat README.md`
+    # is `timeout 5 rm cat README.md`, and under bash `t='5 rm'; timeout $t cat README.md`
+    # is too, with no file needed.
+    for word in words[1 : len(words) - len(inner)]:
+        if _word_the_shell_builds(word, parts):
+            raise NotReadOnly(
+                f"{program} given a word the shell still builds: {_expand(word, parts)}"
+            )
+    return inner
+
+
+def _refuse_flags_the_shell_supplies(
+    call: _Call, spec: _Program, safe_names: frozenset[str]
+) -> None:
+    """Refuse an argument whose leading `-`, or whose flag's name, an expansion supplies.
+
+    Every flag test a validator makes reads a word that is already complete. One that begins
+    with an expansion is not: its leading `-` arrives after this module has finished, so the
+    word the validator cleared is not the word the program receives.
+    """
+    program, parts = call.program, call.parts
+    for token in _unspliced(call, spec.option_words):
+        if _word_the_shell_decides(token, parts):
             # A bare `"$f"` whose `f` a literal-list `for` header binds is the one word the
             # shell builds that the command still pins down: every value is spelled out to
             # the left and none is a flag. `"${f}-x"` and `"$f$g"` are not bare and are not
             # exempt -- `_is_bare_expansion_of` holds only for exactly `$f` or `${f}`.
-            if _is_bare_expansion_of(word, parts, safe_names):
+            if _is_bare_expansion_of(token, parts, safe_names):
                 continue
             raise NotReadOnly(
-                f"an argument to {program} begins with an expansion: {_expand(word, parts)}"
+                f"an argument to {program} begins with an expansion: {_expand(token, parts)}"
             )
-        shapes = _word_shapes(word, parts, known_values)
+        shapes = _word_shapes(token, parts, call.known_values)
         if shapes is None:
             raise NoOpinion(TOO_MANY_SHAPES)
         if any(_flag_an_expansion_spells(shape) for shape in shapes):
             raise NotReadOnly(
                 f"an argument to {program} is a flag a value it never read spells: "
-                f"{_expand(word, parts)}"
+                f"{_expand(token, parts)}"
             )
 
-    # What these two print, a terminal interprets; see `TERMINAL_CONTROL_BYTE`. Read here,
-    # past any wrapper, so `echo '=== EC ==='` beside a `sed` that strips colors stays approved.
-    # Without a scope there is no command to have read the spelling from, so an expanded
-    # value is refused rather than assumed clean -- the opposite of Layer A below, where no
-    # scope means no roots to measure against, and the read is left to the validators.
-    if program in INTERPRETS_ESCAPES:
-        if any(TERMINAL_CONTROL_SPELLED.search(arg) for arg in args):
-            raise NotReadOnly(f"{program} given a terminal escape")
-        if (scope is None or scope.spells_escape) and any(
-            "$" in arg or SUBSTITUTION_MARKER in arg for arg in args
-        ):
-            raise NotReadOnly(f"{program} expands a value in a command that spells an escape")
 
-    # A wildcard the shell expands is a word, or several, that no validator reads: it gets the
-    # spelling, and the program gets what the directory held. Beside a file named `-f`, `awk
-    # [-]f x` is `awk -f x`; beside one named `x;BEGIN{system(...)}`, `awk x*` runs it as its
-    # program; and `uniq *.txt` writes over the second file it matches. Every program with a
-    # validator turns on its words, as `EXPANSION_UNSAFE` says, and so is refused one, the `-C`
-    # directory of `git` included. A quoted wildcard is the program's own to match.
-    # For `printf` only the first word can be an option, so it is the one read, as above:
-    # beside a file named `-v`, `printf [-]v PATH .` sets `PATH`.
-    # bash splits and globs a value where an unquoted `$q` glued to text uses it, so
-    # `q='*'; awk x$q` is `awk x*`: such a use is refused too, unless `known_values` holds a
-    # value for the name that bash can neither split nor glob.
-    if program == "printf":
-        globbed = list(zip(arg_tokens[:1], live_globs[:1], spliced[:1], strict=True))
-    elif program in EXPANSION_UNSAFE:
-        globbed = list(zip(arg_tokens, live_globs, spliced, strict=True))
-    else:
-        globbed = []
-    for word, live, was_spliced in globbed:
+def _refuse_terminal_escapes(call: _Call) -> None:
+    """Refuse an `echo` or a `printf` that may print a terminal escape.
+
+    What these two print, a terminal interprets; see `TERMINAL_CONTROL_BYTE`. Read here, past
+    any wrapper, so `echo '=== EC ==='` beside a `sed` that strips colors stays approved.
+    Without a scope there is no command to have read the spelling from, so an expanded value is
+    refused rather than assumed clean -- the opposite of Layer A, where no scope means no roots
+    to measure against, and the read is left to the validators.
+    """
+    if call.program not in INTERPRETS_ESCAPES:
+        return
+    if any(TERMINAL_CONTROL_SPELLED.search(arg) for arg in call.args):
+        raise NotReadOnly(f"{call.program} given a terminal escape")
+    if (call.scope is None or call.scope.spells_escape) and any(
+        "$" in arg or SUBSTITUTION_MARKER in arg for arg in call.args
+    ):
+        raise NotReadOnly(f"{call.program} expands a value in a command that spells an escape")
+
+
+def _refuse_words_the_shell_splits(call: _Call, spec: _Program) -> None:
+    """Refuse an argument the shell globs, or may split or glob once a value is in place.
+
+    A wildcard the shell expands is a word, or several, that no validator reads: it gets the
+    spelling, and the program gets what the directory held. Beside a file named `-f`, `awk
+    [-]f x` is `awk -f x`; beside one named `x;BEGIN{system(...)}`, `awk x*` runs it as its
+    program; and `uniq *.txt` writes over the second file it matches. Every program with a
+    validator turns on its words, and so is refused one, the `-C` directory of `git` included.
+    A quoted wildcard is the program's own to match. For `printf`, beside a file named `-v`,
+    `printf [-]v PATH .` sets `PATH`.
+
+    bash splits and globs a value where an unquoted `$q` glued to text uses it, so `q='*';
+    awk x$q` is `awk x*`: such a use is refused too, unless ``known_values`` holds a value for
+    the name that bash can neither split nor glob.
+    """
+    count = spec.option_words
+    words = zip(call.tokens[:count], call.live_globs[:count], call.spliced[:count], strict=True)
+    for token, live, spliced in words:
         if live:
-            raise NotReadOnly(f"unquoted glob operand in {program}")
-        expansion = None if was_spliced else _unclean_expansion(word, known_values)
+            raise NotReadOnly(f"unquoted glob operand in {call.program}")
+        expansion = None if spliced else _unclean_expansion(token, call.known_values)
         if expansion is not None:
             raise NotReadOnly(
-                f"bash may split or glob {expansion} where {program} gets it: "
-                f"{_expand(word, parts)}"
+                f"bash may split or glob {expansion} where {call.program} gets it: "
+                f"{_expand(token, call.parts)}"
             )
 
-    # Fail-closed dispatch: either a dedicated validator, a purely read-only program, or reject
-    if program in PROGRAM_VALIDATORS:
-        PROGRAM_VALIDATORS[program](args)
-        # The validator read each word as spelled. With the values the command sets in place,
-        # a word can be another flag: `q=o; sort -${q}ut in` is `sort -out in`, and
-        # `q=''; r=-o; sort ${q}${r}ut in` is too. Each list the program can get is read again.
-        if program in EXPANSION_UNSAFE or program == "printf":
-            for variant in _arg_variants(args, arg_tokens, spliced, parts, known_values):
-                try:
-                    PROGRAM_VALIDATORS[program](variant)
-                except NotReadOnly as error:
-                    raise type(error)(
-                        f"{error}, with the values this command sets: {' '.join(variant)}"
-                    ) from None
-        if program == "printf":
-            _check_printf_unread_format(args, arg_tokens, parts, known_values)
-    elif program not in READ_ONLY:
-        raise NoOpinion(f"unrecognized program: {program}")
 
-    # `-C` points git at the repository there, and so at that repository's config, which
-    # can name a program git runs: `core.fsmonitor` on `status`, `gpg.program` on a `log`
-    # that shows signatures. That is `--git-dir` under another name, so a directory
-    # outside the read roots is not this module's to approve. Read before the early return
-    # below, and before `_check_git_remote_reach`, which runs git in that directory.
-    if program == "git":
-        index, directories = _git_global_options(args)
-        if len(directories) > 1:
-            raise NoOpinion("git -C given more than once, each relative to the last")
-        for position in directories if scope is not None else []:
-            problem = _read_scope_problem(arg_tokens[position], args[position], parts, scope)
-            if problem is not None:
-                raise NoOpinion(f"git -C points at {problem}")
-        # Layer A, below, for the files git opens, which it resolves from the `-C` directory,
-        # and for the paths it reads in a repository whose root is outside the read roots
-        found = _git_file_operands(args, index)
-        if scope is not None:
-            files_scope = scope
-            if directories:
-                token = arg_tokens[directories[0]]
-                files_scope = _directory_scope(token, parts, known_values, scope)
-            if found:
-                _check_read_scope(f"git {args[index]}", found, args, arg_tokens, parts, files_scope)
-            _check_git_paths(args, index, arg_tokens, parts, files_scope)
-        directory = args[directories[0]] if directories else None
-        _check_git_remote_reach(args[index:], directory, scope)
+def _validate(call: _Call, spec: _Program) -> None:
+    """Run the program's validator on each argument list the program can get."""
+    spec.validate(call.args)
+    # The validator read each word as spelled. With the values the command sets in place,
+    # a word can be another flag: `q=o; sort -${q}ut in` is `sort -out in`, and
+    # `q=''; r=-o; sort ${q}${r}ut in` is too. Each list the program can get is read again.
+    variants = _arg_variants(call.args, call.tokens, call.spliced, call.parts, call.known_values)
+    for variant in variants:
+        try:
+            spec.validate(variant)
+        except NotReadOnly as error:
+            raise type(error)(
+                f"{error}, with the values this command sets: {' '.join(variant)}"
+            ) from None
+    if spec.then is not None:
+        spec.then(call)
 
-    # The read scope comes after the validator, so a write the validator found keeps its
-    # verdict whatever a rule says: `sort -o out /etc/hostname` writes `out` wherever it reads.
-    if scope is None:
-        return
 
-    # Layer A: a reader this module knows may only open files inside the working directories.
-    # Outside them, or unresolvable, is not a verdict this module can give; the operator's
-    # own allow rules decide, as they do for any program the module cannot read.
+def _check_what_it_reads(call: _Call, scope: _ReadScope) -> None:
+    """Layer A: a reader this module knows may only open files inside the working directories.
+
+    Outside them, or unresolvable, is not a verdict this module can give; the operator's own
+    allow rules decide, as they do for any program the module cannot read.
+    """
+    program, args, tokens, parts = call.program, call.args, call.tokens, call.parts
     if program in READER_SPECS:
-        _check_read_scope(program, _file_operands(program, args), args, arg_tokens, parts, scope)
+        _check_read_scope(program, _file_operands(program, args), args, tokens, parts, scope)
     # And for a link it follows while it recurses, wherever the link is (#63)
     if program in LINK_FOLLOWERS:
-        links = _followed_links(program, args, arg_tokens, parts, scope.bases, known_values)
+        links = _followed_links(program, args, tokens, parts, scope.bases, call.known_values)
         # The link by its own path, which `_in_scope` resolves as the scratchpad is resolved:
         # its target alone is out of a scratchpad whose path goes through a link, as on macOS
         for link, _ in links:
