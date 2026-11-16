@@ -304,6 +304,15 @@ other change: where a fix rewrote content that was correct, revert it and adjust
   - Rebasing a PR, fold a commit that only fixes a review of an earlier one, or say in the PR
     why it stays
 
+## Reviews
+
+- Answer each review thread with a reply that names the fix in this PR, the issue that holds
+  what the PR leaves, or the reason it stays
+  - "Partly done, this PR leaves the rest" answers it only once a reply names that issue
+- Leave the thread open: whether the reply settles it is the reviewer's to judge
+- A PR merges only once every thread is answered and resolved, by the reviewer, or by an agent
+  when the operator asks
+
 ## Release
 
 [docs/release.md](docs/release.md) has the steps: merge, point the catalog's `source.sha` at the
