@@ -1096,6 +1096,18 @@ def _skip_arithmetic(text: str, index: int) -> int:
     raise NotReadOnly("unterminated arithmetic expansion")
 
 
+class _EscapedDollar(str):
+    r"""Double-quoted text that closes its span and holds a `$` a backslash made literal.
+
+    `_scan_double_quoted` takes the backslash out, so `"\$r"` and `"$r"` are the same text in
+    the parts table. `_quoted_splice_name` reads a word's text as the expansion it spells, and
+    must not read the first as one: this type is how it tells them apart. Every other reader
+    takes the text as a plain `str`, as before.
+    """
+
+    __slots__ = ()
+
+
 def _scan_double_quoted(text: str, index: int, emit: Callable[[str, str], None]) -> int:
     """Scan a ``"..."`` span at word level, emitting its literal runs and substitutions.
 
@@ -1103,6 +1115,7 @@ def _scan_double_quoted(text: str, index: int, emit: Callable[[str, str], None])
     word, so ``"a$(id)b"`` stays one word and its command is still reachable.
     """
     buffer: list[str] = []
+    escaped_dollar = False
     length = len(text)
     while index < length:
         char = text[index]
@@ -1113,10 +1126,12 @@ def _scan_double_quoted(text: str, index: int, emit: Callable[[str, str], None])
                 continue
             if following in '$`"\\':
                 buffer.append(following)
+                escaped_dollar = escaped_dollar or following == "$"
                 index += 2
                 continue
         if char == '"':
-            emit(DOUBLE_QUOTED, "".join(buffer))
+            span = "".join(buffer)
+            emit(DOUBLE_QUOTED, _EscapedDollar(span) if escaped_dollar else span)
             return index + 1
         if char == "`":
             raise NotReadOnly("backtick command substitution")
@@ -1332,7 +1347,7 @@ def _safe_loop_names(
 # A use of `name` that the shell word-splits into the argument list: `$name`, `${name}`,
 # and the zsh `${=name}`. All three split an unquoted value into several words, so all
 # three are spliceable when the value is one this module resolved. A quoted `"$name"` is
-# not here -- it is a single word and is handled by the loop-name path -- and neither is a
+# not here -- it is a single word, which `_quoted_splice_name` reads -- and neither is a
 # glued `${name}x`, which is one word too.
 # TODO(zsh): under zsh only `${=name}` word-splits; a bare `$name` or `${name}` is one word
 # (SH_WORD_SPLIT is off by default). The splice checks the split words, which is the bash
@@ -1345,8 +1360,8 @@ def _splice_name(token: str, splice_vars: dict[str, list[str]]) -> str | None:
     """The variable name this token splices in, or None.
 
     A bare, unquoted `$name`, `${name}` or `${=name}` whose `name` has a resolved literal
-    value. A quoted use is a placeholder, not this literal text, so it never matches here
-    and stays with the loop-name path. A glued `${name}x` is not a whole-word match either.
+    value. A quoted use is a placeholder, not this literal text, so it never matches here:
+    `_quoted_splice_name` reads it. A glued `${name}x` is not a whole-word match either.
     """
     match = SPLICE_USE.match(token)
     if match is None:
@@ -1355,10 +1370,38 @@ def _splice_name(token: str, splice_vars: dict[str, list[str]]) -> str | None:
     return name if name in splice_vars else None
 
 
+# The text of a double-quoted span that is one plain expansion: `"$name"` or `"${name}"`. Not
+# zsh's `"${=name}"`, which splits the value inside the quotes.
+QUOTED_SPLICE_USE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _quoted_splice_name(
+    token: str, parts: list[tuple[str, str]], values: dict[str, str]
+) -> str | None:
+    r"""The variable name whose value this token is, as one word, or None (#99).
+
+    A word that is exactly `"$name"` or `"${name}"`, whose `name` has a resolved literal
+    value: both shells hand the program that value as it is, neither split nor globbed. The
+    whole word has to be the one double-quoted span, so `"$name"x` and `"$name$other"` are not
+    read here, and neither is `"\$name"`, the literal text, which `_EscapedDollar` marks.
+    """
+    match = PLACEHOLDER.fullmatch(token)
+    if match is None:
+        return None
+    kind, text = parts[int(match.group(1))]
+    if kind != DOUBLE_QUOTED or isinstance(text, _EscapedDollar):
+        return None
+    use = QUOTED_SPLICE_USE.fullmatch(text)
+    if use is None:
+        return None
+    name = use.group(1) or use.group(2)
+    return name if name in values else None
+
+
 def _literal_assignments(
     segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
-) -> dict[str, list[str]]:
-    """Variables assigned a fully literal value in a sibling segment, as split words.
+) -> dict[str, str]:
+    """Variables assigned a fully literal value in a sibling segment, each with the value it holds.
 
     `_p='--profile admin --region us-east-1'` puts those three flags in `_p`, and because
     the assignment is in the same command as the `${=_p}` that uses it, the value is right
@@ -1407,11 +1450,10 @@ def _literal_assignments(
             # home-relative path, not the two characters. Storing the expansion is what lets
             # the read scope see where `"$x"` really points. A value the two store differently,
             # or one with a directory the shell picks, as `x=~-`, is none to read: see
-            # `_assigned_value`. Nor is one that keeps a tilde: `LITERAL_TILDE`.
+            # `_assigned_value`.
             value = _assigned_value(value_token, parts)
-            if value is None or LITERAL_TILDE.search(value):
-                continue
-            assigned[name] = value.split()
+            if value is not None:
+                assigned[name] = value
     return assigned
 
 
@@ -4521,6 +4563,7 @@ def _check_command(
     splice_vars: dict[str, list[str]] | None = None,
     scope: _ReadScope | None = None,
     known_values: dict[str, list[str] | None] | None = None,
+    quoted_values: dict[str, str] | None = None,
 ) -> None:
     """Inspect simple command name and argument list with strict fail-closed dispatch.
 
@@ -4549,20 +4592,34 @@ def _check_command(
     # flag-position check below skips them: they are known literals, and the validator that
     # runs on the full list is what actually clears them. An argument that is not a splice
     # keeps its token, so quoting and placeholders are preserved for every other check.
+    # A quoted `"$name"` or `"${name}"` of such a name is the value as one word, unsplit, and
+    # is read as that value written out in single quotes: its token is a placeholder for a
+    # literal part added here, so every check below reads the word as quoted text (#99).
     splice_vars = splice_vars or {}
     known_values = known_values or {}
+    quoted_values = quoted_values or {}
     args: list[str] = []
     arg_tokens: list[str] = []
     live_globs: list[bool] = []
     spliced: list[bool] = []
     for word in words[1:]:
         name = _splice_name(word, splice_vars)
+        # The value before any split, which `_literal_assignments` reads only where the commands
+        # around this one bind the name nowhere, and `_classify_with` keeps only where the
+        # shell holds it at the use
+        quoted_name = _quoted_splice_name(word, parts, quoted_values)
         if name is not None:
             for value_word in splice_vars[name]:
                 args.append(value_word)
                 arg_tokens.append(value_word)
                 live_globs.append(False)  # a resolved literal has no live glob
                 spliced.append(True)
+        elif quoted_name is not None:
+            parts.append((LITERAL, quoted_values[quoted_name]))
+            args.append(quoted_values[quoted_name])
+            arg_tokens.append(f"{PLACEHOLDER_MARK}{len(parts) - 1}{PLACEHOLDER_MARK}")
+            live_globs.append(False)
+            spliced.append(True)
         else:
             args.append(_expand(word, parts))
             arg_tokens.append(word)
@@ -4629,7 +4686,9 @@ def _check_command(
                 raise NotReadOnly(
                     f"{program} given a word the shell still builds: {_expand(word, parts)}"
                 )
-        _check_command(inner, parts, depth + 1, safe_names, splice_vars, scope, known_values)
+        _check_command(
+            inner, parts, depth + 1, safe_names, splice_vars, scope, known_values, quoted_values
+        )
         return
 
     # Every flag test below reads a word that is already complete. One that begins with
@@ -8363,18 +8422,25 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
 
     # Variables assigned a fully literal value in this command. A `$name`/`${name}`/`${=name}`
     # that uses one is spliced into its words and checked as the flags it is, which is how a
-    # `_p='--profile x --region y'` hoisted out of repeated vendor calls stops prompting.
-    splice_vars = _literal_assignments(segments, parts, bindings)
+    # `_p='--profile x --region y'` hoisted out of repeated vendor calls stops prompting. A
+    # `"$name"` is read as the value itself, one that keeps a tilde included; an unquoted use of
+    # that one is not, as zsh's `glob_subst` expands the tilde there: `LITERAL_TILDE`.
+    assigned = _literal_assignments(segments, parts, bindings)
+    splice_vars = {
+        name: value.split() for name, value in assigned.items() if not LITERAL_TILDE.search(value)
+    }
     loop_values = _literal_loop_values(segments, parts, bindings)
     known_values = _known_values(segments, parts, splice_vars, loop_values, own_bindings)
     # A value the shell may not hold where a word uses it is no value to read: every reader
-    # takes the name as unread, the value it had before, as for `cd $d; d=src`
+    # takes the name as unread, the value it had before, as for `cd $d; d=src`. `assigned`
+    # holds one that keeps a tilde too, which `splice_vars` leaves out and a `"$name"` reads.
     read = {name for name, values in known_values.items() if values is not None}
     unsettled = _unsettled_names(
-        segments, separators, parts, read | set(splice_vars) | set(loop_values)
+        segments, separators, parts, read | set(assigned) | set(loop_values)
     )
     for name in unsettled:
         known_values[name] = None
+        assigned.pop(name, None)
         splice_vars.pop(name, None)
         loop_values.pop(name, None)
     for name, values in (inherited.values if inherited else {}).items():
@@ -8461,6 +8527,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
                 splice_vars=splice_vars,
                 scope=scope,
                 known_values=known_values,
+                quoted_values=assigned,
             )
             _check_where_it_runs(unvouched)
         except NoOpinion:
