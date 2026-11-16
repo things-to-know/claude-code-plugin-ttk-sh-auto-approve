@@ -5490,6 +5490,16 @@ class ReadsAValueOnlyWhereTheShellHoldsIt(Verdicts, unittest.TestCase):
                 with self.subTest(command=command):
                     self.assert_no_opinion(command, "cat read below /")
 
+    def test_a_flag_before_its_loop(self):
+        """A bare `"$p"` of a literal loop's name is exempt from the flag check only where the
+        loop has bound it: before it, `p` holds a value no header spells."""
+        with a_project_below_home():
+            self.assert_allowed('for p in main; do git log "$p"; done', "the control")
+            self.assert_allowed('for p in main; do true; done; git log "$p"', "the control")
+            self.assert_refused_outright(
+                'git log "$p"; for p in main; do true; done', "git got the value p had before"
+            )
+
 
 class RefusesAScratchPathThroughALinkOut(Verdicts, unittest.TestCase):
     """The scratch directory was matched by its text alone, so a link inside it led a read or a

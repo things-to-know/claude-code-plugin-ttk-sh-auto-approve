@@ -7343,9 +7343,10 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # A value the shell may not hold where a word uses it is no value to read: every reader
     # takes the name as unread, the value it had before, as for `cd $d; d=src`
     read = {name for name, values in known_values.items() if values is not None}
-    for name in _unsettled_names(
+    unsettled = _unsettled_names(
         segments, separators, parts, read | set(splice_vars) | set(loop_values)
-    ):
+    )
+    for name in unsettled:
         known_values[name] = None
         splice_vars.pop(name, None)
         loop_values.pop(name, None)
@@ -7361,8 +7362,9 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # sets in place. Collected across every segment first, because the header that binds a name
     # and the body that uses it are separate segments, and `_strip_structure` discards the
     # header. A bare `"$name"` of one of these is exempt from the flag check inside
-    # `_check_command`; nothing else is.
-    safe_names = _safe_loop_names(segments, parts, bindings, known_values)
+    # `_check_command`; nothing else is. An unsettled name is none: where a word uses it, it holds
+    # a value no header spells.
+    safe_names = _safe_loop_names(segments, parts, bindings, known_values) - unsettled
 
     # Where a relative word may be resolved from, worked out once for the credential check, the
     # read scope and each substitution's body
