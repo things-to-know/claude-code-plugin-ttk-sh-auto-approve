@@ -5449,6 +5449,45 @@ class ReadsAValueOnlyWhereTheShellHoldsIt(Verdicts, unittest.TestCase):
                 with self.subTest(command=command):
                     self.assert_no_opinion(command, "cat read below /")
 
+    def test_a_binding_inside_a_compound(self):
+        """A branch or a body the shell may skip, or run in a subshell: in bash 5.2 and zsh 5.9,
+        each `cd` went to the home directory, and each `cat` read below `/`, except zsh's for the
+        group that ends a pipeline, which zsh runs in the shell itself."""
+        with a_project_below_home():
+            for command in (
+                "{ true; }; d=src; cd $d && grep -rl PRIVATE .",
+                "if true; then true; fi\nd=src; cd $d && grep -rl PRIVATE .",
+                "for f in src; do\ncat $f/lib/x.txt\ndone",
+                "for x in a; do\nfor f in src; do cat $f/lib/x.txt; done\ndone",
+                "false && for d in src; do cat $d/lib/x.txt; done",
+                "for d in src; do cat $d/lib/x.txt; done | cat",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: the binding runs first")
+            for command in (
+                "false && { true; d=src; }; cd $d && grep -rl PRIVATE .",
+                "if false; then true; d=src; fi; cd $d && grep -rl PRIVATE .",
+                "if false; then\nd=src\nfi; cd $d && grep -rl PRIVATE .",
+                "if true; then true; else true; d=src; fi; cd $d && grep -rl PRIVATE .",
+                "false && {\nd=src\n}; cd $d && grep -rl PRIVATE .",
+                "while false; do\nd=src\ndone; cd $d && grep -rl PRIVATE .",
+                "{\nd=src\n} | cat; cd $d && grep -rl PRIVATE .",
+                "{ true; d=src; } & cd $d && grep -rl PRIVATE .",
+                "cat /dev/null | { true; d=src; }; cd $d && grep -rl PRIVATE .",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command, "cd went to the home directory")
+            for command in (
+                "for d in src; do true; done | cat; cat $d/lib/x.txt",
+                "for d in src; do true; done & cat $d/lib/x.txt",
+                "if false; then true; for d in src; do true; done; fi; cat $d/lib/x.txt",
+                "for x in sr*; do\nfor d in src; do true; done\ndone; cat $d/lib/x.txt",
+                # zsh's short `for` has no `done`: the one here closes the loop around it
+                "for x in a; do\nfor d in sr*; true; cat $d/lib/x.txt; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "cat read below /")
+
 
 class RefusesAScratchPathThroughALinkOut(Verdicts, unittest.TestCase):
     """The scratch directory was matched by its text alone, so a link inside it led a read or a
