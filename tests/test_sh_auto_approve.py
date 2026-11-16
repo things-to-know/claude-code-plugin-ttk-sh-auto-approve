@@ -4728,6 +4728,18 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_refused(command)
 
+    def test_a_glob_in_the_first_component_of_an_absolute_path(self):
+        """The directory in front of the wildcard in `/u*/lib/os-release` is `/`, which was read
+        as the empty relative path, and so as the project: `cat /u*/lib/os-release` was approved,
+        and printed `/usr/lib/os-release`."""
+        self.assert_allowed("cat docs/*/a.md", "the control: the glob stays below docs")
+        self.assert_no_opinion("cat /usr/lib/os-release", "the literal path, as before")
+        for command in ("cat /u*/lib/os-release", "head -1 /us?/lib/os-release", "ls /u*"):
+            with self.subTest(command=command):
+                self.assert_no_opinion(command, "a read in /")
+                with operator_rules(allow=["Bash(cat *)", "Bash(head *)", "Bash(ls *)"]):
+                    self.assert_allowed(command, "the rule approves it")
+
     def test_a_nul_byte_is_refused_rather_than_crashing(self):
         """Bash ends a string at a NUL, so the hook and bash would read different commands."""
         self.assert_refused("cat AGENTS.md\x00 ~/.aws/credentials", "bash truncates here")

@@ -5732,9 +5732,10 @@ def _read_scope_problem(
         if _carries_live_glob(token):
             if _glob_may_climb(candidate):
                 return f"a glob that may climb out of its directory: {candidate}"
-            # The directory the glob runs in: everything up to the last `/` before it.
+            # The directory the glob runs in: everything up to the last `/` before it, which is
+            # `/` itself for `/u*/lib/x`, not the empty relative path
             head = PATH_SPECIAL.split(candidate, 1)[0]
-            candidate = head.rsplit("/", 1)[0] if "/" in head else "."
+            candidate = (head.rsplit("/", 1)[0] or "/") if "/" in head else "."
         absolutes = (
             [candidate]
             if candidate.startswith("/")
