@@ -531,7 +531,7 @@ def _whole_part(token: str, parts: Parts) -> Part | None:
 # Shell grammar: text refused wherever it is spelled
 #
 # What the shell acts on with no program involved, or evaluates from a value the module did
-# not read. `_refuse_unreadable_text` applies these to the whole command.
+# not read. `_refuse_text_the_shell_evaluates` applies most of these to the whole command.
 # --------------------------------------------------------------------------------------
 
 # A socket the shell opens itself, with no program involved. `cat /dev/tcp/h/p` is egress
@@ -7348,10 +7348,75 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     binds: in `q=--; echo "$(git log "${q}output=x")"` it is `git log --output=x`, and in
     `cd src && x=$(cat ../x)` it reads `src/../x`. ``inherited`` is that command's
     `_ShellState`, or None for a whole command.
+
+    The order below is part of the verdict. Everything down to the substitutions' bodies refuses
+    outright or not at all, and a simple command can have no opinion, so a refusal a rule
+    cannot overturn always comes first.
     """
     if depth > MAX_SUBSTITUTION_DEPTH:
         raise NotReadOnly("substitution nested too deeply")
+    _refuse_bytes_no_command_holds(command)
+    reduced, parts = _scan(command)
+    _refuse_text_the_shell_evaluates(reduced, parts)
 
+    # Read once, for both tiers: the read roots below and the operator's rules further down.
+    settings = _settings_permissions()
+    roots = _read_roots(settings)
+
+    stripped, input_targets = _strip_redirections(reduced, parts)
+    segments, backgrounds = _read_segments(stripped, inherited)
+    allow, deny = _operator_rules(settings)
+    names = _read_names(segments, parts, inherited)
+
+    # Where a relative word may be resolved from, worked out once for the credential check, the
+    # read scope and each substitution's body
+    bases, shell_bases = _working_directories(segments, parts, inherited, names.known_values)
+    state = _ShellState(
+        bases, shell_bases, names.known_values, names.bindings, backgrounds=backgrounds
+    )
+
+    # The links an `ln` here makes, which every path below is resolved through as if they were
+    # there already: `ln -s ~ k && cat k/.ssh/id_rsa` reads a credential store (#79)
+    _record_planned_links(segments, parts, shell_bases)
+
+    # Layer B: no word may name a credential store, whatever program it belongs to and
+    # whatever tier would otherwise approve it, nor may a link a reader follows lead to one.
+    _refuse_credential_paths(reduced, parts, state)
+    _refuse_followed_credential_links(segments, parts, state)
+
+    # Where readers may read. A relative path must be in scope from each working directory: a
+    # `cd` inside a pipeline does not move the shell that runs the next command, so the module
+    # does not guess which one applies.
+    scope = _ReadScope(
+        roots=roots,
+        bases=state.bases,
+        splice_vars=names.splice_vars,
+        loop_values=names.loop_values,
+        spells_escape=bool(TERMINAL_CONTROL_SPELLED.search(command)),
+        settings=settings,
+        backgrounds=backgrounds,
+    )
+    _check_input_targets(input_targets, scope)
+
+    # A substitution runs a command wherever it sits, so each body is classified by these
+    # same rules before the word it produces is looked at, in this command's shell state.
+    # The shell runs a process substitution without waiting for it, as it runs a job behind
+    # `&`: `true <(curl x)` returns at once.
+    detached = _ShellState(bases, shell_bases, names.known_values, names.bindings, backgrounds=True)
+    bodies = [part for part in parts if part.kind in RUNS_A_COMMAND]
+    for body in bodies:
+        within = detached if body.kind == PROCESS_SUBSTITUTION else state
+        _classify_with(body.value, depth + 1, within)
+
+    # A substitution body is work that was inspected, so `x=$(grep -c . AGENTS.md)` has
+    # something to show for itself even though the assignment it sits in is skipped.
+    checked = len(bodies) + _check_segments(segments, parts, names, scope, allow, deny)
+    if checked == 0:
+        raise NotReadOnly("nothing to check")
+
+
+def _refuse_bytes_no_command_holds(command: str) -> None:
+    """Refuse a command the scan cannot stand for, before it is scanned."""
     # Enforce host length cap
     if len(command) > HOST_COMMAND_LENGTH_CAP:
         raise NotReadOnly("command exceeds length cap")
@@ -7365,16 +7430,17 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     if "\x00" in command or "\x02" in command:
         raise NotReadOnly("NUL or reserved control byte in command")
 
-    # See `TERMINAL_CONTROL_BYTE`; the spelled forms are read in `_check_command`.
+    # See `TERMINAL_CONTROL_BYTE`; the spelled forms are read in `_refuse_terminal_escapes`.
     if TERMINAL_CONTROL_BYTE.search(command):
         raise NotReadOnly("terminal control byte in command")
 
-    reduced, parts = _scan(command)
 
+def _refuse_text_the_shell_evaluates(reduced: str, parts: Parts) -> None:
+    """Refuse what the shell opens or evaluates with no program this module reads involved."""
     # `/dev/tcp/host/port` opens a socket with no program involved, so it is refused
     # wherever it appears -- as an operand, behind `<`, and inside a quoted word -- rather
     # than left to a per-program validator that would never see it.
-    for text in [reduced] + [value for _, value in parts]:
+    for text in [reduced, *(part.value for part in parts)]:
         if NETWORK_DEVICE.search(text):
             raise NotReadOnly("network pseudo-device")
 
@@ -7385,7 +7451,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # value -- a writing flag, or a new `PATH` -- with no `name=` anywhere to be found.
     # The rest re-evaluate a value the module never read; see `SUBSCRIPT` and
     # `ZSH_PARAMETER_FLAGS` for what each one runs.
-    for text in [reduced] + [value for kind, value in parts if kind == DOUBLE_QUOTED]:
+    for text in [reduced, *(part.value for part in parts if part.kind == DOUBLE_QUOTED)]:
         if PARAMETER_TRANSFORM.search(text) or BRACE_SUBSTITUTION.search(text):
             raise NotReadOnly("deferred command substitution")
         if PARAMETER_ASSIGN.search(text):
@@ -7410,13 +7476,15 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
                     f"zsh replaces a word with the path of a command: {_expand(token, parts)}"
                 )
 
-    # Read once, for both tiers: the read roots below and the operator's rules further down.
-    settings = _settings_permissions()
-    roots = _read_roots(settings)
 
-    # Normalize stream discards before tokenization, then the two redirections that are
-    # reads or contained writes. Everything `_segments` still meets after this is a `>` at
-    # a path this module could not account for, which is the one it has to refuse.
+def _strip_redirections(reduced: str, parts: Parts) -> tuple[str, list[str]]:
+    """The reduced command without the redirections accounted for, and each `<` target taken.
+
+    Stream discards first, then the two redirections that are reads or contained writes.
+    Everything `_segments` still meets after this is a `>` at a path this module could not
+    account for, which is the one it has to refuse. Each `<` target is checked by
+    `_check_input_targets`, once the working directories are known.
+    """
     stripped = SAFE_REDIRECTS.sub(" ", reduced)
     scratch_redirect = _scratch_redirect()
     if scratch_redirect is not None:
@@ -7424,7 +7492,6 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
             lambda match: " " if _resolves_into_scratch(match["target"]) else match.group(0),
             stripped,
         )
-    # Each `<` target stripped here is checked once the working directories are known
     input_targets: list[str] = []
 
     def strip_input(match: re.Match) -> str:
@@ -7434,11 +7501,16 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         input_targets.append(target)
         return " "
 
-    stripped = FILE_INPUT_REDIRECT.sub(strip_input, stripped)
+    return FILE_INPUT_REDIRECT.sub(strip_input, stripped), input_targets
 
-    # A newline separates commands exactly as `;` does, but shlex counts it as
-    # whitespace and glues `ls\nrm` into one word, so the split happens here. A newline
-    # inside a quoted string is in the table by now, so it no longer reaches this.
+
+def _read_segments(stripped: str, inherited: _ShellState | None) -> tuple[list[list[str]], bool]:
+    r"""The simple commands of a command, and whether the shell may not wait for one.
+
+    A newline separates commands exactly as `;` does, but shlex counts it as whitespace and
+    glues `ls\nrm` into one word, so the split happens here. A newline inside a quoted string
+    is in the table by now, so it no longer reaches this.
+    """
     segments: list[list[str]] = []
     # A substitution's body inherits the `&` of the command it sits in: in `echo "$(curl x)" &`,
     # the `curl` runs in the job
@@ -7450,9 +7522,25 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         segments.extend(_segments(tokens))
     if not segments:
         raise NotReadOnly("no command")
+    return segments, backgrounds
 
-    allow, deny = _operator_rules(settings)
 
+class _Names(NamedTuple):
+    """What a command binds, as `_read_names` reads it, with the commands around it."""
+
+    # How many times each name is bound: `_bindings`
+    bindings: dict[str, int]
+    # Each name assigned a fully literal value, as its split words: `_literal_assignments`
+    splice_vars: dict[str, list[str]]
+    # The values each `for` variable can take: `_literal_loop_values`
+    loop_values: dict[str, list[str]]
+    known_values: KnownValues
+    # The loop variables a bare `"$name"` of which is no flag: `_safe_loop_names`
+    safe_names: frozenset[str]
+
+
+def _read_names(segments: list[list[str]], parts: Parts, inherited: _ShellState | None) -> _Names:
+    """Every binding of every name in these segments, and the values each can hold."""
     # Every binding of every name, wherever it stands, and those of the commands around this
     # one: a substitution's body runs in their shell, so `o=-x; echo "$(sort $o; o=-u)"` binds
     # `o` twice. Each reader below takes a name's values only where the bindings it read are
@@ -7484,53 +7572,23 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # header. A bare `"$name"` of one of these is exempt from the flag check inside
     # `_check_command`; nothing else is.
     safe_names = _safe_loop_names(segments, parts, bindings, known_values)
+    return _Names(bindings, splice_vars, loop_values, known_values, safe_names)
 
-    # Where a relative word may be resolved from, worked out once for the credential check, the
-    # read scope and each substitution's body
-    bases, shell_bases = _working_directories(segments, parts, inherited, known_values)
-    state = _ShellState(bases, shell_bases, known_values, bindings, backgrounds=backgrounds)
 
-    # The links an `ln` here makes, which every path below is resolved through as if they were
-    # there already: `ln -s ~ k && cat k/.ssh/id_rsa` reads a credential store (#79)
-    _record_planned_links(segments, parts, shell_bases)
-
-    # Layer B: no word may name a credential store, whatever program it belongs to and
-    # whatever tier would otherwise approve it, nor may a link a reader follows lead to one.
-    _refuse_credential_paths(reduced, parts, state)
-    _refuse_followed_credential_links(segments, parts, state)
-
-    # Where readers may read. A relative path must be in scope from each working directory: a
-    # `cd` inside a pipeline does not move the shell that runs the next command, so the module
-    # does not guess which one applies.
-    scope = _ReadScope(
-        roots=roots,
-        bases=state.bases,
-        splice_vars=splice_vars,
-        loop_values=loop_values,
-        spells_escape=bool(TERMINAL_CONTROL_SPELLED.search(command)),
-        settings=settings,
-        backgrounds=backgrounds,
-    )
-    _check_input_targets(input_targets, scope)
-
-    # A substitution runs a command wherever it sits, so each body is classified by these
-    # same rules before the word it produces is looked at, in this command's shell state.
-    # Everything above refuses outright or not at all, and the segments below can have no
-    # opinion, so a body's refusal still comes first. The shell runs a process substitution
-    # without waiting for it, as it runs a job behind `&`: `true <(curl x)` returns at once.
-    detached = _ShellState(bases, shell_bases, known_values, bindings, backgrounds=True)
-    for kind, value in parts:
-        if kind in RUNS_A_COMMAND:
-            _classify_with(value, depth + 1, detached if kind == PROCESS_SUBSTITUTION else state)
-
+def _check_segments(
+    segments: list[list[str]],
+    parts: Parts,
+    names: _Names,
+    scope: _ReadScope,
+    allow: list[_GlobRule],
+    deny: list[_GlobRule],
+) -> int:
+    """Check each simple command, under the operator's rules, and count them."""
     # A move to a directory the read scope doesn't vouch for leaves every program to the rules,
     # wherever it stands, since a program reads where it runs (#72). What a validator refuses
     # stays refused: the check comes after it.
-    unvouched = _unvouched_directory(state.bases, scope)
-
-    # A substitution body is work that was inspected, so `x=$(grep -c . AGENTS.md)` has
-    # something to show for itself even though the assignment it sits in is skipped.
-    checked = sum(1 for kind, _ in parts if kind in RUNS_A_COMMAND)
+    unvouched = _unvouched_directory(scope.bases, scope)
+    checked = 0
     for segment in segments:
         words = _strip_structure(segment)
         if not words:
@@ -7542,10 +7600,10 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
             _check_command(
                 words,
                 parts,
-                safe_names=safe_names,
-                splice_vars=splice_vars,
+                safe_names=names.safe_names,
+                splice_vars=names.splice_vars,
                 scope=scope,
-                known_values=known_values,
+                known_values=names.known_values,
             )
             _check_where_it_runs(unvouched)
         except NoOpinion:
@@ -7554,9 +7612,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
             if not any(pattern.match(text) for pattern in allow):
                 raise
         checked += 1
-
-    if checked == 0:
-        raise NotReadOnly("nothing to check")
+    return checked
 
 
 def is_read_only(command: str) -> bool:
