@@ -1996,35 +1996,32 @@ def _names_used(words: list[str], parts: list[tuple[str, str]]) -> set[str]:
     """Each name these words expand: unquoted, double-quoted, or in a substitution's body.
 
     Read wider than the shell reads them, which costs only a name read as unread: a body is
-    searched as its raw text, so a `'$d'` inside it counts too.
+    searched as its raw text, so a `'$d'` inside it counts too. A part's value holds no
+    placeholder, as the command can't carry `PLACEHOLDER_MARK`, so there is one level to read.
     """
     names: set[str] = set()
-    texts = list(words)
-    seen: set[int] = set()
-    while texts:
-        text = texts.pop()
-        names.update(UNQUOTED_EXPANSION.findall(PLACEHOLDER.sub("", text)))
-        for index in map(int, PLACEHOLDER.findall(text)):
+    for word in words:
+        names.update(UNQUOTED_EXPANSION.findall(PLACEHOLDER.sub("", word)))
+        for index in map(int, PLACEHOLDER.findall(word)):
             kind, value = parts[index]
-            if index not in seen and (kind == DOUBLE_QUOTED or kind in RUNS_A_COMMAND):
-                seen.add(index)
-                texts.append(value)
+            if kind == DOUBLE_QUOTED or kind in RUNS_A_COMMAND:
+                names.update(UNQUOTED_EXPANSION.findall(value))
     return names
 
 
-def _binds_first(segment: list[str], name: str, parts: list[tuple[str, str]]) -> bool:
-    """Whether this segment binds ``name`` where `_known_values` reads a value.
+def _first_bindings(segment: list[str], parts: list[tuple[str, str]]) -> list[str]:
+    """The names this segment binds where `_known_values` reads a value.
 
-    That is in an assignment that starts the segment, or as the `for` header the segment is.
+    Each assignment that starts the segment, or the name of the `for` header the segment is.
     """
     if len(segment) >= 3 and segment[0] in WORD_LIST_HEADS and segment[2] == "in":
-        return _expand(segment[1], parts) == name
+        return [_expand(segment[1], parts)]
+    names = []
     for word in segment:
         if not ASSIGNMENT.match(word):
-            return False
-        if word.partition("=")[0] == name:
-            return True
-    return False
+            break
+        names.append(word.partition("=")[0])
+    return names
 
 
 def _unsettled_names(
@@ -2053,21 +2050,30 @@ def _unsettled_names(
 
     ``separators`` holds the separator before and after each segment, `_segment_separators`.
     """
+    binders: dict[str, list[int]] = {}
+    # The first and the last segment that uses each name
+    first_use: dict[str, int] = {}
+    last_use: dict[str, int] = {}
+    for position, segment in enumerate(segments):
+        for name in _first_bindings(segment, parts):
+            binders.setdefault(name, []).append(position)
+        for name in _names_used(segment, parts):
+            first_use.setdefault(name, position)
+            last_use[name] = position
     unsettled: set[str] = set()
     for name in names:
-        bound = [i for i, segment in enumerate(segments) if _binds_first(segment, name, parts)]
+        bound = binders.get(name, [])
         if len(bound) != 1:
             unsettled.add(name)
             continue
         index = bound[0]
         before, after = separators[index]
-        # The segments after the binding where the name may not hold its value
-        unsure = segments[_loop_end(segments, index, parts) :]
+        first, last = first_use.get(name, len(segments)), last_use.get(name, -1)
         if (
             before not in SETTLING_SEPARATORS
             or after in SUBSHELL_SEPARATORS
-            or any(name in _names_used(segment, parts) for segment in segments[: index + 1])
-            or any(name in _names_used(segment, parts) for segment in unsure)
+            or first <= index
+            or last >= _loop_end(segments, index, parts)
         ):
             unsettled.add(name)
     return unsettled
