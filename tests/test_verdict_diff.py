@@ -53,6 +53,52 @@ def is_read_only(command):
     return True
 """
 
+# A hook with no opinion on anything, whose reason names the command's last word
+NAMING_HOOK = """
+class NotReadOnly(Exception):
+    pass
+
+
+class NoOpinion(NotReadOnly):
+    pass
+
+
+def _classify(command, depth=0):
+    raise NoOpinion("reads " + command.split()[-1])
+
+
+def is_read_only(command):
+    try:
+        _classify(command)
+    except NotReadOnly:
+        return False
+    return True
+"""
+
+# Tests that ask about a path in 2 temporary directories, one past a directory's name, one in
+# the checkout, and one that names no directory. `CHECKOUT` becomes the checkout's path
+PATH_CASES = """
+import importlib.util
+import os
+import tempfile
+import unittest
+
+spec = importlib.util.spec_from_file_location("hook", os.environ["SH_AUTO_APPROVE_HOOK"])
+hook = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hook)
+
+
+class Cases(unittest.TestCase):
+    def test_paths(self):
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_home_") as directory:
+            hook.is_read_only(f"cat {directory}/x")
+            hook.is_read_only(f"cat {directory}x")
+        with tempfile.TemporaryDirectory() as directory:
+            hook.is_read_only(f"cat {directory}/x")
+        hook.is_read_only("cat CHECKOUT/x")
+        hook.is_read_only("cat AGENTS.md")
+"""
+
 SCRATCH = "/tmp/claude-1000/-home-dir1-dir2/00000000-0000-4000-8000-000000000000/scratchpad"
 FIRST = "sed -i 's/a/b/' AGENTS.md"
 SECOND = "sed -n '1e touch PWNED' AGENTS.md"
@@ -149,6 +195,47 @@ class ListsChangedVerdicts(unittest.TestCase):
         control = run_tool("--base=HEAD", "--tests", str(CASES))
         self.assertEqual(control.returncode, 0, control.stderr)
         self.assertRegex(control.stdout, r"\b[0-9]+ of 8 verdicts changed\n\Z")
+
+
+class PrintsNoPathOfTheRun(unittest.TestCase):
+    """#85: a temporary directory the run made prints as `<tmp>`, and the checkout as
+    `<project>`, so that 2 runs print the same lines, which a public pull request can carry."""
+
+    def setUp(self):
+        self.scratch = Path(tempfile.mkdtemp(prefix="verdict_diff_"))
+        self.addCleanup(shutil.rmtree, self.scratch)
+        (self.scratch / "approving.py").write_text(APPROVING_HOOK)
+        (self.scratch / "naming.py").write_text(NAMING_HOOK)
+        (self.scratch / "path_cases.py").write_text(PATH_CASES.replace("CHECKOUT", str(ROOT)))
+
+    def run_paths(self) -> list[str]:
+        result = run_tool(
+            "--before",
+            str(self.scratch / "approving.py"),
+            "--after",
+            str(self.scratch / "naming.py"),
+            "--tests",
+            str(self.scratch / "path_cases.py"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.splitlines()
+
+    def test_each_path_prints_as_its_placeholder(self):
+        """The 2 temporary directories read the same, so their commands are one line. A name
+        that runs on past a directory's is another file, and keeps its path."""
+        tmp, past, checkout, plain, count = self.run_paths()
+        self.assertEqual(tmp, "allow\tno-opinion\treads <tmp>/x\tcat <tmp>/x")
+        self.assertRegex(past, r"\Aallow\tno-opinion\treads /\S+x\tcat /\S+x\Z")
+        self.assertNotIn("<tmp>", past)
+        self.assertEqual(checkout, "allow\tno-opinion\treads <project>/x\tcat <project>/x")
+        self.assertEqual(plain, "allow\tno-opinion\treads AGENTS.md\tcat AGENTS.md")
+        self.assertEqual(count, "4 of 4 verdicts changed")
+
+    def test_two_runs_print_the_same_lines(self):
+        """But for the one past a directory's name, whose path is the run's own."""
+        first, second = self.run_paths(), self.run_paths()
+        self.assertNotEqual(first[1], second[1], "the control: each run names its own")
+        self.assertEqual(first[:1] + first[2:], second[:1] + second[2:])
 
 
 if __name__ == "__main__":
