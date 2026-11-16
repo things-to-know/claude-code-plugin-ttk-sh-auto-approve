@@ -2100,8 +2100,9 @@ def _unsettled_names(
       `||` or a pipe
     - runs in the shell itself, `SUBSHELL_SEPARATORS`: not in a pipeline, nor behind `&`, by
       the separator after its segment, or after the `done` of the loop it opens
-    - is no `for` whose list may hold no word, which then runs no turn: one with a wildcard,
-      which bash's `nullglob` and zsh's `null_glob` drop where it matches nothing
+    - is no `for` whose list may hold no word, which then runs no turn: one with a word the
+      shell builds, `_word_the_shell_builds`, such as a wildcard, which bash's `nullglob` and
+      zsh's `null_glob` drop where it matches nothing, or a `$(ls)` of an empty directory
 
     ``separators`` holds the separator before and after each segment, `_segment_separators`.
     """
@@ -2136,7 +2137,7 @@ def _unsettled_names(
             or separators[end][1] in SUBSHELL_SEPARATORS
             or (
                 header[0] in WORD_LIST_HEADS
-                and any(_has_wildcard(PLACEHOLDER.sub("", word)) for word in header[3:])
+                and any(_word_the_shell_builds(word, parts) for word in header[3:])
             )
         ):
             unsettled.add(name)

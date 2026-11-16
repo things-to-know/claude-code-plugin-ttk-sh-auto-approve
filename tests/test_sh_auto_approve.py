@@ -5482,6 +5482,8 @@ class ReadsAValueOnlyWhereTheShellHoldsIt(Verdicts, unittest.TestCase):
                 "for d in src; do true; done & cat $d/lib/x.txt",
                 "if false; then true; for d in src; do true; done; fi; cat $d/lib/x.txt",
                 "for x in sr*; do\nfor d in src; do true; done\ndone; cat $d/lib/x.txt",
+                # A list of words the shell builds may hold none, with no shell option
+                "for d in $(ls nothing); do true; done; cat $d/lib/x.txt",
                 # zsh's short `for` has no `done`: the one here closes the loop around it
                 "for x in a; do\nfor d in sr*; true; cat $d/lib/x.txt; done",
             ):
