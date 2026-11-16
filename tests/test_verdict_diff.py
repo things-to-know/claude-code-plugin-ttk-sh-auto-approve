@@ -75,8 +75,9 @@ def is_read_only(command):
     return True
 """
 
-# Tests that ask about a path in 2 temporary directories, one past a directory's name, one in
-# the checkout, and one that names no directory. `CHECKOUT` becomes the checkout's path
+# Tests that ask about a path in 2 temporary directories, one past a directory's name, one
+# through a directory's own name, one in the checkout, and one that names no directory.
+# `CHECKOUT` becomes the checkout's path, as a Python literal
 PATH_CASES = """
 import importlib.util
 import os
@@ -93,9 +94,10 @@ class Cases(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="readonly_hook_home_") as directory:
             hook.is_read_only(f"cat {directory}/x")
             hook.is_read_only(f"cat {directory}x")
+            hook.is_read_only(f"cat d/{os.path.basename(directory)}/x")
         with tempfile.TemporaryDirectory() as directory:
             hook.is_read_only(f"cat {directory}/x")
-        hook.is_read_only("cat CHECKOUT/x")
+        hook.is_read_only("cat " + CHECKOUT + "/x")
         hook.is_read_only("cat AGENTS.md")
 """
 
@@ -206,7 +208,7 @@ class PrintsNoPathOfTheRun(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.scratch)
         (self.scratch / "approving.py").write_text(APPROVING_HOOK)
         (self.scratch / "naming.py").write_text(NAMING_HOOK)
-        (self.scratch / "path_cases.py").write_text(PATH_CASES.replace("CHECKOUT", str(ROOT)))
+        (self.scratch / "path_cases.py").write_text(PATH_CASES.replace("CHECKOUT", repr(str(ROOT))))
 
     def run_paths(self) -> list[str]:
         result = run_tool(
@@ -222,14 +224,16 @@ class PrintsNoPathOfTheRun(unittest.TestCase):
 
     def test_each_path_prints_as_its_placeholder(self):
         """The 2 temporary directories read the same, so their commands are one line. A name
-        that runs on past a directory's is another file, and keeps its path."""
-        tmp, past, checkout, plain, count = self.run_paths()
+        that runs on past a directory's is another file, and keeps its path. A directory's own
+        name, below another directory, is `<tmp>` too."""
+        tmp, past, own, checkout, plain, count = self.run_paths()
         self.assertEqual(tmp, "allow\tno-opinion\treads <tmp>/x\tcat <tmp>/x")
         self.assertRegex(past, r"\Aallow\tno-opinion\treads /\S+x\tcat /\S+x\Z")
         self.assertNotIn("<tmp>", past)
+        self.assertEqual(own, "allow\tno-opinion\treads d/<tmp>/x\tcat d/<tmp>/x")
         self.assertEqual(checkout, "allow\tno-opinion\treads <project>/x\tcat <project>/x")
         self.assertEqual(plain, "allow\tno-opinion\treads AGENTS.md\tcat AGENTS.md")
-        self.assertEqual(count, "4 of 4 verdicts changed")
+        self.assertEqual(count, "5 of 5 verdicts changed")
 
     def test_two_runs_print_the_same_lines(self):
         """But for the one past a directory's name, whose path is the run's own."""

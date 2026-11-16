@@ -28,11 +28,12 @@ escaped as ``tools/explain.py --transcript`` prints them:
 A last line counts the commands. For a refactor, the count must be 0; for any other hook change,
 the lines are the change's effect, to list in its pull request.
 
-A path that differs from run to run, or that names this machine, prints as a placeholder: each
-temporary directory the run makes, through ``tempfile.mkdtemp``, which ``TemporaryDirectory``
-calls, as ``<tmp>``, and the checkout as ``<project>``. So 2 runs print the same verdict the
-same way, and the lines can go in a public pull request as they are. Lines that read the same
-then are listed once, and their commands counted once.
+Each temporary directory the run makes, through ``tempfile.mkdtemp``, which
+``TemporaryDirectory`` calls, prints as ``<tmp>``, whether a line spells it whole or by its own
+name, and the checkout as ``<project>``. So 2 runs print the same verdict the same way. Other
+paths print as they are: the home directory, ``tempfile.gettempdir()``, and a file
+``tempfile.mkstemp`` makes. Commands that then read the same are listed once for each change,
+with the first one's reason, and counted once.
 
 The earlier hook is ``--base``, a git revision whose ``plugin/scripts/sh_auto_approve.py`` is
 read, or ``--before``, a file.
@@ -65,7 +66,9 @@ HOOK_ENV = "SH_AUTO_APPROVE_HOOK"
 TEMPORARY = "<tmp>"
 CHECKOUT = "<project>"
 # A character that continues a file name: a path followed by one names another file
-NAME_CHARACTER = r"[\w.@%+=,-]"
+NAME_CHARACTER = r"[\w.@%+=,~#-]"
+# A character a file name holds before a directory's own name: one after it names another file
+NAME_PREFIX = r"[\w.@%+~#-]"
 
 # `-I` keeps this script's directory off `sys.path`
 sys.path.insert(0, str(TOOLS))
@@ -189,15 +192,27 @@ def recording_temporary_directories() -> Iterator[set[str]]:
 def placeholders(temporary: set[str]) -> Callable[[str], str]:
     """What writes each path in ``temporary`` as ``<tmp>``, and the checkout as ``<project>``.
 
-    The longest path is replaced first, so a directory made inside another is one placeholder,
-    and a path only where its last name ends: ``<tmp>x`` would be another file. ``ROOT`` is
-    resolved already.
+    The longest path is replaced first, so a directory made inside another temporary one is one
+    placeholder, and one made in the checkout is ``<project>/<tmp>``. A path is replaced only
+    where its last name ends: ``<tmp>x`` would be another file. A directory's own name, as a
+    path relative to where it was made spells it, is ``<tmp>`` too, where no name runs on
+    before it. ``ROOT`` is resolved already.
     """
-    names = dict.fromkeys(temporary, TEMPORARY)
-    names[str(ROOT)] = CHECKOUT
+    checkout = str(ROOT)
+    names = {
+        path: CHECKOUT + "/" + TEMPORARY if path.startswith(checkout + "/") else TEMPORARY
+        for path in temporary
+    }
+    names[checkout] = CHECKOUT
     paths = "|".join(map(re.escape, sorted(names, key=len, reverse=True)))
-    pattern = re.compile(f"(?:{paths})(?!{NAME_CHARACTER})")
-    return lambda text: pattern.sub(lambda match: names[match.group(0)], text)
+    # `mkdtemp` ends each name in random characters, so no other word reads as one
+    own = {Path(path).name for path in temporary} - {""}
+    alternatives = [f"(?:{paths})"]
+    if own:
+        bases = "|".join(map(re.escape, sorted(own, key=len, reverse=True)))
+        alternatives.append(f"(?<!{NAME_PREFIX})(?:{bases})")
+    pattern = re.compile(f"(?:{'|'.join(alternatives)})(?!{NAME_CHARACTER})")
+    return lambda text: pattern.sub(lambda match: names.get(match.group(0), TEMPORARY), text)
 
 
 def in_repository(path: Path) -> str:
