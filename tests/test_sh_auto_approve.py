@@ -62,7 +62,7 @@ from a command that prompted in a real session.
           RefusesDescriptorAndSocketRedirection, RefusesRedirectionAttachedToACompound,
           RefusesReadsOutsideTheWorkingDirectories, ResolvesThroughALinkTheCommandMakes,
           RefusesALinkARecursiveReadFollows, RefusesACredentialStoreAWildcardOrABaseReaches,
-          RefusesAScratchPathThroughALinkOut,
+          RefusesAWildcardThatMatchesALinkOut, RefusesAScratchPathThroughALinkOut,
           RefusesEgressThroughAnApprovedProgram
      9  Program identity, environment, and session state
           RefusesControlOfTheEnvironmentAndTheProgram, StripsTheWrapperTheHostStrips,
@@ -5237,8 +5237,8 @@ class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase
     one, so a word the shell expands into a credential store got past it (#43). Each is refused
     outright now, so no allow rule overturns it, beside a control approved under the same setup.
 
-    Not covered here: what a wildcard matches, such as `k*` in `cat k*/id_rsa` through the link
-    `k` to `~/.ssh`, which is #54.
+    What a wildcard matches, such as `k*` in `cat k*/id_rsa` through the link `k` to `~/.ssh`,
+    is `RefusesAWildcardThatMatchesALinkOut`'s.
     """
 
     def test_a_dot_dot_after_the_wildcard(self):
@@ -5406,6 +5406,135 @@ class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase
             ):
                 with self.subTest(command=command):
                     self.assert_refused_outright(command)
+
+
+class RefusesAWildcardThatMatchesALinkOut(Verdicts, unittest.TestCase):
+    """#54: neither layer read what a wildcard matches, so one that matched a link read wherever
+    it led. With `k -> ~/.ssh`, `cat k/id_rsa` was refused and `cat k*/id_rsa` approved, with no
+    rule. Each path a wildcard may match is now checked as a literal path is.
+
+    In `a_project_below_home`, with `src/lib2 -> ~/.ssh`, `o -> ~/a/b/outside`, which holds
+    `x.txt` and no store, and `m -> src/lib`, which stays in the project.
+    """
+
+    @contextlib.contextmanager
+    def _project(self):
+        with a_project_below_home() as project:
+            home = Path(os.environ["HOME"])
+            (project / "src" / "lib2").symlink_to(home / ".ssh")
+            outside = project.parent / "outside"
+            outside.mkdir()
+            (outside / "x.txt").write_text("one\n")
+            (project / "o").symlink_to(outside)
+            (project / "m").symlink_to("src/lib")
+            yield project, home
+
+    def test_a_match_in_a_credential_store(self):
+        """Layer B: refused outright, as `cat k/id_rsa` is."""
+        with self._project():
+            for refused, control in (
+                ("cat k*/id_rsa", "cat src*/lib/x.txt"),
+                ("cat [k]/id_rsa", "cat [s]rc/lib/x.txt"),
+                ("grep -r PRIVATE k*", "grep -r PRIVATE src*"),
+                ("cat src/*/id_rsa", "cat src/*/x.txt"),
+                ("cat src/lib*/id_rsa", "cat src/lib*/x.txt"),
+                ("cat K*/id_rsa", "cat M*/x.txt"),
+                ("cat ~/a/b/proj/k*/id_rsa", "cat ~/a/b/proj/m*/x.txt"),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_refused_outright(refused, "reads ~/.ssh through a link")
+                    self.assert_allowed(control, "matches no link out")
+            self.assert_refused_outright("cat k/id_rsa", "the literal path, as before")
+            with operator_rules(allow=["Bash(cat *)", "Bash(grep *)"]):
+                self.assert_allowed("cat o*/x.txt", "the control: the rule approves this")
+                self.assert_refused("cat k*/id_rsa", "the rule says yes")
+                self.assert_refused("grep -r PRIVATE k*", "the rule says yes")
+
+    def test_a_match_out_of_the_working_directories(self):
+        """Layer A: no store, so the read scope's question, and so the rule's, as `cat o/x.txt`
+        is."""
+        with self._project():
+            self.assert_allowed("cat m*/x.txt", "the control: m stays in the project")
+            self.assert_no_opinion("cat o/x.txt", "the literal path, as before")
+            for command in ("cat o*/x.txt", "cat [o]/x.txt", "wc -l */x.txt", "head -1 ?/x.txt"):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "reads ~/a/b/outside through o")
+                    with operator_rules(allow=["Bash(cat *)", "Bash(wc *)", "Bash(head *)"]):
+                        self.assert_allowed(command, "the rule approves it")
+
+    def test_in_the_scratchpad(self):
+        """The scratchpad is a read root as the project is."""
+        with self._project() as (_, home):
+            scratch = home / "scratch" / "scratchpad"
+            (scratch / "inner").mkdir(parents=True)
+            (scratch / "inner" / "x.txt").write_text("one\n")
+            (scratch / "in").symlink_to("inner")
+            (scratch / "k").symlink_to(home / ".ssh")
+            (scratch / "key").symlink_to(home / ".ssh" / "id_rsa")
+            with with_scratchpad_dir(str(scratch)):
+                for refused, control in (
+                    (f"cat {scratch}/k*/id_rsa", f"cat {scratch}/in*/x.txt"),
+                    (f"cat {scratch}/[k]/id_rsa", f"cat {scratch}/[i]n/x.txt"),
+                    (f"cat {scratch}/*", f"cat {scratch}/inner/*"),
+                    (f"grep -r PRIVATE {scratch}/k*", f"grep -r PRIVATE {scratch}/in*"),
+                ):
+                    with self.subTest(refused=refused):
+                        self.assert_refused_outright(refused, "reads ~/.ssh through k or key")
+                        self.assert_allowed(control, "in stays in the scratchpad")
+
+    def test_a_for_list(self):
+        """A `for` list's wildcard binds each match: Layer B reads the list word itself, and the
+        read scope each match that leads out of its directory."""
+        with self._project():
+            self.assert_allowed('for f in src*/lib/x.txt; do cat "$f"; done', "the control")
+            self.assert_refused_outright('for f in k*/id_rsa; do cat "$f"; done', "~/.ssh")
+            self.assert_allowed('for f in m*; do cat "$f"/x.txt; done', "the control")
+            self.assert_no_opinion('for f in o; do cat "$f"/x.txt; done', "the literal word")
+            self.assert_no_opinion('for f in o*; do cat "$f"/x.txt; done', "o leads out")
+            self.assert_allowed('for f in *.md; do wc -l "$f"; done', "the control")
+
+    def test_a_wildcard_at_any_depth(self):
+        """bash reads `**` as `*`, unless `globstar` makes it any depth of directories, as zsh's
+        `**/` is. Neither descends into a link, though both match one by its name. zsh's `***`
+        follows links as it recurses, so it is read as a recursive read of its directory. Here
+        `a/b/d1/k2 -> ~/.ssh` is three levels down, and `e/f` holds no link."""
+        with self._project() as (project, home):
+            (project / "a" / "b" / "d1").mkdir(parents=True)
+            (project / "a" / "b" / "d1" / "x.txt").write_text("one\n")
+            (project / "a" / "b" / "d1" / "k2").symlink_to(home / ".ssh")
+            (project / "e" / "f").mkdir(parents=True)
+            (project / "e" / "f" / "x.txt").write_text("one\n")
+            self.assert_allowed("cat a/**/x.txt", "the control: a/b/d1/x.txt")
+            self.assert_allowed("cat a/**/id_rsa", "the control: neither descends into k2")
+            self.assert_allowed("cat e/***/x.txt", "the control: e holds no link")
+            for command in (
+                "cat **/id_rsa",  # as `*/id_rsa`: k/id_rsa
+                "cat src/**/id_rsa",  # as `src/*/id_rsa`: src/lib2/id_rsa
+                "cat a/**/k2/id_rsa",  # any depth: a/b/d1/k2/id_rsa
+                "cat a/***/id_rsa",  # zsh's `***`: through a/b/d1/k2
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through a link")
+            self.assert_no_opinion("cat **/x.txt", "as `*/x.txt`: o/x.txt")
+
+    def test_a_link_the_command_makes(self):
+        """#79's links count: `j` isn't there when the hook runs."""
+        with self._project(), operator_rules(allow=["Bash(ln *)"]):
+            self.assert_allowed("ln -s src j && cat j*/lib/x.txt", "the control: j is src")
+            self.assert_refused_outright("ln -s ~ j && cat j*/.ssh/id_rsa", "j is ~")
+
+    def test_past_the_walk_budget(self):
+        """A match it didn't reach could be a link anywhere, and a rule would approve the read."""
+        with (
+            self._project() as (project, _),
+            unittest.mock.patch.object(hook, "MAX_WALKED_ENTRIES", 2),
+        ):
+            (project / "d").mkdir()
+            for name in ("1.txt", "2.txt", "3.txt"):
+                (project / "d" / name).write_text("one\n")
+            self.assert_allowed("cat d/1*", "the control: one match, in the project")
+            self.assert_refused_outright("cat d/*", "three matches")
+            self.assert_refused_outright("cat **/1.txt", "four directories")
 
 
 class RefusesAScratchPathThroughALinkOut(Verdicts, unittest.TestCase):

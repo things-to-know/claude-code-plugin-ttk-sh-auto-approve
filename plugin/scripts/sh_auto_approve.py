@@ -1603,6 +1603,48 @@ def _literal_loop_values(
     return values
 
 
+def _with_wildcard_matches(
+    loop_values: dict[str, list[str]],
+    segments: list[list[str]],
+    parts: list[tuple[str, str]],
+    bases: list[str],
+) -> dict[str, list[str]]:
+    """``loop_values``, with each path a wildcard in a list matches that leads out of its directory.
+
+    `_literal_loop_values` reads a wildcard as a name inside its literal directory,
+    `PATH_COMPONENT`, which places each match that leads nowhere else. A match can be a link out
+    of that directory: `for f in o*` binds `o`, which may lead out of the project (#54). Each such
+    match, and for a wildcard matched at any depth each link below its directory, is a value too,
+    from each of ``bases``, for the read scope to measure.
+    """
+    values = {name: list(shapes) for name, shapes in loop_values.items()}
+    for segment in segments:
+        if len(segment) < 3 or segment[0] not in WORD_LIST_HEADS or segment[2] != "in":
+            continue
+        name = _expand(segment[1], parts)
+        if name not in values:
+            continue
+        for token in segment[3:]:
+            if not _carries_live_glob(token):
+                continue
+            pattern = _expand(token, parts)
+            head = PATH_SPECIAL.split(pattern, 1)[0]
+            directory = head.rpartition("/")[0]
+            for base in bases:
+                if UNREAD_VALUE in base:
+                    continue
+                literal = os.path.realpath(os.path.join(base, directory))
+                matches, links = _wildcard_reaches(pattern, [base])
+                for path in [*matches, *(link for link, _ in links)]:
+                    try:
+                        resolutions = _match_resolutions(path)
+                    except (OSError, ValueError):
+                        raise NotReadOnly(f"a path this module can't resolve: {path}") from None
+                    if not all(_is_under(resolved, literal) for resolved in resolutions):
+                        values[name].append(path)
+    return values
+
+
 # A parameter expansion in the unquoted part of a word: `$q`, `${q}`, `${=q}`, `${q:-x}`.
 UNQUOTED_EXPANSION = re.compile(r"\$\{?=?([A-Za-z_][A-Za-z0-9_]*)")
 
@@ -5149,14 +5191,16 @@ def _names_a_credential_unguarded(
 
     A relative path, or literal part, is resolved from each of `bases`, the directories the
     command can run in, and through any symbolic link, so a link inside the project that
-    points at `~/.ssh` is caught by its target. What a wildcard matches is not read: a
-    wildcard that matches such a link is not caught (#54). A value this module didn't read,
+    points at `~/.ssh` is caught by its target. A value this module didn't read,
     `UNREAD_VALUE`, in the word or as a base, is read by `_below_an_unread_value`.
 
     With `live_glob`, the shell expands a wildcard in the word, and a component that can
     match `..`, as `.*` does in a bash older than 5.2, is read as `..` too: `../.*/.ssh/x` can
     be `../../.ssh/x`. A `..` after the wildcard is refused before this, in
-    `_refuse_credential_paths`.
+    `_refuse_credential_paths`. And each path the wildcard may match is resolved as a literal
+    path is, `_wildcard_reaches`, so `k*/known_hosts` is caught by `k`'s target too (#54). In a
+    word with an unread value, the wildcard is matched once the value is in place, which this
+    module can't do: the residual `_followed_links` leaves too.
     """
     text = REDIRECTION_PREFIX.sub("", text)
     if "=" in text and not text.startswith(("/", "~", "$", UNREAD_VALUE)):
@@ -5185,20 +5229,38 @@ def _names_a_credential_unguarded(
     if any(_below_an_unread_value(spelled, live_glob=live_glob) for spelled in unread):
         return True
     # Below, an unread value is an expansion: the text in front of it is the literal part
+    has_unread_value = UNREAD_VALUE in text
     text = text.replace(UNREAD_VALUE, "$")
     bases = [base for base in bases if UNREAD_VALUE not in base]
     roots = _credential_roots()
     spellings = [text] if text.startswith("/") else [os.path.join(base, text) for base in bases]
 
+    # `_is_under` each root, as one test: a wildcard can match thousands of paths
+    exact = set(roots)
+    below = tuple(root.rstrip(os.sep) + os.sep for root in roots)
+
+    def names_a_store(absolute: str, resolve: Callable[[str], set[str]] = _resolutions) -> bool:
+        """Whether a literal path is in a credential store, where it is or where it leads."""
+        for candidate in {os.path.normpath(absolute), *resolve(absolute)}:
+            if PROCESS_SECRETS.match(candidate):
+                return True
+            if candidate in exact or candidate.startswith(below):
+                return True
+        return False
+
     special = PATH_SPECIAL.search(text)
     if special is None:
-        for absolute in spellings:
-            for candidate in {os.path.normpath(absolute), *_resolutions(absolute)}:
-                if PROCESS_SECRETS.match(candidate):
-                    return True
-                if any(_is_under(candidate, root) for root in roots):
-                    return True
-        return False
+        return any(names_a_store(absolute) for absolute in spellings)
+
+    if live_glob and not has_unread_value:
+        # What the wildcard matches, each as the literal path it is, and for one matched at any
+        # depth, each link below its directory as a reader that recurses through it reads one
+        matches, links = _wildcard_reaches(text, bases)
+        if any(names_a_store(match, _match_resolutions) for match in matches):
+            return True
+        stores = [os.path.realpath(store) for store in roots]
+        if any(_leads_to_a_store(target, stores) for _, target in links):
+            return True
 
     if live_glob:
         components = text.split("/")
@@ -5225,8 +5287,8 @@ def _names_a_credential_unguarded(
     if not text.startswith("/") and not relative_partial and relative_directory in ("", "."):
         # The wildcard or expansion reads the base itself, as `*` and `"$f"` do: the read
         # scope's question. No base is in a credential store, `_working_directories` sees to
-        # that, and a link in one that the wildcard matches is read by neither layer (#54); one
-        # a reader follows while it recurses is `_refuse_followed_credential_links`'
+        # that; a link in one that the wildcard matches is read above, and one a reader follows
+        # while it recurses is `_refuse_followed_credential_links`'
         return False
     for absolute in spellings:
         prefix = absolute[: len(absolute) - len(text) + special.start()]
@@ -5735,7 +5797,21 @@ def _read_scope_problem(
             # The directory the glob runs in: everything up to the last `/` before it, which is
             # `/` itself for `/u*/lib/x`, not the empty relative path
             head = PATH_SPECIAL.split(candidate, 1)[0]
-            candidate = (head.rsplit("/", 1)[0] or "/") if "/" in head else "."
+            directory = (head.rsplit("/", 1)[0] or "/") if "/" in head else "."
+            # Each path it matches, which can be a link out of that directory (#54), and for one
+            # matched at any depth, each link below it. A match that stays in the directory, by
+            # its path and where it leads, is in scope as the directory is, measured below.
+            literals = (
+                [directory]
+                if directory.startswith("/")
+                else [os.path.join(base, directory) for base in scope.bases]
+            )
+            inside = [(os.path.normpath(path), os.path.realpath(path)) for path in literals]
+            matches, links = _wildcard_reaches(candidate, scope.bases)
+            for path in [*matches, *(link for link, _ in links)]:
+                if not _stays_inside(path, inside) and not _in_scope(path, scope):
+                    return f"outside the working directories: {path}, which {candidate} matches"
+            candidate = directory
         absolutes = (
             [candidate]
             if candidate.startswith("/")
@@ -5745,6 +5821,23 @@ def _read_scope_problem(
             if not _in_scope(absolute, scope):
                 return f"outside the working directories: {candidate}"
     return None
+
+
+def _stays_inside(path: str, inside: list[tuple[str, str]]) -> bool:
+    """Whether ``path`` is below one of the directories ``inside`` holds, and leads below it.
+
+    Each is a directory's path and where it resolves: a path below both is in scope wherever
+    the directory is. One that can't be resolved stays nowhere.
+    """
+    normal = os.path.normpath(path)
+    try:
+        resolutions = _match_resolutions(path)
+    except (OSError, ValueError):
+        return False
+    return any(
+        _is_under(normal, text) and all(_is_under(resolved, real) for resolved in resolutions)
+        for text, real in inside
+    )
 
 
 # How each known reader takes its arguments.
@@ -6326,11 +6419,15 @@ def _followed_links(
 # the walk follows each link below it anyway.
 GLOB_FROM_ITS_DIRECTORY = re.compile(r"\*\*|\[\[\.|[()|#^<>]|(?<!^)~")
 
+# A `**` that is a whole component: zsh's `**/`, and bash's `**` with `globstar`. Each matches
+# any depth of directories, and neither descends into a link, though both match one by its name.
+GLOBSTAR_COMPONENT = re.compile(r"(?:(?<=/)|^)\*\*(?=/|$)")
+
 # How many bytes of UTF-8 a character can take: in the C locale, `?` and `[...]` match one byte
 MAX_CHARACTER_BYTES = 4
 
 
-def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
+def _glob_matches(pattern: str, bases: list[str], *, globstar: bool = False) -> list[str]:
     """Each path a wildcard the shell expands may match, from each of ``bases``: more, never fewer.
 
     Every reading a startup file can choose is taken at once, so that none is missed: dot files
@@ -6344,8 +6441,15 @@ def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
     A link an `ln` in the command makes is a name in its directory, as if it were there already,
     and a directory is listed wherever it may lead, `_resolutions`: `ln -s ~ j && ... j*` matches
     `j`, and `j*/.ssh` the store.
+
+    With ``globstar``, a `**` that is a whole component is matched rather than sent to its
+    directory: each directory below, at any depth, that no link leads to, and as the last
+    component each name below too, a link included, as `_below_without_links` lists them. And
+    as `*`, which bash without `globstar` reads it as: each name in the directory, a link that
+    the next component goes through included.
     """
-    if GLOB_FROM_ITS_DIRECTORY.search(pattern):
+    special = GLOBSTAR_COMPONENT.sub("", pattern) if globstar else pattern
+    if GLOB_FROM_ITS_DIRECTORY.search(special):
         head = PATH_SPECIAL.split(pattern, 1)[0]
         return [head.rsplit("/", 1)[0] or "/" if "/" in head else "."]
     components = [component for component in pattern.split("/") if component]
@@ -6357,6 +6461,20 @@ def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
             regex = _glob_component_regex(component)
             last = index == len(components) - 1
             found: list[str] = []
+            if component == "**":  # only with `globstar`: any other is sent to its directory
+                for directory in current:
+                    found += _below_without_links(directory, names=last, budget=len(matches))
+                    # Without `globstar`, bash reads it as `*`: each name, a link included
+                    for name in _entry_names(directory):
+                        path = os.path.join(directory, name)
+                        if last or _may_be_a_directory(path):
+                            found.append(path)
+                current = list(dict.fromkeys(found))
+                if len(current) + len(matches) > MAX_WALKED_ENTRIES:
+                    raise NotReadOnly(
+                        f"a wildcard that matches more than {MAX_WALKED_ENTRIES} names"
+                    )
+                continue
             for directory in current:
                 names = _entry_names(directory)
                 if regex is None:
@@ -6379,6 +6497,42 @@ def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
             current = found
         matches += current
     return matches
+
+
+def _below_without_links(directory: str, *, names: bool, budget: int) -> list[str]:
+    """``directory`` and each directory below it that the walk reaches through no link.
+
+    As a `**` matches them: neither shell descends into a link. With ``names``, each entry
+    below too, a link and a link an `ln` in the command makes included, as a last `**` matches
+    them. ``budget`` names are already matched: past `MAX_WALKED_ENTRIES`, `NotReadOnly`.
+    """
+    found = [directory]
+    stack = [directory]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as listing:
+                entries = [
+                    (os.path.join(current, entry.name), entry.is_dir(follow_symlinks=False))
+                    for entry in listing
+                ]
+        except (OSError, ValueError):
+            entries = []
+        if names and _PLANNED_LINKS:
+            listed = {path for path, _ in entries}
+            entries += [
+                (os.path.join(current, name), False)
+                for name in _entry_names(current)
+                if os.path.join(current, name) not in listed
+            ]
+        for path, is_directory in entries:
+            if is_directory:
+                stack.append(path)
+            if is_directory or names:
+                found.append(path)
+        if len(found) + budget > MAX_WALKED_ENTRIES:
+            raise NotReadOnly(f"a wildcard that matches more than {MAX_WALKED_ENTRIES} names")
+    return found
 
 
 def _entry_names(directory: str) -> list[str]:
@@ -6415,6 +6569,64 @@ def _may_be_a_directory(path: str) -> bool:
         return any(os.path.isdir(real) for real in _resolutions(path))
     except (OSError, ValueError):
         raise NotReadOnly(f"a path this module can't resolve: {path}") from None
+
+
+def _wildcard_reaches(pattern: str, bases: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """What a wildcard the shell expands names, for both layers to check (#54).
+
+    The paths it may match, `_glob_matches`, each to be checked as a literal path is: `k*` is
+    `k`, which may be a link to `~/.ssh`. A `**` is matched at every depth, `globstar`. For a
+    pattern `_glob_matches` still reads as its literal directory, as zsh's `***`, which follows
+    links as it recurses, or an `extglob` operator, a match can be a name at any depth below it,
+    through any link: each link below that directory and where it leads, as `_walk_for_links`
+    finds them, to be checked as a link a reader follows is. A base below a value this module
+    didn't read is skipped, the residual `_followed_links` leaves too.
+    """
+    matches = _glob_matches(pattern, bases, globstar=True)
+    if not GLOB_FROM_ITS_DIRECTORY.search(GLOBSTAR_COMPONENT.sub("", pattern)):
+        return matches, []
+    roots = [
+        os.path.join(base, directory) if base else directory
+        for directory in matches
+        for base in (bases if not directory.startswith("/") else [""])
+        if UNREAD_VALUE not in base
+    ]
+    return roots, _walk_for_links(roots, 0)
+
+
+# The directories `_match_resolutions` resolved for the command being classified: a wildcard's
+# matches are many names in few directories. Reset by `_classify`.
+_RESOLVED_DIRECTORIES: dict[str, str] = {}
+
+
+def _match_resolutions(path: str) -> set[str]:
+    """`_resolutions` of a path a wildcard matched, at the cost of one `lstat` for most.
+
+    Its directory is resolved once for every name in it, and the name itself only when it is a
+    link, or `.` or `..`, which `_glob_matches` matches as names. With a link an `ln` in the
+    command makes, `_resolutions` itself.
+    """
+    if _PLANNED_LINKS:
+        return _resolutions(path)
+    directory, name = os.path.split(path)
+    real = _RESOLVED_DIRECTORIES.get(directory)
+    if real is None:
+        real = _RESOLVED_DIRECTORIES[directory] = os.path.realpath(directory)
+    candidate = os.path.join(real, name)
+    if name in ("", ".", "..") or os.path.islink(candidate):
+        return {os.path.realpath(candidate)}
+    return {candidate}
+
+
+def _leads_to_a_store(target: str, stores: list[str]) -> bool:
+    """Whether a link that leads to ``target`` reaches a credential store when it is followed.
+
+    ``target`` is in one, or is a directory that holds one, as `~` does, which a reader that
+    recurses through the link reads. ``stores`` are `_credential_roots`, resolved.
+    """
+    return _names_a_credential(target, tilde=False, bases=[], live_glob=False) or any(
+        _is_under(store, target) for store in stores
+    )
 
 
 def _glob_component_regex(component: str) -> re.Pattern[str] | None:
@@ -6610,9 +6822,7 @@ def _refuse_followed_credential_links(
                 operands_elsewhere=elsewhere,
             )
             for link, target in links:
-                if _names_a_credential(target, tilde=False, bases=[], live_glob=False) or any(
-                    _is_under(store, target) for store in stores
-                ):
+                if _leads_to_a_store(target, stores):
                     raise NotReadOnly(
                         f"{program} follows the link {link} to a credential store: {target}"
                     )
@@ -7038,6 +7248,7 @@ def _classify(command: str, depth: int = 0) -> None:
     global _PLANNED_LINKS  # noqa: PLW0603 - per command, as `_SESSION_CWD` is per call
     _PLANNED_LINKS = {}
     _WALKS.clear()
+    _RESOLVED_DIRECTORIES.clear()
     try:
         for _ in range(MAX_LINK_PASSES):
             known = {key: set(targets) for key, targets in _PLANNED_LINKS.items()}
@@ -7048,6 +7259,7 @@ def _classify(command: str, depth: int = 0) -> None:
     finally:
         _PLANNED_LINKS = {}
         _WALKS.clear()
+        _RESOLVED_DIRECTORIES.clear()
 
 
 def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> None:
@@ -7215,7 +7427,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         roots=roots,
         bases=state.bases,
         splice_vars=splice_vars,
-        loop_values=loop_values,
+        loop_values=_with_wildcard_matches(loop_values, segments, parts, state.bases),
         spells_escape=bool(TERMINAL_CONTROL_SPELLED.search(command)),
         settings=settings,
         backgrounds=backgrounds,

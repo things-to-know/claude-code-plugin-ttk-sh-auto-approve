@@ -58,6 +58,14 @@ insists on its own filename, symlink to this file rather than copying it.
     - An operand below a value the hook didn't read isn't walked: the residual of `grep -r x "$d"`
     - A wildcard operand is matched every way a startup file can make the shell read it
       (`_glob_matches`); one it can't bound, such as `**`, is walked from its literal directory
+  - A wildcard the shell expands can match a link, as `k*` matches `k -> ~/.ssh`
+    - Both layers check each path it may match as a literal path (`_wildcard_reaches`), in any
+      word and in a `for` list
+    - A `**` is matched as `*`, and as any depth of directories reached through no link, as
+      `globstar` and zsh's `**/` match it; zsh's `***` and an `extglob` operator, which it can't
+      bound, are read as a recursive read of their literal directory
+    - Past `MAX_WALKED_ENTRIES` matches the command is refused outright, under any rule
+    - A wildcard after a value the hook didn't read isn't matched, as in `cat "$d"/*`
   - One approval makes a network call: a `curl` GET of one URL on a listed site
     - What leaves the machine is a URL Claude wrote, which a poisoned context can put a secret in
       - So the request goes to an exact listed host, with no userinfo, redirect, proxy or
