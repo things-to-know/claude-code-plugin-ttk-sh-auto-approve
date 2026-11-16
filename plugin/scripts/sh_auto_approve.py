@@ -123,6 +123,10 @@ from pathlib import Path
 from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import NoReturn
 
+# --------------------------------------------------------------------------------------
+# Limits, and where the module runs
+# --------------------------------------------------------------------------------------
+
 # Maximum command length inspected before defaulting to user prompt (matches host caution)
 HOST_COMMAND_LENGTH_CAP = 10_000
 
@@ -130,7 +134,39 @@ HOST_COMMAND_LENGTH_CAP = 10_000
 # if the hook were not installed: the shells and tools it models are the ones found here,
 # and an older interpreter is one nobody has run the tests on.
 MINIMUM_PYTHON = (3, 12)
+
 SUPPORTED_PLATFORMS = ("linux", "darwin")
+
+# --------------------------------------------------------------------------------------
+# Verdicts
+#
+# A verdict is an exception whose message is the reason `tools/explain.py` prints. Returning
+# from `_classify` without one is the approval.
+# --------------------------------------------------------------------------------------
+
+
+class NotReadOnly(Exception):  # noqa: N818 - a verdict, not an error
+    """Raised when any command component is not provably read-only."""
+
+
+class NoOpinion(NotReadOnly):
+    """Raised where the module has no reading of the command rather than a bad one.
+
+    The distinction is what bounds the second tier. An operator's allow rule may supply a
+    program this module has never heard of -- ``gh``, ``shellcheck``, a script in ``scripts/``
+    -- because there the module is admitting it cannot tell. It may not overrule a
+    validator that read the command and found a write: ``git diff --output=`` and
+    ``find . -delete`` stay refused whatever the rule file says, so a broad rule cannot
+    quietly cancel a finding.
+    """
+
+
+# --------------------------------------------------------------------------------------
+# The session, and the command being read
+#
+# The module's only state. `main` sets the session's names once per call, and `_classify` the
+# command's for each command it reads. The tests and `tools/` set them too, by these names.
+# --------------------------------------------------------------------------------------
 
 # The project the session works in:
 # - What a `cd` is measured against
@@ -145,301 +181,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # does not move.
 PROJECT_DIR_ENV = "CLAUDE_PROJECT_DIR"
 
-# Where the operator's own rules live, and the variable a test points somewhere else. An
-# empty value turns the second tier off, which is how the classifier is exercised alone.
-SETTINGS_ENV = "SH_AUTO_APPROVE_SETTINGS"
-SETTINGS_FILES = (".claude/settings.json", ".claude/settings.local.json")
-
-# A settings file larger than this is not one anyone wrote, and reading it costs the Bash call
-# it was supposed to approve. A hand-written one is a few KB, so the cap is some tens of times
-# that and still small enough to read on every call.
-SETTINGS_SIZE_CAP = 256 * 1024
-
-# Claude Code applies a project's settings file only in a session that loaded the file's setting
-# source, and only in a workspace it has a trust record for (`_sources_in_force`). The source of
-# each file, by the name `--setting-sources` gives it, and every source that flag names:
-SETTING_SOURCE_OF = {".claude/settings.json": "project", ".claude/settings.local.json": "local"}
-SETTING_SOURCES = frozenset({"user", "project", "local"})
-SETTING_SOURCES_FLAG = "--setting-sources"
-
-# Claude Code's process id, which it sets for the processes it starts. This hook is one, so its
-# parent process is Claude Code, whose command line holds `--setting-sources`.
-CLAUDE_PID_ENV = "CLAUDE_PID"
-
-# While the first is set, Claude Code counts no trust record; while the second is, it keeps its
-# global config, where the trust records are, in a file of another name
-IGNORE_TRUST_ENV = "CLAUDE_CODE_IGNORE_PERSISTED_TRUST"
-CUSTOM_OAUTH_ENV = "CLAUDE_CODE_CUSTOM_OAUTH_URL"
-
-# Claude Code's global config is `.claude.json` in this directory, or else in the home directory.
-# It grows with every project a session ran in: one with 30 projects is about 160 KB.
-CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
-GLOBAL_CONFIG_SIZE_CAP = 32 * 1024 * 1024
-
-# The `.git` file of a worktree, and the `commondir` and `gitdir` files git writes for one, hold a
-# single path, in which a control character is not one git wrote
-GIT_POINTER_SIZE_CAP = 4096
-GIT_POINTER_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-
-# How long `ps` may take to print Claude Code's command line on macOS, where there is no /proc
-PARENT_COMMAND_LINE_TIMEOUT = 5.0
-
-# Base programs that only ever read. Must be invoked by bare name (no slashes).
-READ_ONLY = {
-    "basename",
-    "cat",
-    "cmp",
-    "column",
-    "comm",
-    "cut",
-    "diff",
-    "dirname",
-    "du",
-    "echo",
-    "egrep",
-    "false",
-    "fgrep",
-    "grep",
-    "head",
-    "id",
-    "join",
-    "jq",
-    "ls",
-    "md5sum",
-    "nl",
-    "od",
-    "paste",
-    "printf",
-    "pwd",
-    "readlink",
-    "realpath",
-    "rev",
-    "shasum",
-    "sha1sum",
-    "sha256sum",
-    "stat",
-    "tac",
-    "tail",
-    "test",
-    "tr",
-    "true",
-    "uname",
-    "wc",
-    "which",
-    "whoami",
-}
-
-# Shell control structure keywords that can precede a simple command
-STRUCTURE = {
-    "do",
-    "done",
-    "elif",
-    "else",
-    "esac",
-    "fi",
-    "if",
-    "then",
-    "time",
-    "until",
-    "while",
-    "{",
-    "}",
-    "!",
-    "[[",
-    "]]",
-}
-
-# Head keywords that introduce a loop variable list
-WORD_LIST_HEADS = {"for"}
-
-# zsh 5.9's reserved words, as its `$reswords` lists them. After a `for` header's first name,
-# zsh ends the names at one and, under SHORT_LOOPS, on by default, starts the loop's body with
-# it: `for p time touch x` runs `time touch x` once for each positional parameter
-ZSH_RESERVED_WORDS = {
-    "!",
-    "[[",
-    "{",
-    "}",
-    "case",
-    "coproc",
-    "declare",
-    "do",
-    "done",
-    "elif",
-    "else",
-    "end",
-    "esac",
-    "export",
-    "fi",
-    "float",
-    "for",
-    "foreach",
-    "function",
-    "if",
-    "integer",
-    "local",
-    "nocorrect",
-    "readonly",
-    "repeat",
-    "select",
-    "then",
-    "time",
-    "typeset",
-    "until",
-    "while",
-}
-
-# Exactly recognized shell separators
-SEPARATORS = {";", "|", "&&", "||", "&", "|&", "\n"}
-
-# Shell punctuation characters handled by punctuation_chars=True
-PUNCTUATION_CHARS = set("();<>|&")
-
-# Stream redirections that safely discard or merge output streams without file creation
-SAFE_REDIRECTS = re.compile(
-    r"(?<![^\s;|&(])(?:[12]?>&[12]|&>\s*/dev/null|[12]?>\s*/dev/null|<\s*/dev/null)"
-    r"(?=[\s;|&)]|$)"
-)
-
-# Reading a file through `<` is a read. The target is left in the reduced command when it
-# is literal and is a placeholder when it is quoted; either way nothing is created. The
-# forms this must not swallow are `<<`, `<<<`, `<&` and `2<`, each of which fails the
-# character class or the lookbehind and stays punctuation for `_segments` to refuse.
-FILE_INPUT_REDIRECT = re.compile(r"(?<![^\s;|&(])<\s*([^\s;|&()<>]+)(?=[\s;|&)]|$)")
-
-# A socket the shell opens itself, with no program involved. `cat /dev/tcp/h/p` is egress
-# spelled as a read, so the path is refused wherever it appears rather than per-program.
-NETWORK_DEVICE = re.compile(r"/dev/(?:tcp|udp)/")
-
-# Output is not inert:
-# - A terminal acts on an escape sequence
-# - OSC 52 writes the clipboard
-# - OSC 8 turns any text into a link
-# - Some terminals report their title back as input
-# A raw ESC or C1 control byte has no business in a command, so it is refused anywhere.
-# Spelled out, `\033` is only text until `echo` or `printf` interprets it (zsh's `echo` does
-# without `-e`), so a spelling is refused in what either is given, and so is any value either
-# expands when the command spells one somewhere, since that value may be the escape.
-# Elsewhere it is left alone: `sed 's/\x1b\[[0-9;]*m//g'` is how a help page loses its colors.
-TERMINAL_CONTROL_BYTE = re.compile("[\x1b\x9b\x9d]")
-TERMINAL_CONTROL_SPELLED = re.compile(
-    r"\\(?:0{0,2}33|0{0,2}23[35]|x1[bB]|x9[bBdD]|[uU]0*(?:1[bB]|9[bBdD])|[eE])"
-)
-INTERPRETS_ESCAPES = ("echo", "printf")
-
-# Claude Code gives each session a scratch directory, tells the model to use it, and names it in
-# the hook payload as `scratchpad_dir`, from Claude Code 2.1.257 on. Writes that land inside it
-# are contained: the directory sits under the system temp directory, outside the project, and
-# is this session's alone, so no other session's scratchpad is in reach. Its files last as long
-# as the session's transcript. No setting names one instead: a directory named for every session
-# would be one they all share, where one session could rewrite a script another is about to run.
-# A path is in it only while it stays there once each link in it is resolved: a link in the
-# scratchpad may lead anywhere, such as one a `git worktree add` checks out
-# (`_resolves_into_scratch`).
-
-# One path component that is not `..`, spelled only in characters the shell passes through
-# untouched. Without the lookahead the trailing `(?:/COMPONENT)+` happily matches
-# `scratchpad/../../escape.txt`; without the character class it matches a quoted
-# `"../../x"` (a placeholder by now), a `$d` the shell fills in, and a `..*` the shell globs,
-# each of which lands wherever it likes.
-SCRATCH_COMPONENT = r"(?:/(?!\.\.?(?:/|$|[\s;|&)]))[A-Za-z0-9._@%+=,-]+)"
-# A `scratchpad_dir` the hook can match as the shell reads it: absolute and normalized, every
-# component spelled in `SCRATCH_COMPONENT`'s characters. One of any other shape gets no
-# scratchpad, since the shell would read the same text as another path: it ends the target of
-# `> /tmp/a b/scratchpad/x` at the space, and so writes `/tmp/a`.
-SCRATCH_DIRECTORY = re.compile(SCRATCH_COMPONENT + "+")
-
-# --------------------------------------------------------------------------------------
-# Read scope
-#
-# Reading is what this module approves, and under a poisoned prompt the read is the attack:
-# a credential printed to stdout lands in Claude's context, where the injected instruction
-# is waiting for it. Two layers keep a read where it belongs.
-#
-# Layer B refuses a short list of known credential stores wherever their path appears -- any
-# word of any command, before the operator tier is consulted -- because a program the module
-# cannot read can still be told to open one: `shellcheck ~/.aws/credentials` echoes the
-# lines it flags, `dig -f FILE` reads its queries from a file, and both pass on an operator
-# rule. It is a denylist and is fragile the way denylists are, so it is the backstop and not
-# the boundary.
-#
-# Layer A is the boundary, for the readers this module knows: a file operand must resolve
-# inside the project, an `additionalDirectories` entry of the project's settings files
-# (`_read_roots`), or this session's scratch directory. The same roots bound where `git -C`
-# may point, and the files a git read subcommand opens (`_git_file_operands`). Anything else,
-# and anything the module cannot resolve, is not this module's to approve and falls through
-# to the operator's own rules.
-# --------------------------------------------------------------------------------------
-
-# Relative to the home directory. Each is a directory or file whose contents are a secret or
-# hand one out: cloud and VCS credentials, key material, package-registry tokens, database
-# passwords, Claude Code's own credentials, and the shell histories that hold whatever was
-# typed on a command line.
-# TODO(decision): this hook only ever allows or stays silent, so refusing a credential read
-# here stops the hook from approving it -- it does not stop Claude Code. `cat` is in Claude
-# Code's built-in read-only set and runs without a prompt, and a native allow rule such as
-# `Bash(shellcheck *)` approves its program whatever path it is given. What blocks the read:
-#   * native `Read()` deny rules (evaluated even when a hook says allow), e.g. in
-#     ~/.claude/settings.json: ~/.aws/sso/cache, ~/.aws/cli/cache, ~/.ssh/**,
-#     ~/.config/gh, ~/.config/op, ~/.docker/config.json, ~/.terraform.d/credentials.tfrc.json,
-#     ~/.pgpass, ~/.git-credentials, ~/.claude/.credentials.json, ~/.zsh_history
-#   * narrowing broad native allow rules, such as `Bash(shellcheck *)`, `Bash(dig *)`,
-#     `Bash(git log *)` or `Bash(git diff *)`
-#   * or flipping this module's allow-or-silent invariant so layer B emits `deny`, which
-#     the tests currently forbid
-# TODO(option): read the operator's own `Read()` deny rules from all four settings files and
-# refuse any operand that matches them, instead of keeping a second list here.
-# TODO(verify): which programs Claude Code's native Read-deny matcher recognizes beyond the
-# documented cat/head/tail/sed/tee. Probe: deny `Read(~/deny-probe/**)`, place a junk file
-# there, and ask Claude to read it with jq, sort, diff, wc and grep.
-CREDENTIAL_HOME_PATHS = (
-    ".aws",
-    ".ssh",
-    ".gnupg",
-    ".kube",
-    ".azure",
-    ".docker/config.json",
-    ".config/gcloud",
-    ".config/gh",
-    ".config/op",
-    ".config/hub",
-    ".netrc",
-    ".git-credentials",
-    ".npmrc",
-    ".pypirc",
-    ".vault-token",
-    ".pgpass",
-    ".my.cnf",
-    ".terraform.d/credentials.tfrc.json",
-    ".claude/.credentials.json",
-    ".claude.json",
-    ".bash_history",
-    ".zsh_history",
-    ".psql_history",
-    ".mysql_history",
-    ".python_history",
-    ".node_repl_history",
-    ".lesshst",
-)
-
-# Absolute. `/root` is another user's home; the rest hold system credentials.
-CREDENTIAL_SYSTEM_PATHS = ("/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/root")
-
-# A process's environment and memory, or one of its threads'. `/proc/self/environ` is the hook's
-# own environment, which is where the session's tokens live.
-PROCESS_SECRETS = re.compile(
-    r"^/proc/(?:self|thread-self|\d+)/(?:task/\d+/)?(?:environ|mem|cmdline|auxv)\b"
-)
-
-# Paths that read nothing from disk.
-DEVICE_READS = frozenset({"/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr"})
-
-# A redirection operator glued to its target, as in `2>~/x` or `<~/x`.
-REDIRECTION_PREFIX = re.compile(r"^[0-9]*[<>&|]+")
-
-# Characters after which a path's final text is left for the shell to decide.
-PATH_SPECIAL = re.compile(r"[$*?\[{`]")
-
 # The working directory Claude Code reports in the hook payload. Set by `main()`; when it is
 # set, a relative operand must be in scope from there too.
 _SESSION_CWD: str | None = None
@@ -448,10 +189,14 @@ _SESSION_CWD: str | None = None
 # directory, and none is while it is unset. See `_scratch_directory`.
 _SCRATCHPAD_DIR: str | None = None
 
-# The symbolic and hard links an `ln` in the command being classified makes: where each will be,
-# with each parent directory resolved, mapped to the absolute paths it may lead to. Set by
-# `_classify` for each command, and read by `_resolutions`; see `_record_planned_links`.
-_PLANNED_LINKS: dict[str, set[str]] = {}
+# Claude Code applies a project's settings file only in a session that loaded the file's setting
+# source, and only in a workspace it has a trust record for (`_sources_in_force`). The source of
+# each file, by the name `--setting-sources` gives it, and every source that flag names:
+SETTING_SOURCE_OF = {".claude/settings.json": "project", ".claude/settings.local.json": "local"}
+
+SETTING_SOURCES = frozenset({"user", "project", "local"})
+
+SETTING_SOURCES_FLAG = "--setting-sources"
 
 # The setting sources the session loaded. `main()` sets it to None, so the first call that needs
 # it reads them from Claude Code's command line (`_session_setting_sources`). In process, as
@@ -459,97 +204,62 @@ _PLANNED_LINKS: dict[str, set[str]] = {}
 # `--setting-sources`.
 _SETTING_SOURCES: frozenset[str] | None = SETTING_SOURCES
 
-# Variable assignment matching
-ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
+# The symbolic and hard links an `ln` in the command being classified makes: where each will be,
+# with each parent directory resolved, mapped to the absolute paths it may lead to. Set by
+# `_classify` for each command, and read by `_resolutions`; see `_record_planned_links`.
+_PLANNED_LINKS: dict[str, set[str]] = {}
 
-# `${var@P}` expands its value as a prompt string, and prompt expansion performs command
-# substitution, so the payload need never contain `$(` itself. `${arr[@]}` is not this:
-# a transformation is an `@` followed by an operator letter, not by `]`.
-PARAMETER_TRANSFORM = re.compile(r"\$\{[^{}]*@[A-Za-z]")
+# The walks `_walk_for_links` made for the command being classified, by roots, depth and the
+# links the command makes: Layer B and Layer A each ask, and `_classify` may read a command more
+# than once. Reset by `_classify`.
+_WALKS: dict[tuple, list[tuple[str, str]]] = {}
 
-# `${name=value}` and `${name:=value}` assign as a side effect of being expanded, so a command
-# that only prints can still hand the next one a writing flag, or a new `PATH`.
-# The other `${name:X...}` operators substitute without assigning and must not match:
-# only `=`, optionally preceded by the `:` that also tests for empty, is an assignment.
-PARAMETER_ASSIGN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?:\[[^]{}]*\])?:?=")
 
-# Arithmetic evaluates a variable's *value* as an expression, and an array subscript in that
-# value runs the command substitution inside it: `x='a[$(touch PWNED)]'; echo $((x))` writes
-# in bash and in zsh. So every place the shell evaluates arithmetic on something the module
-# did not read is refused -- `$((...))` naming a variable (in `_skip_arithmetic`), `$[...]`,
-# a subscript or a `${name:offset}` that is not a literal integer, and `${!name}`, which
-# evaluates a subscript in the name it looks up. `[@]`, `[*]`, `[3]`, `${x:0:8}` and the
-# `${!arr[@]}` key listing evaluate nothing and stay approved.
-PARAM_NAME = r"(?:[A-Za-z_][A-Za-z0-9_]*|\d+|[@*#?$!-])"
-ARITHMETIC_BRACKET = re.compile(r"\$\[")
-SUBSCRIPT = re.compile(
-    r"\$\{[#+]?[A-Za-z_][A-Za-z0-9_]*\[(?!(?:[@*]|-?\d+)\])"
-    r"|\$[A-Za-z_][A-Za-z0-9_]*\[(?!(?:[@*]|-?\d+)\])"
-)
-SUBSTRING = re.compile(
-    r"\$\{#?" + PARAM_NAME + r"(?:\[(?:[@*]|-?\d+)\])?:"
-    r"(?![-=+?]|\s*-?\d+\s*(?::\s*-?\d+\s*)?\})"
-)
-INDIRECT = re.compile(r"\$\{!(?![A-Za-z_][A-Za-z0-9_]*(?:\[[@*]\]|[@*])\})")
+def _home() -> str:
+    """The home directory, read at call time so a test can point it elsewhere."""
+    return os.path.expanduser("~")
 
-# zsh is one of the 2 shells Claude Code runs these commands in (see the module docstring), and it
-# has expansions bash does not. `${(e)x}` re-expands the value -- command substitution included --
-# and any `${(...)` flag set is refused rather than read letter by letter. `${~x}` and `$~x`
-# turn the value into a glob, and a zsh glob qualifier `*(e:cmd:)` runs a command.
-ZSH_PARAMETER_FLAGS = re.compile(r"\$\{\s*\(")
-ZSH_GLOB_SUBST = re.compile(r"\$\{?~")
 
-# A `printf` conversion: `%%`, or a position (`%1$d`), flags, a width and a precision, each a
-# number or a `*` that takes it from an operand (`%*s`, `%.*f`, `%*2$d`), length modifiers, and
-# the conversion letter. zsh evaluates as arithmetic the operand of a numeric letter, and of
-# each `*`. No letter, at the end of the format, is read as unknown.
-PRINTF_CONVERSION = re.compile(
-    r"%(?:%|(\d+\$)?[-+ #0']*(\*(\d+\$)?|\d+)?(?:\.(\*(\d+\$)?|\d*))?[hlLjzt]*(.)?)", re.DOTALL
-)
-PRINTF_NUMERIC_LETTERS = frozenset("diouxXeEfFgGaA")
-PRINTF_TEXT_LETTERS = frozenset("sbqc")
+def _account_home() -> str | None:
+    """The home directory of the account the hook runs as, as curl finds it without ``HOME``.
 
-# A field wider than this is not alignment:
-# - `printf '%099999999d' 1` allocates 100 MB and prints them into Claude's context
-# - `find -printf` takes the same widths
-# A `*` takes the width from an argument, so a number above the cap is refused beside one.
-PRINTF_WIDTH_CAP = 1000
-PRINTF_WIDTH = re.compile(r"%[-+ #0']*(\d+)?(?:\.(\d+))?")
-PRINTF_STAR = re.compile(r"%[-+ #0']*\d*\.?\*")
-# A number spelled out, in the forms zsh's arithmetic reads as a constant: an integer, or a
-# decimal for `%e`, `%f` and `%g`. Anything else is an expression zsh evaluates, and a name, a
-# subscript or a `base#` prefix can run a command: `printf '%d' 'path[`cmd`1]'` runs `cmd`.
-PRINTF_NUMBER_ARGUMENT = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+    ``pwd`` is imported here rather than at the top: it exists on Linux and macOS only, and
+    elsewhere ``main`` returns before anything calls this.
+    """
+    try:
+        import pwd  # noqa: PLC0415 - see the docstring
 
-# Text that is parameter expansions and nothing else, so that the shell supplies all of it.
-# `$(` never survives the scan, so only the parameter forms are here.
-EXPANSION_ONLY = re.compile(r"(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[^{}]*\}|\$[0-9@*#?$!-])+")
+        return pwd.getpwuid(os.geteuid()).pw_dir
+    except (ImportError, KeyError, OSError):
+        return None
 
-# Bash opens a socket for a path under these, with no program involved. Only a redirection
-# reaches them, and a redirection is refused already -- but a word that names one has no reading
-# other than the one bash would give it.
-# TODO: `PSEUDO_DEVICE` and `NETWORK_DEVICE` are the same pattern from the two sides of a
-# merge. Keep `NETWORK_DEVICE`, whose check in `_classify` also sees redirect targets, and
-# drop this one with its loop in `_check_command`.
-PSEUDO_DEVICE = re.compile(r"/dev/(?:tcp|udp)/")
 
-# The Bash 5.3 substitution forms, which spell no `$(` of their own.
-BRACE_SUBSTITUTION = re.compile(r"\$\{\s*\||\$\{\s+[a-zA-Z0-9_]")
+# --------------------------------------------------------------------------------------
+# Shell grammar: quoting
+#
+# `_scan` resolves quoting before anything else reads the command. Every reader below takes a
+# word as a reduced token and the table of `parts` its placeholders index.
+# --------------------------------------------------------------------------------------
 
 # The scanner below rewrites every quoted span, escape and command substitution to a placeholder
 # of this shape, so that what reaches the lexer is unquoted shell syntax and nothing else.
 # `\x01` is not a character a command can contain: one that does is refused rather than rewritten,
 # so a placeholder can never be forged from the command text.
 PLACEHOLDER_MARK = "\x01"
+
 PLACEHOLDER = re.compile(r"\x01(\d+)\x01")
 
 # A part is inert text, text the shell will still expand, or a command to run. The middle
 # one exists because `"${x@P}"` is not a substitution the scanner can extract and is not
 # inert either: what is quoted there is the `"`, and the expansion inside it runs anyway.
 LITERAL = "literal"
+
 DOUBLE_QUOTED = "double-quoted"
+
 SUBSTITUTION = "substitution"
+
 PROCESS_SUBSTITUTION = "process-substitution"
+
 # An arithmetic expansion, which `_skip_arithmetic` lets through only when it names no variable
 # and expands nothing. It stands in as `0`, as a literal would, but is a kind of its own so that
 # a validator reading each word whole can tell that the shell computes this one: see
@@ -567,430 +277,6 @@ SUBSTITUTION_MARKER = "__substitution__"
 # `$( $( ... ) )` is legal and pointless. The cap bounds the recursion rather than
 # the nesting anyone writes.
 MAX_SUBSTITUTION_DEPTH = 4
-
-# Dangerous environment variables that must never be set (bare or prefix)
-DANGEROUS_ENV_VARS = {
-    "PATH",
-    "BASH_ENV",
-    "ENV",
-    "CDPATH",
-    "IFS",
-    "SHELLOPTS",
-    "BASHOPTS",
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "GIT_EXTERNAL_DIFF",
-    "GIT_CONFIG",
-    "GIT_EXEC_PATH",
-    "PYTHONPATH",
-    "PYTHONHOME",
-    "PERL5LIB",
-    "RUBYLIB",
-    "NODE_OPTIONS",
-    "AWS_CONFIG_FILE",
-    "CLOUDSDK_CONFIG",
-    # Where a later command in the same session sends its traffic, and what it will
-    # trust when it gets there. These are the ones normally spelled in lower case, and
-    # the membership test upper-cases the name, so both spellings are covered.
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "FTP_PROXY",
-    "NO_PROXY",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "CURL_CA_BUNDLE",
-    "REQUESTS_CA_BUNDLE",
-    "NODE_EXTRA_CA_CERTS",
-    # Where a later command looks for its configuration, and what runs before it
-    "HOME",
-    "TMPDIR",
-    "PROMPT_COMMAND",
-    "GLIBC_TUNABLES",
-    "GCONV_PATH",
-    "LOCPATH",
-    # Where zsh loads a module from, and it loads some on demand: expanding `$commands` loads
-    # `zsh/parameter`. zsh ties it to `module_path`, which the upper-casing covers
-    "MODULE_PATH",
-}
-
-# `aws` read operations pattern
-AWS_READ_OP = re.compile(r"^(?:describe|get|list|lookup|search|batch-get|help)\b|^help$")
-
-# `aws` global options that take an argument (to avoid positional shift)
-AWS_GLOBAL_OPTS_WITH_ARG = {
-    "--profile",
-    "--region",
-    "--output",
-    "--color",
-    "--query",
-    "--cli-read-timeout",
-    "--cli-connect-timeout",
-    "--user-agent",
-}
-
-# `aws` global options that decide where a signed request goes, what it will trust when it
-# arrives, or what the argument list even is. A read verb is still a read; the credential
-# it is read with is the operator's, and `--cli-input-json` replaces every other argument
-# from a file this module never opened, so the verb it checked is not the verb that runs.
-AWS_BLOCKED_OPTS = (
-    "--endpoint-url",
-    "--ca-bundle",
-    "--no-verify-ssl",
-    "--cli-input-json",
-    "--cli-input-yaml",
-)
-
-# Options blocked for one service
-AWS_BLOCKED_SERVICE_OPTS = {
-    "ssm": (
-        # Makes every `ssm get-parameter*` print a `SecureString` in plain text, and a Secrets
-        # Manager secret too (read through the reserved `/aws/reference/secretsmanager/` path).
-        # Without it, the same reads return ciphertext.
-        "--with-decryption",
-    )
-}
-
-# AWS operations that output files, mint credentials, or print a secret
-AWS_BLOCKED_OPS = {
-    "batch-get-secret-value",
-    "get-object",
-    "get-login-password",
-    "get-secret-value",
-    "get-session-token",
-}
-
-# Operations blocked for one service only, because the verb alone is the read everywhere else
-AWS_BLOCKED_SERVICE_OPS = {
-    # `aws configure get` prints a key from the credentials file.
-    # It also refuses the harmless `aws configure get region`, which costs a prompt.
-    ("configure", "get")
-}
-
-# `gcloud` verbs that strictly only read
-GCLOUD_READ_VERBS = {
-    "analyze-iam-policy",
-    "describe",
-    "get",
-    "get-ancestors",
-    "get-iam-policy",
-    "get-value",
-    "list",
-    "lookup",
-    "search-all-iam-policies",
-    "search-all-resources",
-    "test-iam-permissions",
-    "version",
-}
-
-# `gcloud` global flags that move where the call goes or who it goes as. A named
-# configuration can carry `api_endpoint_overrides`, so `--configuration` is an endpoint
-# flag spelled indirectly, and the credential flags run the read as somebody else.
-GCLOUD_BLOCKED_OPTS = (
-    "--configuration",
-    "--account",
-    "--impersonate-service-account",
-    "--access-token-file",
-    "--credential-file-override",
-    "--billing-project",
-)
-
-# `gcloud` mutating, executing, or credential verbs that must be refused
-GCLOUD_BLOCKED_VERBS = {
-    "add",
-    "add-iam-policy-binding",
-    "attach-disk",
-    "auth",
-    "call",
-    "copy-files",
-    "cp",
-    "create",
-    "delete",
-    "deploy",
-    "detach-disk",
-    "disable",
-    "enable",
-    "grant",
-    "import",
-    "invoke",
-    "login",
-    "move",
-    "patch",
-    "print-access-token",
-    "publish",
-    "remove",
-    "remove-iam-policy-binding",
-    "reset",
-    "restart",
-    "restore",
-    "resume",
-    "revoke",
-    "rm",
-    "run",
-    "scp",
-    "set",
-    "set-iam-policy",
-    "ssh",
-    "start",
-    "stop",
-    "submit",
-    "suspend",
-    "sync",
-    "terminate",
-    "undelete",
-    "update",
-    "upload",
-}
-
-# An `awk` string literal, which is the one place in a program where `>` and `|` are only
-# characters. Taken out before either rule below reads the program.
-JQ_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
-AWK_STRING = re.compile(r'"(?:\\.|[^"\\])*"')
-
-# A `print` or `printf` statement is the only thing in `awk` that can redirect to a file or
-# pipe to a shell, and a statement ends at `;`, `{` or `}`. `||` is the logical or, which
-# is how a line selector is spelled; `|&` is `gawk`'s coprocess, which is not.
-AWK_OUTPUT = re.compile(r"\b(?:print|printf)\b[^;{}]*(?:>|(?<!\|)\|(?!\|))")
-
-# `gawk`'s `@include` and `@load` are `--include` and `--load` written inside the program,
-# where the flag table cannot see them: one pulls in another program file, the other a
-# shared object. Neither is a flag, so neither is refused by refusing the flags.
-AWK_EXTENSION = re.compile(r"@\s*(?:include|load|namespace)\b")
-
-# `sed` script commands that can neither write a file nor run a program. `w`, `W`, `r`,
-# `R`, `e`, `F` and `v` are left out on purpose, and so are the branch commands `b`, `t`,
-# `T`, `:` and the `{` `}` group, whose labels would need a parser of their own to read.
-SED_SAFE_COMMANDS = set("=DGHNPQdghlnpqsxyz")
-
-# Git options that write a file or run a program: `--ext-diff`, `--textconv` and `--filters`
-# run whatever the repository's own config or `.gitattributes` names, and
-# `--open-files-in-pager` runs the program it is given. The `--no-` spellings are the safe
-# ones and match none of these.
-GIT_EXECUTION_OPTS = (
-    "--output",
-    "--exec-path",
-    "--open-files-in-pager",
-    "--ext-diff",
-    "--textconv",
-    "--filters",
-    "--upload-pack",
-    "--receive-pack",
-)
-
-# Git options that point it at a repository whose config this module never read
-GIT_LOCATION_OPTS = ("--git-dir", "--work-tree", "--namespace")
-
-# Global options that take a value, which hides the subcommand git runs when the value is the
-# next word (see `GIT_GLOBAL_FLAGS`): `--attr-source` (git 2.41 and later), `--shallow-file`, and
-# `--super-prefix` (git 2.39 and earlier)
-GIT_VALUE_GLOBAL_OPTS = ("--attr-source", "--shallow-file", "--super-prefix")
-
-# The global options, before the subcommand, that `_git_global_options` walks past besides
-# `-C <dir>`. None takes a value, and git matches each exactly (`handle_options` in `git.c`
-# compares with `strcmp`), so this set is matched exactly too.
-# - An allowlist, because a global option that takes the next word as its value makes that word
-#   look like the subcommand: `git --attr-source log clean -fdx` reads as `git log`, and git runs
-#   `git clean -fdx`. `GIT_VALUE_GLOBAL_OPTS` lists the ones known, and git can add another
-# - Left out:
-#   - `--bare`, which makes the current directory the repository: `--git-dir=.`
-#   - `--help` and `-h`, which end the options, and git runs `help` in their place:
-#     `git --help log` is `git help log`, which starts a man viewer
-#   - `--version` and `-v`, which end the options too: see `GIT_VERSION_FLAGS`
-GIT_GLOBAL_FLAGS = frozenset(
-    {"-p", "--paginate", "-P", "--no-pager"}
-    | {"--no-replace-objects", "--no-lazy-fetch", "--no-optional-locks", "--no-advice"}
-    | {"--literal-pathspecs", "--no-literal-pathspecs", "--glob-pathspecs"}
-    | {"--noglob-pathspecs", "--icase-pathspecs"}
-)
-
-# Global options that end git's options, where git runs `git version` in their place and hands
-# it the words after them: `git --version clean -fdx` fails with `unknown switch 'f'`
-GIT_VERSION_FLAGS = frozenset({"--version", "-v"})
-
-# Exact options that are also a prefix of one in `GIT_EXECUTION_OPTS`, which git reads as
-# themselves: `git grep --text` and `git diff --text` treat binary files as text.
-GIT_EXACT_SAFE_OPTS = frozenset({"--text"})
-
-# Git subcommands that read repository state, and `version`, which prints git's own
-GIT_READ_SUBCOMMANDS = {
-    "blame",
-    "cat-file",
-    "check-ignore",
-    "describe",
-    "diff",
-    "grep",
-    "log",
-    "ls-files",
-    "ls-tree",
-    "merge-base",
-    "range-diff",
-    "rev-list",
-    "rev-parse",
-    "shortlog",
-    "show",
-    "show-ref",
-    "status",
-    "tag",
-    "version",
-    "worktree",
-}
-
-# The options of git's read subcommands that open the file they are given, and what each
-# prints of it: `blame --contents` the file, `blame -S` each line, as bad graft data, `blame
-# --ignore-revs-file` its first line, as an invalid object name, and `grep -f` the first line
-# that is not a valid pattern. `ls-files -X` prints none of it, and neither does `-O`, the order
-# file of the subcommands that write a diff, which a FIFO hangs. For each subcommand:
-# - `long`: the long options, whose value is attached after `=` or is the next word. git takes
-#   an unambiguous prefix of one as that option (`blame --cont`)
-# - `exact`: long options that are a prefix of one in `long`, which git reads as themselves:
-#   `ls-files --exclude <pattern>`
-# - `short`: the letter of the short option, whose value is the rest of the word
-#   (`blame -wS<file>`) or the next word
-# - `values`: the letters before which a `short` in the same word is a value, not an option:
-#   each takes the rest of the word as its own value (`grep -e<pattern>`)
-# - `names`: long options whose value is a file name, which git joins to each directory it
-#   reads, from the top of the working tree: `ls-files --exclude-per-directory=.gitignore`
-# `diff` opens every operand too, which `_git_file_operands` reads.
-# `ls-files --exclude-per-directory=../../x` reads `x` two levels above each directory, so a
-# `names` value must be a plain file name: `GIT_FILE_NAME`.
-# The order file has no long option, and git takes it only attached to its letter.
-# `_check_git` refuses a word that starts with `-O`, as `grep`'s runs a program, so here it is
-# read bundled after another letter: `git log -pO<file>`. `-G`, `-I`, `-S` and `-l` take the rest
-# of the word, so an `O` after them is part of their value; git stops on most other letters
-# before it reads the file, which costs this table no more than a prompt.
-# `_check_git` reads `grep`'s `short` and `values` too, to find its `-O` in a bundle, so a letter
-# there that takes nothing would hide an `O` after it: `grep -nO<cmd>` runs `<cmd>`.
-# Checked against git 2.48.1 (`builtin/blame.c`, `builtin/grep.c`, `builtin/ls-files.c`), and
-# the order file by running each subcommand with a FIFO as the file.
-GIT_ORDER_FILE = {"short": "O", "values": "GISl"}
-GIT_FILE_OPTIONS = {
-    "blame": {
-        "long": frozenset({"--contents", "--ignore-revs-file"}),
-        "exact": frozenset({"--ignore-rev"}),
-        "short": "S",
-        "values": "LMC",
-    },
-    "grep": {"short": "f", "values": "eABCmO"},
-    "ls-files": {
-        "long": frozenset({"--exclude-from"}),
-        "exact": frozenset({"--exclude"}),
-        "short": "X",
-        "values": "x",
-        "names": frozenset({"--exclude-per-directory"}),
-    },
-    "diff": GIT_ORDER_FILE,
-    "log": GIT_ORDER_FILE,
-    "range-diff": GIT_ORDER_FILE,
-    "show": GIT_ORDER_FILE,
-    "stash": GIT_ORDER_FILE,
-}
-
-# A file name with no directory in it, in characters the shell passes through untouched. `.`
-# and `..` match, and name a directory, which git cannot read as a file.
-GIT_FILE_NAME = re.compile(r"[A-Za-z0-9._-]+")
-
-# `diff`'s short options that take the rest of their word as their value. A letter after one of
-# these is that one's value, so the next word is an operand again: `-IS <path>`.
-# `GIT_DIFF_NEXT_WORD_VALUES`: those that take the next word when nothing is left, which git
-# never opens: the string or the regex `-S` and `-G` search the changes for, and the regex of
-# lines `-I` ignores. Checked against git 2.48.1, with a file outside the repository as the next
-# word, after each letter. Left out:
-# - `-O`, whose value git takes only attached
-# - `-l`, whose rename limit git 2.48.1 takes from the next word too, but which before git 2.22
-#   took it only attached, so the next word was an operand: from git's history, not run
-# The long options whose next word git never opens are `GIT_REVISION_VALUES`.
-GIT_DIFF_VALUE_LETTERS = frozenset({"-G", "-I", "-O", "-S", "-l"})
-GIT_DIFF_NEXT_WORD_VALUES = GIT_DIFF_VALUE_LETTERS - {"-O", "-l"}
-
-# `git branch` lists unless it is handed a name, which creates a branch, or a flag that
-# deletes, moves, copies, or sets an upstream. So only the listing flags are read, and
-# a name only beside a flag that forces list mode, where it is a pattern or a commit.
-# `-l` is left out: before git 2.19 it was `--create-reflog`, so `git branch -l x` created x.
-GIT_BRANCH_BARE_FLAGS = frozenset(
-    {"--all", "--remotes", "--verbose", "--quiet", "--ignore-case", "--list"}
-    | {"--show-current", "--omit-empty", "--no-abbrev", "--no-color", "--no-column"}
-)
-GIT_BRANCH_BARE_SHORTS = frozenset("arvqi")
-# Optional values git reads only when attached: `--abbrev 7` makes 7 a branch name.
-GIT_BRANCH_ATTACHED_ONLY = frozenset({"--abbrev", "--color", "--column"})
-GIT_BRANCH_VALUE_FLAGS = frozenset({"--sort", "--format", "--points-at"})
-GIT_BRANCH_LIST_MODE = frozenset(
-    {"--list", "--points-at", "--contains", "--no-contains", "--merged", "--no-merged"}
-)
-
-# `git tag` likewise: it creates a tag from a name unless one of these flags, anywhere in the
-# command, puts it in list mode, where every operand is a pattern, and the word after a flag
-# that takes a commit is that commit or a pattern. So does a short flag with `l` or `n` in it,
-# `GIT_TAG_SHORTS`. Every other flag is refused: the ones that create (`-a`, `-m`, `-e` and the
-# rest), `-d`, and `-v`, which verifies. Checked against git 2.48.1, `git tag v9 --contains HEAD`
-# included, which creates nothing.
-# Not stopped here: a `--format` with a `%(signature)` atom runs the program `gpg.program` names,
-# as `git branch --format` and `git log --show-signature` do. A repository config that names a
-# program is #104's.
-# A set of its own, not `GIT_BRANCH_LIST_MODE`: a flag added there for `git branch` would make
-# every operand of `git tag` a pattern, though git may read that flag otherwise in `git tag`.
-GIT_TAG_LIST_MODE = frozenset(
-    {"--list", "--points-at", "--contains", "--no-contains", "--merged", "--no-merged"}
-)
-GIT_TAG_BARE_FLAGS = frozenset({"--ignore-case", "--no-column", "--no-color", "--omit-empty"})
-# Optional values git reads only when attached: `git tag --column v9` creates `v9`
-GIT_TAG_ATTACHED_ONLY = frozenset({"--column", "--color"})
-GIT_TAG_VALUE_FLAGS = frozenset({"--sort", "--format"})
-# `-i`, `-l` and `-n` alone or bundled, as `-ln5`: `-n` takes a number only attached, so it ends
-# the bundle, and git stops at its usage message on `-nl`
-GIT_TAG_SHORTS = re.compile(r"-(?:[il]+(?:n[0-9]*)?|n[0-9]*)")
-
-# `git ls-remote` flags that only shape what is printed. `--sort` is read too, attached only,
-# as `--sort=<key>`. Left out on purpose:
-# - `--upload-pack` (`-u`), which names a program to run
-# - `--server-option` (`-o`), which sends text of the caller's choosing to the server
-GIT_LS_REMOTE_FLAGS = frozenset(
-    {
-        "--heads",
-        "--branches",
-        "--tags",
-        "--refs",
-        "--quiet",
-        "--exit-code",
-        "--get-url",
-        "--symref",
-    }
-)
-GIT_LS_REMOTE_SHORTS = frozenset("hbtq")
-
-# A remote as the repository's config names it, never a URL or a path: no `:`, which a scheme,
-# `ext::` and `host:path` all need, and no `/`.
-GIT_REMOTE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
-
-# A URL git reaches over the network with a transport of its own: `http(s)`, `ssh` and `git`
-# with a host, and the scp-like `[user@]host:path`, which has no `/` before its first `:` and no
-# `//` after it, since git reads `<word>://` as a scheme. Not a path or `file://`, which open a
-# repository on this machine, and not `<helper>::<address>` or another scheme, which run a
-# `git-remote-<name>` program from `PATH`.
-GIT_NETWORK_URL = re.compile(
-    r"(?:https?|ssh|git|git\+ssh|ssh\+git)://(?!-)[^/]+(?:/.*)?"
-    r"|(?!-)[^:/]+:(?!:|//).*"
-)
-
-# The longest the hook waits for git to say where a remote leads: `git ls-remote --get-url`
-# reads config and contacts nothing, so it takes milliseconds unless a file it opens blocks
-GIT_RESOLVE_TIMEOUT = 5.0
-
-
-class NotReadOnly(Exception):  # noqa: N818 - a verdict, not an error
-    """Raised when any command component is not provably read-only."""
-
-
-class NoOpinion(NotReadOnly):
-    """Raised where the module has no reading of the command rather than a bad one.
-
-    The distinction is what bounds the second tier. An operator's allow rule may supply a
-    program this module has never heard of -- ``gh``, ``shellcheck``, a script in ``scripts/``
-    -- because there the module is admitting it cannot tell. It may not overrule a
-    validator that read the command and found a write: ``git diff --output=`` and
-    ``find . -delete`` stay refused whatever the rule file says, so a broad rule cannot
-    quietly cancel a finding.
-    """
 
 
 def _skip_single_quoted(text: str, index: int) -> int:
@@ -1213,9 +499,134 @@ def _expand(token: str, parts: list[tuple[str, str]]) -> str:
     return PLACEHOLDER.sub(replace, token)
 
 
+# --------------------------------------------------------------------------------------
+# Shell grammar: text refused wherever it is spelled
+#
+# What the shell acts on with no program involved, or evaluates from a value the module did
+# not read. `_refuse_unreadable_text` applies these to the whole command.
+# --------------------------------------------------------------------------------------
+
+# A socket the shell opens itself, with no program involved. `cat /dev/tcp/h/p` is egress
+# spelled as a read, so the path is refused wherever it appears rather than per-program.
+NETWORK_DEVICE = re.compile(r"/dev/(?:tcp|udp)/")
+
+# Bash opens a socket for a path under these, with no program involved. Only a redirection
+# reaches them, and a redirection is refused already -- but a word that names one has no reading
+# other than the one bash would give it.
+# TODO: `PSEUDO_DEVICE` and `NETWORK_DEVICE` are the same pattern from the two sides of a
+# merge. Keep `NETWORK_DEVICE`, whose check in `_classify` also sees redirect targets, and
+# drop this one with its loop in `_check_command`.
+PSEUDO_DEVICE = re.compile(r"/dev/(?:tcp|udp)/")
+
+# Output is not inert:
+# - A terminal acts on an escape sequence
+# - OSC 52 writes the clipboard
+# - OSC 8 turns any text into a link
+# - Some terminals report their title back as input
+# A raw ESC or C1 control byte has no business in a command, so it is refused anywhere.
+# Spelled out, `\033` is only text until `echo` or `printf` interprets it (zsh's `echo` does
+# without `-e`), so a spelling is refused in what either is given, and so is any value either
+# expands when the command spells one somewhere, since that value may be the escape.
+# Elsewhere it is left alone: `sed 's/\x1b\[[0-9;]*m//g'` is how a help page loses its colors.
+TERMINAL_CONTROL_BYTE = re.compile("[\x1b\x9b\x9d]")
+
+TERMINAL_CONTROL_SPELLED = re.compile(
+    r"\\(?:0{0,2}33|0{0,2}23[35]|x1[bB]|x9[bBdD]|[uU]0*(?:1[bB]|9[bBdD])|[eE])"
+)
+
+INTERPRETS_ESCAPES = ("echo", "printf")
+
+# `${var@P}` expands its value as a prompt string, and prompt expansion performs command
+# substitution, so the payload need never contain `$(` itself. `${arr[@]}` is not this:
+# a transformation is an `@` followed by an operator letter, not by `]`.
+PARAMETER_TRANSFORM = re.compile(r"\$\{[^{}]*@[A-Za-z]")
+
+# `${name=value}` and `${name:=value}` assign as a side effect of being expanded, so a command
+# that only prints can still hand the next one a writing flag, or a new `PATH`.
+# The other `${name:X...}` operators substitute without assigning and must not match:
+# only `=`, optionally preceded by the `:` that also tests for empty, is an assignment.
+PARAMETER_ASSIGN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?:\[[^]{}]*\])?:?=")
+
+# Arithmetic evaluates a variable's *value* as an expression, and an array subscript in that
+# value runs the command substitution inside it: `x='a[$(touch PWNED)]'; echo $((x))` writes
+# in bash and in zsh. So every place the shell evaluates arithmetic on something the module
+# did not read is refused -- `$((...))` naming a variable (in `_skip_arithmetic`), `$[...]`,
+# a subscript or a `${name:offset}` that is not a literal integer, and `${!name}`, which
+# evaluates a subscript in the name it looks up. `[@]`, `[*]`, `[3]`, `${x:0:8}` and the
+# `${!arr[@]}` key listing evaluate nothing and stay approved.
+PARAM_NAME = r"(?:[A-Za-z_][A-Za-z0-9_]*|\d+|[@*#?$!-])"
+
+ARITHMETIC_BRACKET = re.compile(r"\$\[")
+
+SUBSCRIPT = re.compile(
+    r"\$\{[#+]?[A-Za-z_][A-Za-z0-9_]*\[(?!(?:[@*]|-?\d+)\])"
+    r"|\$[A-Za-z_][A-Za-z0-9_]*\[(?!(?:[@*]|-?\d+)\])"
+)
+
+SUBSTRING = re.compile(
+    r"\$\{#?" + PARAM_NAME + r"(?:\[(?:[@*]|-?\d+)\])?:"
+    r"(?![-=+?]|\s*-?\d+\s*(?::\s*-?\d+\s*)?\})"
+)
+
+INDIRECT = re.compile(r"\$\{!(?![A-Za-z_][A-Za-z0-9_]*(?:\[[@*]\]|[@*])\})")
+
+# zsh is one of the 2 shells Claude Code runs these commands in (see the module docstring), and it
+# has expansions bash does not. `${(e)x}` re-expands the value -- command substitution included --
+# and any `${(...)` flag set is refused rather than read letter by letter. `${~x}` and `$~x`
+# turn the value into a glob, and a zsh glob qualifier `*(e:cmd:)` runs a command.
+ZSH_PARAMETER_FLAGS = re.compile(r"\$\{\s*\(")
+
+ZSH_GLOB_SUBST = re.compile(r"\$\{?~")
+
+# The Bash 5.3 substitution forms, which spell no `$(` of their own.
+BRACE_SUBSTITUTION = re.compile(r"\$\{\s*\||\$\{\s+[a-zA-Z0-9_]")
+
+
+def _zsh_equals_expansion(token: str, parts: list[tuple[str, str]]) -> bool:
+    """Whether zsh replaces part of this word with the path of a command, `=ls` with `/usr/bin/ls`.
+
+    zsh does so for an unquoted `=` that starts a word and has more after it, and in an
+    assignment's value for one that starts the value or follows a `:`, as in `x==ls` and
+    `x=a:=ls`. With `magic_equal_subst`, which a startup file can set, every word with a `=` is
+    read as an assignment is, as `--file==ls` is. A quoted part or an expansion can supply the
+    `:`, or nothing at all: `x=a':'=ls` and `p=; x=$p=ls` each expand. A `=` on its own, as in
+    `test a = b`, is left as it is. ``token`` is a reduced word, so a quoted `=` is in ``parts``,
+    and expands nothing.
+    """
+    if token.startswith("=") and len(token) > 1:
+        return True
+    _, equals, value = token.partition("=")
+    if not equals:
+        return False
+    for index, char in enumerate(value):
+        if char != "=":
+            continue
+        before = _expand(value[:index], parts).rpartition(":")[2]
+        if not before or "$" in before or SUBSTITUTION_MARKER in before:
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------------------
+# Shell grammar: words the shell still builds
+#
+# Predicates over one word: whether an expansion, a substitution, a wildcard or a brace leaves
+# its final text to the shell.
+# --------------------------------------------------------------------------------------
+
+# Text that is parameter expansions and nothing else, so that the shell supplies all of it.
+# `$(` never survives the scan, so only the parameter forms are here.
+EXPANSION_ONLY = re.compile(r"(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[^{}]*\}|\$[0-9@*#?$!-])+")
+
+
 def _carries_substitution(token: str, parts: list[tuple[str, str]]) -> bool:
     """Whether any part of this word is produced by running a command."""
     return any(parts[int(index)][0] in RUNS_A_COMMAND for index in PLACEHOLDER.findall(token))
+
+
+def _carries_arithmetic(token: str, parts: list[tuple[str, str]]) -> bool:
+    """Whether any part of this word is an arithmetic expansion, which reads as `0` here."""
+    return any(parts[int(index)][0] == ARITHMETIC for index in PLACEHOLDER.findall(token))
 
 
 def _has_wildcard(text: str) -> bool:
@@ -1233,11 +644,6 @@ def _has_wildcard(text: str) -> bool:
         return True
     start = text.find("[")
     return start >= 0 and text.find("]", start + 1) >= 0
-
-
-def _carries_arithmetic(token: str, parts: list[tuple[str, str]]) -> bool:
-    """Whether any part of this word is an arithmetic expansion, which reads as `0` here."""
-    return any(parts[int(index)][0] == ARITHMETIC for index in PLACEHOLDER.findall(token))
 
 
 def _carries_live_glob(token: str) -> bool:
@@ -1273,6 +679,78 @@ def _carries_brace_expansion(token: str) -> bool:
     return BRACE_EXPANSION.search(PLACEHOLDER.sub("", token)) is not None
 
 
+def _has_bare_variable(token: str, parts: list[tuple[str, str]]) -> bool:
+    """Whether the value itself contains an unresolved `$var`, in or out of quotes.
+
+    A value like `--profile $other` cannot be spliced, because `$other` is a word this
+    module never read; the splice would check `--profile` and a placeholder, not the real
+    second flag. Both the bare `$x` left in the reduced token and a `$x` inside a
+    double-quoted part count.
+    """
+    if "$" in PLACEHOLDER.sub("", token):
+        return True
+    return any(
+        kind == DOUBLE_QUOTED and "$" in value
+        for index in PLACEHOLDER.findall(token)
+        for kind, value in [parts[int(index)]]
+    )
+
+
+def _word_the_shell_builds(token: str, parts: list[tuple[str, str]]) -> bool:
+    """Whether the shell still builds this word.
+
+    An expansion, a substitution, a wildcard it expands or a brace.
+    """
+    return (
+        _has_bare_variable(token, parts)
+        or _carries_substitution(token, parts)
+        or _carries_live_glob(token)
+        or _carries_brace_expansion(token)
+    )
+
+
+def _word_the_shell_decides(token: str, parts: list[tuple[str, str]]) -> bool:
+    """Whether the shell, not the operator, decides what kind of word this is.
+
+    Every flag table reads a word that is already complete. Two shapes are not:
+
+    * a word carrying a command substitution, because the body ran and its output is
+        this word -- ``sort "$(echo -o)" PWNED`` is ``sort -o PWNED`` and says so nowhere;
+    * a word that is nothing but parameter expansions, because its whole text, leading
+        ``-`` included, was set by some earlier command in the same shell -- ``sort ${o}``
+        is whatever ``o`` holds.
+
+    A parameter glued to literal text is neither, and that is deliberate: the everyday idioms
+    are ``"${_p}-example-project"``, a key with a suffix, and ``--project="${p}"``, a flag
+    whose value is a parameter. Refusing those buys nothing -- the option is already spelled
+    out in the command -- and costs every such loop.
+    The residual is narrow and real: ``"${o}-x"`` is still a flag if ``o`` begins with one.
+    """
+    if _carries_substitution(token, parts):
+        return True
+
+    index, length, expansions = 0, len(token), False
+    while index < length:
+        match = PLACEHOLDER.match(token, index)
+        if match is None:
+            end = token.find(PLACEHOLDER_MARK, index)
+            chunk = token[index : length if end < 0 else end]
+            if not EXPANSION_ONLY.fullmatch(chunk):
+                return False
+            expansions = True
+            index = length if end < 0 else end
+            continue
+        kind, value = parts[int(match.group(1))]
+        # Single quotes and a backslash make the text literal; double quotes do not, and
+        # ``"${o}"`` expands exactly as ``${o}`` does.
+        if value:
+            if kind != DOUBLE_QUOTED or not EXPANSION_ONLY.fullmatch(value):
+                return False
+            expansions = True
+        index = match.end()
+    return expansions
+
+
 # A word that is exactly one *quoted* expansion of `name`, written `"$name"` or
 # `"${name}"`, with nothing glued on. Three conditions, each load-bearing:
 #
@@ -1294,322 +772,274 @@ def _is_bare_expansion_of(token: str, parts: list[tuple[str, str]], names: froze
     return any(expanded == f"${name}" or expanded == "${" + name + "}" for name in names)
 
 
-# A `for name in word...` header whose list is entirely literal words that do not begin
-# with `-`. When that holds, every value `name` can take is spelled out in the command and
-# none is a flag, so a later bare `"$name"` cannot arrive as one -- which is the single
-# case `_word_the_shell_decides` may exempt. The header is read before its body because a
-# segment-by-segment pass has already discarded it (`_strip_structure` returns `[]` for a
-# loop head), so the safe names are collected here and passed down.
+def _carries_tilde_or_equals(token: str) -> bool:
+    """Whether bash or zsh rewrites this word through a tilde, or zsh through ``=cmd``.
+
+    Both shells expand ``~``, ``~+`` and ``~user`` at the start of a word, and bash expands one
+    after the ``=`` of a word shaped like an assignment, so ``x=~`` reaches the program as
+    ``x=$HOME``. zsh replaces a word that starts with ``=`` with the path of the command it
+    names, ``=ls`` with ``/usr/bin/ls``. Any unquoted ``~`` counts, so that no spelling has to
+    be listed. Only the reduced token is read, so a quoted ``'~+'`` or ``'=ls'`` is the literal
+    it spells.
+    """
+    return "~" in PLACEHOLDER.sub("", token) or token.startswith("=")
+
+
+def _rewritten_words(
+    tokens: list[str], live_globs: list[bool], parts: list[tuple[str, str]]
+) -> list[bool]:
+    """Word by word, whether the shell rewrites or computes it before the program runs.
+
+    For the validators that read every word whole and leave the rest to the operator's rules,
+    ``gh`` and ``curl``: an unquoted wildcard, a tilde or zsh's ``=cmd``, a variable, a command
+    substitution, or an arithmetic expansion, which ``_expand`` shows as ``0`` and the shell
+    computes, so that ``https://docs$((1)).example.com/`` names another host than it reads as.
+    """
+    return [
+        glob
+        or _carries_tilde_or_equals(token)
+        or _has_bare_variable(token, parts)
+        or _carries_substitution(token, parts)
+        or _carries_arithmetic(token, parts)
+        for glob, token in zip(live_globs, tokens, strict=True)
+    ]
+
+
+def _word_is_built(word: str) -> bool:
+    """Whether this word, as ``_expand`` gives it, still shows the shell building it.
+
+    The text check that goes with ``_rewritten_words``, for ``gh`` and ``curl``: a ``$`` even in
+    a quoted word, and what a substitution leaves.
+    """
+    return "$" in word or SUBSTITUTION_MARKER in word or PLACEHOLDER_MARK in word
+
+
+def _bundled_short(arg: str, letters: str, value_letters: str = "") -> bool:
+    """Whether a short-option cluster carries one of ``letters``.
+
+    ``-ni`` is one argument whose second letter is the write flag, so a table keyed on the
+    argument as a whole does not see it and a ``startswith('-i')`` guard does not fire.
+    Only the leading run of letters is read: an option that takes an inline value ends
+    the cluster, so ``sort -k1,1`` is ``k`` and not an ``o`` hiding behind a digit.
+
+    ``value_letters`` names the options whose value can be attached *letters*, which a
+    non-letter test cannot see the end of: ``date -Iseconds`` is ``-I`` with the value
+    ``seconds``, not ``-I -s ...``, and ``sort -to`` is ``-t`` with the separator ``o``.
+    The cluster stops after one of those. A caller that passes none is saying it has none.
+    """
+    if not arg.startswith("-") or arg.startswith("--"):
+        return False
+    cluster = ""
+    for char in arg[1:]:
+        if not char.isalpha():
+            break
+        cluster += char
+        if char in value_letters:
+            break
+    return any(letter in cluster for letter in letters)
+
+
+# --------------------------------------------------------------------------------------
+# Shell grammar: commands
 #
-# The list must be literal to count: a `$(...)` body, a `${arr[@]}`, or any word the shell
-# still has to build says nothing about what `name` will hold and yields no exemption. And
-# such headers must be every binding of `name` that `_bindings` counts: an assignment in the
-# body, `for p in a; do p=-i; ...`, or a zsh header that binds it second, `for q p in x -i`,
-# leaves it bound to a value no header spells.
-def _safe_loop_names(
-    segments: list[list[str]],
-    parts: list[tuple[str, str]],
-    bindings: dict[str, int],
-    known_values: dict[str, list[str] | None],
-) -> frozenset[str]:
-    safe: dict[str, int] = {}
-    for segment in segments:
-        if len(segment) < 3 or segment[0] not in WORD_LIST_HEADS or segment[2] != "in":
-            continue
-        name = _expand(segment[1], parts)
-        values = segment[3:]
-        if values and all(_value_is_literal_non_flag(word, parts, known_values) for word in values):
-            safe[name] = safe.get(name, 0) + 1
-    return frozenset(name for name, count in safe.items() if bindings.get(name) == count)
+# From the reduced command to simple commands: tokens, segments, and the control structure in
+# front of each command.
+# --------------------------------------------------------------------------------------
+
+# Shell control structure keywords that can precede a simple command
+STRUCTURE = {
+    "do",
+    "done",
+    "elif",
+    "else",
+    "esac",
+    "fi",
+    "if",
+    "then",
+    "time",
+    "until",
+    "while",
+    "{",
+    "}",
+    "!",
+    "[[",
+    "]]",
+}
+
+# Head keywords that introduce a loop variable list
+WORD_LIST_HEADS = {"for"}
+
+# zsh 5.9's reserved words, as its `$reswords` lists them. After a `for` header's first name,
+# zsh ends the names at one and, under SHORT_LOOPS, on by default, starts the loop's body with
+# it: `for p time touch x` runs `time touch x` once for each positional parameter
+ZSH_RESERVED_WORDS = {
+    "!",
+    "[[",
+    "{",
+    "}",
+    "case",
+    "coproc",
+    "declare",
+    "do",
+    "done",
+    "elif",
+    "else",
+    "end",
+    "esac",
+    "export",
+    "fi",
+    "float",
+    "for",
+    "foreach",
+    "function",
+    "if",
+    "integer",
+    "local",
+    "nocorrect",
+    "readonly",
+    "repeat",
+    "select",
+    "then",
+    "time",
+    "typeset",
+    "until",
+    "while",
+}
+
+# Exactly recognized shell separators
+SEPARATORS = {";", "|", "&&", "||", "&", "|&", "\n"}
+
+# Shell punctuation characters handled by punctuation_chars=True
+PUNCTUATION_CHARS = set("();<>|&")
+
+# Stream redirections that safely discard or merge output streams without file creation
+SAFE_REDIRECTS = re.compile(
+    r"(?<![^\s;|&(])(?:[12]?>&[12]|&>\s*/dev/null|[12]?>\s*/dev/null|<\s*/dev/null)"
+    r"(?=[\s;|&)]|$)"
+)
+
+# Reading a file through `<` is a read. The target is left in the reduced command when it
+# is literal and is a placeholder when it is quoted; either way nothing is created. The
+# forms this must not swallow are `<<`, `<<<`, `<&` and `2<`, each of which fails the
+# character class or the lookbehind and stays punctuation for `_segments` to refuse.
+FILE_INPUT_REDIRECT = re.compile(r"(?<![^\s;|&(])<\s*([^\s;|&()<>]+)(?=[\s;|&)]|$)")
+
+# Variable assignment matching
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 
 
-# A use of `name` that the shell word-splits into the argument list: `$name`, `${name}`,
-# and the zsh `${=name}`. All three split an unquoted value into several words, so all
-# three are spliceable when the value is one this module resolved. A quoted `"$name"` is
-# not here -- it is a single word and is handled by the loop-name path -- and neither is a
-# glued `${name}x`, which is one word too.
-# TODO(zsh): under zsh only `${=name}` word-splits; a bare `$name` or `${name}` is one word
-# (SH_WORD_SPLIT is off by default). The splice checks the split words, which is the bash
-# reading. A differential test under zsh should confirm the joined word never passes where
-# the split words were refused.
-SPLICE_USE = re.compile(r"^\$\{=?([A-Za-z_][A-Za-z0-9_]*)\}$|^\$([A-Za-z_][A-Za-z0-9_]*)$")
+def _tokenize(command: str) -> list[str]:
+    """Tokenize command into shell words with bash-aligned punctuation and comments.
 
-
-def _splice_name(token: str, splice_vars: dict[str, list[str]]) -> str | None:
-    """The variable name this token splices in, or None.
-
-    A bare, unquoted `$name`, `${name}` or `${=name}` whose `name` has a resolved literal
-    value. A quoted use is a placeholder, not this literal text, so it never matches here
-    and stays with the loop-name path. A glued `${name}x` is not a whole-word match either.
+    The input is the reduced command, so there is no quoting left to interpret and the
+    lexer's only remaining job is to split on whitespace and on punctuation, exactly as
+    bash does.
     """
-    match = SPLICE_USE.match(token)
-    if match is None:
-        return None
-    name = match.group(1) or match.group(2)
-    return name if name in splice_vars else None
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    # Do not let shlex drop comments mid-token; '#' must be handled safely
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError as exc:
+        raise NotReadOnly(f"unparseable syntax: {exc}") from exc
 
 
-def _literal_assignments(
-    segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
-) -> dict[str, list[str]]:
-    """Variables assigned a fully literal value in a sibling segment, as split words.
+def _segments(tokens: list[str]) -> list[list[str]]:
+    """Split token stream into simple commands, strictly rejecting invalid punctuation."""
+    out: list[list[str]] = [[]]
+    for token in tokens:
+        # Check if the token consists purely of punctuation characters
+        if set(token).issubset(PUNCTUATION_CHARS):
+            if token in SEPARATORS:
+                out.append([])
+            else:
+                # Any punctuation run not matching exact separators (; | && || & |& \n)
+                # is a redirection, subshell, or glued syntax (e.g. ';(', ';>', '<>', '&>>')
+                raise NotReadOnly(f"disallowed punctuation or redirection: {token}")
+        elif any(c in "<>" for c in token) or token.endswith(("&", "|", ";")):
+            raise NotReadOnly(f"redirection or separator inside token: {token}")
+        else:
+            out[-1].append(token)
+    return [segment for segment in out if segment]
 
-    `_p='--profile admin --region us-east-1'` puts those three flags in `_p`, and because
-    the assignment is in the same command as the `${=_p}` that uses it, the value is right
-    here to read. The value counts as literal only when nothing in it is left for the shell
-    to decide -- no `$(...)`, no nested `$var`, no glob, no brace -- so what it splits into
-    is fixed and checkable.
 
-    Only an assignment that starts its segment is read, and only when it is the one binding of
-    its name that `_bindings` counts. Any other binding, wherever it stands, drops the name, so
-    an attacker cannot shadow a safe value with a later dangerous one: a second assignment, one
-    after `then` or `{`, a `for` header, a builtin such as `export` or `read`, or `$_`, which
-    every command binds. An append is not read either: `p+=x` adds to the value `p` had,
-    which this module never read.
+# Dangerous environment variables that must never be set (bare or prefix)
+DANGEROUS_ENV_VARS = {
+    "PATH",
+    "BASH_ENV",
+    "ENV",
+    "CDPATH",
+    "IFS",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_CONFIG",
+    "GIT_EXEC_PATH",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PERL5LIB",
+    "RUBYLIB",
+    "NODE_OPTIONS",
+    "AWS_CONFIG_FILE",
+    "CLOUDSDK_CONFIG",
+    # Where a later command in the same session sends its traffic, and what it will
+    # trust when it gets there. These are the ones normally spelled in lower case, and
+    # the membership test upper-cases the name, so both spellings are covered.
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "FTP_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    # Where a later command looks for its configuration, and what runs before it
+    "HOME",
+    "TMPDIR",
+    "PROMPT_COMMAND",
+    "GLIBC_TUNABLES",
+    "GCONV_PATH",
+    "LOCPATH",
+    # Where zsh loads a module from, and it loads some on demand: expanding `$commands` loads
+    # `zsh/parameter`. zsh ties it to `module_path`, which the upper-casing covers
+    "MODULE_PATH",
+}
 
-    The split is on the shell's default IFS (space, tab, newline), which is what an
-    unquoted expansion undergoes. That is an approximation -- a custom `IFS` would split
-    differently -- but a command that reset `IFS` carries that binding too, and every binding
-    of `IFS` is refused before this runs: an assignment and a `for` header by
-    `_strip_structure`, a builtin's by `_bindings`.
+
+def _names_the_environment(name: str) -> bool:
+    """Whether a later command, or the shell itself, reads ``name``'s value as configuration.
+
+    `PATH` picks the program a word runs, `HOME` where git and the vendor CLIs read their
+    config, `IFS` how every later expansion splits, which a command may set by assigning the
+    name or by looping over it. The check upper-cases the name, so zsh's `path`, tied to `PATH`,
+    is one too.
     """
-    assigned: dict[str, list[str]] = {}
-    for segment in segments:
-        for word in segment:
-            if not ASSIGNMENT.match(word):
-                break  # assignments come first in a segment; a non-assignment ends them
-            name, _, value_token = word.partition("=")
-            if name.endswith("+") or bindings.get(name) != 1:
-                continue  # an append, or bound elsewhere too: no value here to trust
-            expanded_value = _expand(value_token, parts)
-            if (
-                _word_the_shell_builds(value_token, parts)
-                # The value as expanded, not the token: bash globs the words of an unquoted
-                # `$q` where it is used, however the assignment quoted them, so `q='*'; find .
-                # $q` hands find every name in the directory. zsh does not, but `${=q}` and
-                # `$q` are read the same here.
-                or _has_wildcard(expanded_value)
-                # Defense in depth: word-splitting does not re-run the parser, so a `;` in
-                # the value is an inert argument rather than a new command -- but a value
-                # that carries one was likely meant as a command, and splicing it is too
-                # sharp an edge to auto-approve. A value destined for the argument list is
-                # plain flags and operands or it is not spliced.
-                or any(ch in expanded_value for ch in ";|&<>`()$\n")
-            ):
-                continue
-            # Bash expands a leading tilde in an assignment's value, so `x=~/a` holds the
-            # home-relative path, not the two characters. Storing the expansion is what lets
-            # the read scope see where `"$x"` really points. `x=~-` holds `$OLDPWD`, which
-            # the shell holds: no value here to read.
-            if value_token.startswith("~"):
-                directory = _tilde_expansion(expanded_value)
-                if directory is None:
-                    continue
-                expanded_value = directory
-            assigned[name] = expanded_value.split()
-    return assigned
-
-
-def _has_bare_variable(token: str, parts: list[tuple[str, str]]) -> bool:
-    """Whether the value itself contains an unresolved `$var`, in or out of quotes.
-
-    A value like `--profile $other` cannot be spliced, because `$other` is a word this
-    module never read; the splice would check `--profile` and a placeholder, not the real
-    second flag. Both the bare `$x` left in the reduced token and a `$x` inside a
-    double-quoted part count.
-    """
-    if "$" in PLACEHOLDER.sub("", token):
-        return True
-    return any(
-        kind == DOUBLE_QUOTED and "$" in value
-        for index in PLACEHOLDER.findall(token)
-        for kind, value in [parts[int(index)]]
+    return (
+        name.upper() in DANGEROUS_ENV_VARS
+        or name.startswith(("LD_", "GIT_", "BASH_", "AWS_", "CLOUDSDK_"))
+        or name != name.lower()
     )
 
 
-# Stands for one directory entry's name: no `/`, never `.` or `..`. Only the read scope
-# uses it, to say "some file inside this directory"; it never exempts a word from the flag
-# check, because a directory can hold a file called `-rf`.
-PATH_COMPONENT = "\x02entry\x02"
+def _refuse_binding(name: str) -> None:
+    """Refuse a binding of a name a later program reads, `_names_the_environment`.
 
-# A command substitution whose output is bare directory-entry names: `ls`, or `ls` with
-# relative directory operands and only the flags that change layout, never `-a`.
-LISTING_BODY = re.compile(r"^\s*ls(?:\s+-1)?(?:\s+[A-Za-z0-9_./-]+)*\s*$")
-
-
-def _glob_may_climb(path: str, *, dot_components: bool = True) -> bool:
-    """Whether a path the shell globs can land above the directory in front of its wildcard.
-
-    The read scope places a globbed path in that directory, which holds only while nothing
-    from the wildcard on climbs out of it. A `..` after the wildcard, as in `*/../../x`, climbs
-    from whatever the wildcard matched. A component that starts with `.` and carries a
-    wildcard, as `.*` and `.?` do, matches `..` itself in a bash older than 5.2, or in one
-    with `globskipdots` off; without `dot_components`, only a `..` counts.
+    By an assignment or a builtin: `PATH=.` and `export XDG_CONFIG_HOME=.` each make a later
+    `git status` run a program of the project's. A `for` header's names get the same check in
+    `_check_loop_names`.
     """
-    special = PATH_SPECIAL.search(path)
-    if special is None:
-        return False
-    start = path.rfind("/", 0, special.start()) + 1
-    return any(
-        component == ".." or (dot_components and _may_match_dot_dot(component))
-        for component in path[start:].split("/")
-    )
+    if _names_the_environment(name):
+        raise NotReadOnly(f"refused environment variable assignment: {name}")
 
 
-def _may_match_dot_dot(component: str) -> bool:
-    """Whether a glob component can match `..`: a `.`, then a rest that can be `.` alone.
-
-    `.*`, `.?` and `.[!a]` can; `.env*` can't, as its `e` is no `.`. A bracket expression counts
-    as one that matches `.`, and a value the shell supplies, `$`, `{` or a backtick, as one that
-    may be `.`, both of which err toward a climb.
-    """
-    if not component.startswith("."):
-        return False
-    rest = component[1:]
-    if any(char in rest for char in "${`"):
-        return True
-    positions = {0}  # how much of the one-character "." the pattern has consumed
-    index = 0
-    while index < len(rest) and positions:
-        char = rest[index]
-        close = _bracket_end(rest, index) if char == "[" else -1
-        if char == "*":
-            positions = {0, 1} if 0 in positions else positions
-        elif char == "?" or close >= 0:
-            positions = {1} if 0 in positions else set()
-            index = close if close >= 0 else index
-        else:
-            positions = {1} if char == "." and 0 in positions else set()
-        index += 1
-    return 1 in positions
-
-
-def _bracket_end(text: str, start: int) -> int:
-    """The index of the `]` that closes the bracket expression at `start`, or -1.
-
-    A `]` first in the set, after any `!` or `^`, is a member, and `[:punct:]`, `[=a=]` and
-    `[.a.]` inside it are one member each, whose own `]` closes nothing.
-    """
-    index = start + 1
-    if text[index : index + 1] in ("!", "^"):
-        index += 1
-    if text[index : index + 1] == "]":
-        index += 1
-    while index < len(text):
-        if text[index] == "[" and text[index + 1 : index + 2] in (":", "=", "."):
-            end = text.find(text[index + 1] + "]", index + 2)
-            if end >= 0:
-                index = end + 2
-                continue
-        if text[index] == "]":
-            return index
-        index += 1
-    return -1
-
-
-def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | None:
-    """What one `for`-list word contributes to the variable, for the read scope.
-
-    A literal word is itself. An unquoted glob is a name inside its literal directory. A
-    `$(ls ...)` is a bare name. Anything else -- a substitution with another body, a
-    parameter expansion, a glob that could match `.` or `..` -- is None: unresolvable.
-    """
-    expanded = _expand(token, parts)
-    whole = PLACEHOLDER.fullmatch(token)
-    if whole is not None and parts[int(whole.group(1))][0] == SUBSTITUTION:
-        body = parts[int(whole.group(1))][1]
-        if LISTING_BODY.match(body) and not re.search(r"\s-[A-Za-z]*a", body) and ".." not in body:
-            return [PATH_COMPONENT]
-        return None
-    if _carries_substitution(token, parts) or _has_bare_variable(token, parts):
-        return None
-    if _carries_brace_expansion(token):
-        return None
-    if _carries_live_glob(token):
-        head = PATH_SPECIAL.split(expanded, 1)[0]
-        directory = head.rpartition("/")[0]
-        if (
-            _glob_may_climb(expanded)
-            or expanded.startswith(("/", "~"))
-            or ".." in directory.split("/")
-        ):
-            return None
-        return [f"{directory}/{PATH_COMPONENT}" if directory else PATH_COMPONENT]
-    # Quoted, the word is a literal here, but bash globs it again where an unquoted `$f` uses
-    # it: `for f in '.?'; do grep -r x $f; done` reads `..` in a bash older than 5.2. Placed as
-    # the literal it spells, such a value would be measured below the directory it climbs from.
-    if _has_wildcard(expanded) and _glob_may_climb(expanded):
-        return None
-    # Both shells expand a `~` that starts a word of the list: `for p in ~` binds the home
-    # directory, which the text `~` would place in the project
-    if token.startswith("~"):
-        directory = _tilde_expansion(expanded)
-        return None if directory is None else [directory]
-    return [expanded]
-
-
-def _tilde_expansion(text: str) -> str | None:
-    """The directory a word starting with an unquoted `~` names, or None where the shell picks it.
-
-    `~` and `~/x` are in the home directory. Any other prefix is a value the shell holds:
-    `~+` and `~-` are `$PWD` and `$OLDPWD`, and `~1`, `~+1` and `~-1` entries of the directory
-    stack. zsh reads `~name` as a named directory before a user's home: one a startup file's
-    `hash -d` names, or a parameter whose value starts with `/`, as `~HOME` and `~OLDPWD` are.
-    `os.path.expanduser` leaves each of these as the text it is, a name in the project, unless a
-    user has the name, whose home directory bash reads.
-    """
-    if text[1:].split("/", 1)[0]:
-        return None
-    return os.path.expanduser(text)
-
-
-def _tilde_word(text: str) -> str:
-    """``text``, which starts with an unquoted `~`, with its prefix read by `_tilde_expansion`.
-
-    Where the shell picks the directory, it is `UNREAD_VALUE`, and the rest of the word below it.
-    """
-    directory = _tilde_expansion(text)
-    if directory is not None:
-        return directory
-    _, slash, rest = text.partition("/")
-    return UNREAD_VALUE + slash + rest
-
-
-def _literal_loop_values(
-    segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
-) -> dict[str, list[str]]:
-    """The values each `for` variable can take, for resolving it inside a path.
-
-    Wider than `_safe_loop_names`: a glob or `$(ls)` list resolves here, so `"$f"` can be
-    placed inside a directory, but it is never a reason to exempt `"$f"` from the flag check.
-    A name is left out unless the loop is the one binding of it that `_bindings` counts, and
-    its list is resolvable: `for p in .; do p=~; ...` reads `~`.
-    """
-    values: dict[str, list[str]] = {}
-    for segment in segments:
-        if len(segment) < 3 or segment[0] not in WORD_LIST_HEADS or segment[2] != "in":
-            continue
-        name = _expand(segment[1], parts)
-        if bindings.get(name) != 1:
-            continue
-        shapes: list[str] = []
-        for word in segment[3:]:
-            shape = _loop_value_shapes(word, parts)
-            if shape is None:
-                break
-            shapes.extend(shape)
-        else:
-            values[name] = shapes
-    return values
-
-
-# A parameter expansion in the unquoted part of a word: `$q`, `${q}`, `${=q}`, `${q:-x}`.
-UNQUOTED_EXPANSION = re.compile(r"\$\{?=?([A-Za-z_][A-Za-z0-9_]*)")
-
-# What a clean value may not hold: a separator, which splits it into words, and a pattern
-# character, which can close a pattern with the text around the use: `q=']'; sort [-${q}o` is
-# `[-]o`. A parenthesis is one under bash's `extglob`.
-UNSAFE_IN_A_GLUED_VALUE = frozenset(" \t\n*?[]()")
+# A word a `for` header binds. Both shells reject any other there, a quoted name among them, so
+# a word this doesn't match is no name the hook reads
+LOOP_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _header(words: list[str], index: int) -> tuple[list[str], int | None]:
@@ -1629,20 +1059,101 @@ def _header(words: list[str], index: int) -> tuple[list[str], int | None]:
     return words[index + 1 : end], body
 
 
-def _refuse_binding(name: str) -> None:
-    """Refuse a binding of a name a later program reads, `_names_the_environment`.
+def _check_loop_names(names: list[str]) -> None:
+    """Refuse a `for` header whose names, as `_header` reads them, hold one the hook refuses.
 
-    By an assignment or a builtin: `PATH=.` and `export XDG_CONFIG_HOME=.` each make a later
-    `git status` run a program of the project's. A `for` header's names get the same check in
-    `_check_loop_names`.
+    Each gets the check an assignment's name gets: zsh binds every one of them, so `for q PATH
+    in a .` sets `PATH` to `.`, as `for PATH in .` does in both shells. The first word is a name
+    even when it is `in`, `do` or another reserved word: zsh's `for in PATH in . .` sets `PATH`
+    to `.` too. A header that holds any other reserved word is refused, as zsh starts the
+    loop's body there.
     """
-    if _names_the_environment(name):
-        raise NotReadOnly(f"refused environment variable assignment: {name}")
+    for index, word in enumerate(names):
+        if index and word in ZSH_RESERVED_WORDS:
+            raise NotReadOnly(f"a for header holds a word zsh runs as the loop's body: {word}")
+        if not LOOP_NAME.match(word):
+            raise NotReadOnly("a for header binds a word that is not a plain name")
+        if _names_the_environment(word):
+            raise NotReadOnly(f"a for loop over a refused environment variable: {word}")
+
+
+def _command_index(words: list[str], *, refuse: bool) -> int | None:
+    """The index of the command in this segment, past the structure in front of it, or None.
+
+    The one walk to it, so that `_strip_structure`, which checks the command there, and
+    `_bindings`, which reads the builtin there, agree on where it starts. With ``refuse``, it
+    refuses what `_strip_structure` does on the way: `case` and `select`, a binding of a name
+    `_refuse_binding` refuses, by an assignment or a `for` header, and an assignment that
+    prefixes a command.
+    """
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in ("case", "select"):
+            if refuse:
+                raise NotReadOnly(f"unsupported shell control structure: {word}")
+            return index
+        if word in WORD_LIST_HEADS:
+            # The values a header binds are data, and its names are bindings, held to the
+            # check an assignment gets: `for PATH in .` is `PATH=.`. A body after its `do` in
+            # this segment is a command, as in `for p do touch x`.
+            names, body = _header(words, index)
+            if refuse:
+                _check_loop_names(names)
+            if body is None:
+                return None
+            index = body
+            continue
+        if word in STRUCTURE:
+            index += 1
+            continue
+        if ASSIGNMENT.match(word):
+            if refuse:
+                # TODO(decision): `while IFS= read -r line; do ...; done` prompts here. An
+                # *empty* `IFS=` prefixed to one command is scoped to that command and can
+                # only reduce word-splitting, so it could be allowed; `read` itself only
+                # assigns variables and could join READ_ONLY. A `read` variable stays
+                # unresolvable, so it still prompts in a flag or file position.
+                _refuse_binding(word.split("=", 1)[0].rstrip("+"))
+                # Refuse prefix environment assignments before command execution
+                if index + 1 < len(words) and not ASSIGNMENT.match(words[index + 1]):
+                    raise NotReadOnly(f"environment variable prefix on command: {word}")
+            index += 1
+            continue
+        return index
+    return None
+
+
+def _strip_structure(words: list[str]) -> list[str]:
+    """The simple command in this segment, past the control structure in front of it.
+
+    Refuses what `_command_index` refuses on the way to it: a binding of a name
+    `_names_the_environment` names, by an assignment or a `for` header, a header `_check_loop_names`
+    refuses, and an assignment that prefixes a command.
+    """
+    start = _command_index(words, refuse=True)
+    return [] if start is None else words[start:]
 
 
 # The words in front of a builtin that still run it as one: `builtin read p` reads into `p`.
 # `command` is one too, which `_check_command_builtin` refuses outright.
 PRECOMMANDS = frozenset({"builtin", "noglob", "nocorrect"})
+
+
+def _program_index(words: list[str]) -> int | None:
+    """The index of the program this segment runs, past `PRECOMMANDS` too, or None.
+
+    `builtin read p` runs `read`, which binds `p`.
+    """
+    index = _command_index(words, refuse=False)
+    while index is not None and words[index] in PRECOMMANDS:
+        index = index + 1 if index + 1 < len(words) else None
+    return index
+
+
+# --------------------------------------------------------------------------------------
+# Bindings: the names a command sets
+# --------------------------------------------------------------------------------------
 
 # The builtins of bash and zsh that bind the names their operands give, as `read p`,
 # `export p=x` and `unset p` do, each with the letters of the options that take the next word
@@ -1683,6 +1194,7 @@ IMPLICIT_BINDINGS = {"read": ("reply",), "set": ("argv",), "shift": ("argv",)}
 # The builtins that bind names neither table reads: `getopts` its second operand, and `let`
 # each name it assigns
 OTHER_BINDERS = frozenset({"getopts", "let"})
+
 BINDER_TABLES = (NAME_OPERAND_BINDERS, NAME_OPTION_BINDERS, IMPLICIT_BINDINGS, OTHER_BINDERS)
 
 # The builtins whose `-n` declares a nameref: after `declare -n r=p`, `r=x` binds `p`
@@ -1703,6 +1215,7 @@ NAME_OPERAND = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\?.*)?", re.DOTALL)
 # A name in an arithmetic expression, and one a plain `=` assigns, as each of `p=q=1` does. A
 # letter after a digit, a `#` or a `.` is part of a number: `0x1f`, `16#ff`, `1e5`.
 ARITHMETIC_NAME = re.compile(r"(?<![A-Za-z0-9_#.])[A-Za-z_][A-Za-z0-9_]*")
+
 ARITHMETIC_ASSIGNED = re.compile(r"(?<![A-Za-z0-9_#.])([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)")
 
 
@@ -1753,64 +1266,6 @@ def _bindings(segments: list[list[str]], parts: list[tuple[str, str]]) -> dict[s
         for name in names:
             counts[name] = counts.get(name, 0) + 1
     return counts
-
-
-def _command_index(words: list[str], *, refuse: bool) -> int | None:
-    """The index of the command in this segment, past the structure in front of it, or None.
-
-    The one walk to it, so that `_strip_structure`, which checks the command there, and
-    `_bindings`, which reads the builtin there, agree on where it starts. With ``refuse``, it
-    refuses what `_strip_structure` does on the way: `case` and `select`, a binding of a name
-    `_refuse_binding` refuses, by an assignment or a `for` header, and an assignment that
-    prefixes a command.
-    """
-    index = 0
-    while index < len(words):
-        word = words[index]
-        if word in ("case", "select"):
-            if refuse:
-                raise NotReadOnly(f"unsupported shell control structure: {word}")
-            return index
-        if word in WORD_LIST_HEADS:
-            # The values a header binds are data, and its names are bindings, held to the
-            # check an assignment gets: `for PATH in .` is `PATH=.`. A body after its `do` in
-            # this segment is a command, as in `for p do touch x`.
-            names, body = _header(words, index)
-            if refuse:
-                _check_loop_names(names)
-            if body is None:
-                return None
-            index = body
-            continue
-        if word in STRUCTURE:
-            index += 1
-            continue
-        if ASSIGNMENT.match(word):
-            if refuse:
-                # TODO(decision): `while IFS= read -r line; do ...; done` prompts here. An
-                # *empty* `IFS=` prefixed to one command is scoped to that command and can
-                # only reduce word-splitting, so it could be allowed; `read` itself only
-                # assigns variables and could join READ_ONLY. A `read` variable stays
-                # unresolvable, so it still prompts in a flag or file position.
-                _refuse_binding(word.split("=", 1)[0].rstrip("+"))
-                # Refuse prefix environment assignments before command execution
-                if index + 1 < len(words) and not ASSIGNMENT.match(words[index + 1]):
-                    raise NotReadOnly(f"environment variable prefix on command: {word}")
-            index += 1
-            continue
-        return index
-    return None
-
-
-def _program_index(words: list[str]) -> int | None:
-    """The index of the program this segment runs, past `PRECOMMANDS` too, or None.
-
-    `builtin read p` runs `read`, which binds `p`.
-    """
-    index = _command_index(words, refuse=False)
-    while index is not None and words[index] in PRECOMMANDS:
-        index = index + 1 if index + 1 < len(words) else None
-    return index
 
 
 def _binds(program: str) -> bool:
@@ -1923,16 +1378,306 @@ def _operand_names(args: list[str], parts: list[tuple[str, str]]) -> list[str]:
     return names
 
 
-def _word_the_shell_builds(token: str, parts: list[tuple[str, str]]) -> bool:
-    """Whether the shell still builds this word.
+# --------------------------------------------------------------------------------------
+# Values: what a name the command sets can hold
+# --------------------------------------------------------------------------------------
 
-    An expansion, a substitution, a wildcard it expands or a brace.
+# A use of `name` that the shell word-splits into the argument list: `$name`, `${name}`,
+# and the zsh `${=name}`. All three split an unquoted value into several words, so all
+# three are spliceable when the value is one this module resolved. A quoted `"$name"` is
+# not here -- it is a single word and is handled by the loop-name path -- and neither is a
+# glued `${name}x`, which is one word too.
+# TODO(zsh): under zsh only `${=name}` word-splits; a bare `$name` or `${name}` is one word
+# (SH_WORD_SPLIT is off by default). The splice checks the split words, which is the bash
+# reading. A differential test under zsh should confirm the joined word never passes where
+# the split words were refused.
+SPLICE_USE = re.compile(r"^\$\{=?([A-Za-z_][A-Za-z0-9_]*)\}$|^\$([A-Za-z_][A-Za-z0-9_]*)$")
+
+
+def _splice_name(token: str, splice_vars: dict[str, list[str]]) -> str | None:
+    """The variable name this token splices in, or None.
+
+    A bare, unquoted `$name`, `${name}` or `${=name}` whose `name` has a resolved literal
+    value. A quoted use is a placeholder, not this literal text, so it never matches here
+    and stays with the loop-name path. A glued `${name}x` is not a whole-word match either.
     """
-    return (
-        _has_bare_variable(token, parts)
-        or _carries_substitution(token, parts)
-        or _carries_live_glob(token)
-        or _carries_brace_expansion(token)
+    match = SPLICE_USE.match(token)
+    if match is None:
+        return None
+    name = match.group(1) or match.group(2)
+    return name if name in splice_vars else None
+
+
+def _literal_assignments(
+    segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
+) -> dict[str, list[str]]:
+    """Variables assigned a fully literal value in a sibling segment, as split words.
+
+    `_p='--profile admin --region us-east-1'` puts those three flags in `_p`, and because
+    the assignment is in the same command as the `${=_p}` that uses it, the value is right
+    here to read. The value counts as literal only when nothing in it is left for the shell
+    to decide -- no `$(...)`, no nested `$var`, no glob, no brace -- so what it splits into
+    is fixed and checkable.
+
+    Only an assignment that starts its segment is read, and only when it is the one binding of
+    its name that `_bindings` counts. Any other binding, wherever it stands, drops the name, so
+    an attacker cannot shadow a safe value with a later dangerous one: a second assignment, one
+    after `then` or `{`, a `for` header, a builtin such as `export` or `read`, or `$_`, which
+    every command binds. An append is not read either: `p+=x` adds to the value `p` had,
+    which this module never read.
+
+    The split is on the shell's default IFS (space, tab, newline), which is what an
+    unquoted expansion undergoes. That is an approximation -- a custom `IFS` would split
+    differently -- but a command that reset `IFS` carries that binding too, and every binding
+    of `IFS` is refused before this runs: an assignment and a `for` header by
+    `_strip_structure`, a builtin's by `_bindings`.
+    """
+    assigned: dict[str, list[str]] = {}
+    for segment in segments:
+        for word in segment:
+            if not ASSIGNMENT.match(word):
+                break  # assignments come first in a segment; a non-assignment ends them
+            name, _, value_token = word.partition("=")
+            if name.endswith("+") or bindings.get(name) != 1:
+                continue  # an append, or bound elsewhere too: no value here to trust
+            expanded_value = _expand(value_token, parts)
+            if (
+                _word_the_shell_builds(value_token, parts)
+                # The value as expanded, not the token: bash globs the words of an unquoted
+                # `$q` where it is used, however the assignment quoted them, so `q='*'; find .
+                # $q` hands find every name in the directory. zsh does not, but `${=q}` and
+                # `$q` are read the same here.
+                or _has_wildcard(expanded_value)
+                # Defense in depth: word-splitting does not re-run the parser, so a `;` in
+                # the value is an inert argument rather than a new command -- but a value
+                # that carries one was likely meant as a command, and splicing it is too
+                # sharp an edge to auto-approve. A value destined for the argument list is
+                # plain flags and operands or it is not spliced.
+                or any(ch in expanded_value for ch in ";|&<>`()$\n")
+            ):
+                continue
+            # Bash expands a leading tilde in an assignment's value, so `x=~/a` holds the
+            # home-relative path, not the two characters. Storing the expansion is what lets
+            # the read scope see where `"$x"` really points. `x=~-` holds `$OLDPWD`, which
+            # the shell holds: no value here to read.
+            if value_token.startswith("~"):
+                directory = _tilde_expansion(expanded_value)
+                if directory is None:
+                    continue
+                expanded_value = directory
+            assigned[name] = expanded_value.split()
+    return assigned
+
+
+# Characters after which a path's final text is left for the shell to decide.
+PATH_SPECIAL = re.compile(r"[$*?\[{`]")
+
+# Stands for one directory entry's name: no `/`, never `.` or `..`. Only the read scope
+# uses it, to say "some file inside this directory"; it never exempts a word from the flag
+# check, because a directory can hold a file called `-rf`.
+PATH_COMPONENT = "\x02entry\x02"
+
+# A command substitution whose output is bare directory-entry names: `ls`, or `ls` with
+# relative directory operands and only the flags that change layout, never `-a`.
+LISTING_BODY = re.compile(r"^\s*ls(?:\s+-1)?(?:\s+[A-Za-z0-9_./-]+)*\s*$")
+
+
+def _glob_may_climb(path: str, *, dot_components: bool = True) -> bool:
+    """Whether a path the shell globs can land above the directory in front of its wildcard.
+
+    The read scope places a globbed path in that directory, which holds only while nothing
+    from the wildcard on climbs out of it. A `..` after the wildcard, as in `*/../../x`, climbs
+    from whatever the wildcard matched. A component that starts with `.` and carries a
+    wildcard, as `.*` and `.?` do, matches `..` itself in a bash older than 5.2, or in one
+    with `globskipdots` off; without `dot_components`, only a `..` counts.
+    """
+    special = PATH_SPECIAL.search(path)
+    if special is None:
+        return False
+    start = path.rfind("/", 0, special.start()) + 1
+    return any(
+        component == ".." or (dot_components and _may_match_dot_dot(component))
+        for component in path[start:].split("/")
+    )
+
+
+def _may_match_dot_dot(component: str) -> bool:
+    """Whether a glob component can match `..`: a `.`, then a rest that can be `.` alone.
+
+    `.*`, `.?` and `.[!a]` can; `.env*` can't, as its `e` is no `.`. A bracket expression counts
+    as one that matches `.`, and a value the shell supplies, `$`, `{` or a backtick, as one that
+    may be `.`, both of which err toward a climb.
+    """
+    if not component.startswith("."):
+        return False
+    rest = component[1:]
+    if any(char in rest for char in "${`"):
+        return True
+    positions = {0}  # how much of the one-character "." the pattern has consumed
+    index = 0
+    while index < len(rest) and positions:
+        char = rest[index]
+        # TODO: `_bracket_end` gives None, not -1, for a `[` nothing closes, so `.[x*` raises a
+        # `TypeError` at the comparison below, which `main` turns into silence: the function
+        # this was written against had the same name, and the later definition replaced it
+        close = _bracket_end(rest, index) if char == "[" else -1
+        if char == "*":
+            positions = {0, 1} if 0 in positions else positions
+        elif char == "?" or close >= 0:
+            positions = {1} if 0 in positions else set()
+            index = close if close >= 0 else index
+        else:
+            positions = {1} if char == "." and 0 in positions else set()
+        index += 1
+    return 1 in positions
+
+
+def _tilde_expansion(text: str) -> str | None:
+    """The directory a word starting with an unquoted `~` names, or None where the shell picks it.
+
+    `~` and `~/x` are in the home directory. Any other prefix is a value the shell holds:
+    `~+` and `~-` are `$PWD` and `$OLDPWD`, and `~1`, `~+1` and `~-1` entries of the directory
+    stack. zsh reads `~name` as a named directory before a user's home: one a startup file's
+    `hash -d` names, or a parameter whose value starts with `/`, as `~HOME` and `~OLDPWD` are.
+    `os.path.expanduser` leaves each of these as the text it is, a name in the project, unless a
+    user has the name, whose home directory bash reads.
+    """
+    if text[1:].split("/", 1)[0]:
+        return None
+    return os.path.expanduser(text)
+
+
+def _tilde_word(text: str) -> str:
+    """``text``, which starts with an unquoted `~`, with its prefix read by `_tilde_expansion`.
+
+    Where the shell picks the directory, it is `UNREAD_VALUE`, and the rest of the word below it.
+    """
+    directory = _tilde_expansion(text)
+    if directory is not None:
+        return directory
+    _, slash, rest = text.partition("/")
+    return UNREAD_VALUE + slash + rest
+
+
+def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | None:
+    """What one `for`-list word contributes to the variable, for the read scope.
+
+    A literal word is itself. An unquoted glob is a name inside its literal directory. A
+    `$(ls ...)` is a bare name. Anything else -- a substitution with another body, a
+    parameter expansion, a glob that could match `.` or `..` -- is None: unresolvable.
+    """
+    expanded = _expand(token, parts)
+    whole = PLACEHOLDER.fullmatch(token)
+    if whole is not None and parts[int(whole.group(1))][0] == SUBSTITUTION:
+        body = parts[int(whole.group(1))][1]
+        if LISTING_BODY.match(body) and not re.search(r"\s-[A-Za-z]*a", body) and ".." not in body:
+            return [PATH_COMPONENT]
+        return None
+    if _carries_substitution(token, parts) or _has_bare_variable(token, parts):
+        return None
+    if _carries_brace_expansion(token):
+        return None
+    if _carries_live_glob(token):
+        head = PATH_SPECIAL.split(expanded, 1)[0]
+        directory = head.rpartition("/")[0]
+        if (
+            _glob_may_climb(expanded)
+            or expanded.startswith(("/", "~"))
+            or ".." in directory.split("/")
+        ):
+            return None
+        return [f"{directory}/{PATH_COMPONENT}" if directory else PATH_COMPONENT]
+    # Quoted, the word is a literal here, but bash globs it again where an unquoted `$f` uses
+    # it: `for f in '.?'; do grep -r x $f; done` reads `..` in a bash older than 5.2. Placed as
+    # the literal it spells, such a value would be measured below the directory it climbs from.
+    if _has_wildcard(expanded) and _glob_may_climb(expanded):
+        return None
+    # Both shells expand a `~` that starts a word of the list: `for p in ~` binds the home
+    # directory, which the text `~` would place in the project
+    if token.startswith("~"):
+        directory = _tilde_expansion(expanded)
+        return None if directory is None else [directory]
+    return [expanded]
+
+
+def _literal_loop_values(
+    segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
+) -> dict[str, list[str]]:
+    """The values each `for` variable can take, for resolving it inside a path.
+
+    Wider than `_safe_loop_names`: a glob or `$(ls)` list resolves here, so `"$f"` can be
+    placed inside a directory, but it is never a reason to exempt `"$f"` from the flag check.
+    A name is left out unless the loop is the one binding of it that `_bindings` counts, and
+    its list is resolvable: `for p in .; do p=~; ...` reads `~`.
+    """
+    values: dict[str, list[str]] = {}
+    for segment in segments:
+        if len(segment) < 3 or segment[0] not in WORD_LIST_HEADS or segment[2] != "in":
+            continue
+        name = _expand(segment[1], parts)
+        if bindings.get(name) != 1:
+            continue
+        shapes: list[str] = []
+        for word in segment[3:]:
+            shape = _loop_value_shapes(word, parts)
+            if shape is None:
+                break
+            shapes.extend(shape)
+        else:
+            values[name] = shapes
+    return values
+
+
+# A `for name in word...` header whose list is entirely literal words that do not begin
+# with `-`. When that holds, every value `name` can take is spelled out in the command and
+# none is a flag, so a later bare `"$name"` cannot arrive as one -- which is the single
+# case `_word_the_shell_decides` may exempt. The header is read before its body because a
+# segment-by-segment pass has already discarded it (`_strip_structure` returns `[]` for a
+# loop head), so the safe names are collected here and passed down.
+#
+# The list must be literal to count: a `$(...)` body, a `${arr[@]}`, or any word the shell
+# still has to build says nothing about what `name` will hold and yields no exemption. And
+# such headers must be every binding of `name` that `_bindings` counts: an assignment in the
+# body, `for p in a; do p=-i; ...`, or a zsh header that binds it second, `for q p in x -i`,
+# leaves it bound to a value no header spells.
+def _safe_loop_names(
+    segments: list[list[str]],
+    parts: list[tuple[str, str]],
+    bindings: dict[str, int],
+    known_values: dict[str, list[str] | None],
+) -> frozenset[str]:
+    safe: dict[str, int] = {}
+    for segment in segments:
+        if len(segment) < 3 or segment[0] not in WORD_LIST_HEADS or segment[2] != "in":
+            continue
+        name = _expand(segment[1], parts)
+        values = segment[3:]
+        if values and all(_value_is_literal_non_flag(word, parts, known_values) for word in values):
+            safe[name] = safe.get(name, 0) + 1
+    return frozenset(name for name, count in safe.items() if bindings.get(name) == count)
+
+
+def _value_is_literal_non_flag(
+    token: str, parts: list[tuple[str, str]], known_values: dict[str, list[str] | None]
+) -> bool:
+    """A single loop-list value that the operator wrote out and that is not a flag.
+
+    It must carry no substitution, glob or brace the shell would still act on, and not be
+    nothing but expansions, as `_word_the_shell_decides` reads them. An expansion glued to
+    literal text is read with the values the command sets, as `_word_shapes` reads an
+    argument's: `o=--o; for p in ${o}utput=x` is `--output=x`. No shape may begin with `-`, nor
+    be one `_flag_an_expansion_spells`, and an unquoted expansion must hold a value bash
+    neither splits nor globs, as `_unclean_expansion` reads it.
+    """
+    if _word_the_shell_decides(token, parts) or _carries_substitution(token, parts):
+        return False
+    if _carries_live_glob(token) or _carries_brace_expansion(token):
+        return False
+    if _unclean_expansion(token, known_values) is not None:
+        return False
+    shapes = _word_shapes(token, parts, known_values)
+    return shapes is not None and not any(
+        shape.startswith("-") or _flag_an_expansion_spells(shape) for shape in shapes
     )
 
 
@@ -1980,6 +1725,15 @@ def _known_values(
     return {name: values.get(name) for name in bindings}
 
 
+# A parameter expansion in the unquoted part of a word: `$q`, `${q}`, `${=q}`, `${q:-x}`.
+UNQUOTED_EXPANSION = re.compile(r"\$\{?=?([A-Za-z_][A-Za-z0-9_]*)")
+
+# What a clean value may not hold: a separator, which splits it into words, and a pattern
+# character, which can close a pattern with the text around the use: `q=']'; sort [-${q}o` is
+# `[-]o`. A parenthesis is one under bash's `extglob`.
+UNSAFE_IN_A_GLUED_VALUE = frozenset(" \t\n*?[]()")
+
+
 def _unclean_expansion(token: str, known_values: dict[str, list[str] | None]) -> str | None:
     """The first expansion in the unquoted part of ``token`` that bash may split or glob.
 
@@ -2002,6 +1756,7 @@ def _unclean_expansion(token: str, known_values: dict[str, list[str] | None]) ->
 # The credential check reads every such value, and a working directory it can't resolve, as
 # `UNREAD_VALUE`: any directory, see `_below_an_unread_value`.
 UNREAD_VALUE = "\x02"
+
 OPERATOR_VALUE = "\x03"
 
 # An expansion in unquoted or double-quoted text: a plain `$q` or `${q}`, or any other `$` form.
@@ -2012,6 +1767,7 @@ TEXT_EXPANSION = re.compile(
 # The most shapes one word, or one argument list, is read as: each is a combination of the
 # values its names hold. Past it, the word is one this module cannot read.
 MAX_WORD_SHAPES = 64
+
 TOO_MANY_SHAPES = "too many combinations of the values this command sets to read"
 
 
@@ -2112,180 +1868,2593 @@ def _arg_variants(
     return [list(variant) for variant in itertools.product(*choices) if list(variant) != args]
 
 
-def _value_is_literal_non_flag(
-    token: str, parts: list[tuple[str, str]], known_values: dict[str, list[str] | None]
-) -> bool:
-    """A single loop-list value that the operator wrote out and that is not a flag.
+# --------------------------------------------------------------------------------------
+# The operator's settings: the second tier
+#
+# The allow and deny rules, and `additionalDirectories`, of the project's settings files, read
+# only where Claude Code applies the file.
+# --------------------------------------------------------------------------------------
 
-    It must carry no substitution, glob or brace the shell would still act on, and not be
-    nothing but expansions, as `_word_the_shell_decides` reads them. An expansion glued to
-    literal text is read with the values the command sets, as `_word_shapes` reads an
-    argument's: `o=--o; for p in ${o}utput=x` is `--output=x`. No shape may begin with `-`, nor
-    be one `_flag_an_expansion_spells`, and an unquoted expansion must hold a value bash
-    neither splits nor globs, as `_unclean_expansion` reads it.
+# Where the operator's own rules live, and the variable a test points somewhere else. An
+# empty value turns the second tier off, which is how the classifier is exercised alone.
+SETTINGS_ENV = "SH_AUTO_APPROVE_SETTINGS"
+
+SETTINGS_FILES = (".claude/settings.json", ".claude/settings.local.json")
+
+# A settings file larger than this is not one anyone wrote, and reading it costs the Bash call
+# it was supposed to approve. A hand-written one is a few KB, so the cap is some tens of times
+# that and still small enough to read on every call.
+SETTINGS_SIZE_CAP = 256 * 1024
+
+# Claude Code's process id, which it sets for the processes it starts. This hook is one, so its
+# parent process is Claude Code, whose command line holds `--setting-sources`.
+CLAUDE_PID_ENV = "CLAUDE_PID"
+
+# While the first is set, Claude Code counts no trust record; while the second is, it keeps its
+# global config, where the trust records are, in a file of another name
+IGNORE_TRUST_ENV = "CLAUDE_CODE_IGNORE_PERSISTED_TRUST"
+
+CUSTOM_OAUTH_ENV = "CLAUDE_CODE_CUSTOM_OAUTH_URL"
+
+# Claude Code's global config is `.claude.json` in this directory, or else in the home directory.
+# It grows with every project a session ran in: one with 30 projects is about 160 KB.
+CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
+
+GLOBAL_CONFIG_SIZE_CAP = 32 * 1024 * 1024
+
+# The `.git` file of a worktree, and the `commondir` and `gitdir` files git writes for one, hold a
+# single path, in which a control character is not one git wrote
+GIT_POINTER_SIZE_CAP = 4096
+
+GIT_POINTER_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+# How long `ps` may take to print Claude Code's command line on macOS, where there is no /proc
+PARENT_COMMAND_LINE_TIMEOUT = 5.0
+
+
+class _GlobRule:
+    """A ``Bash(...)`` rule body as an anchored ``*``-glob, matched without a regexp.
+
+    ``"*x" * 12 + "y"`` translated to ``.*x.*x...y`` and matched against a four-hundred
+    character command takes minutes: every star can give back, and the engine tries all
+    of it before reporting no match. A hook that takes minutes is a Bash call that takes
+    minutes, since the host waits for the decision.
+
+    ``*`` is the only wildcard a Bash rule has, and for a pure-``*`` glob the leftmost match
+    of each piece is always the right one -- taking more of the text can only make the
+    rest harder to place. So a single forward scan decides it, in time proportional to
+    the command length, with no backtracking to bound.
     """
-    if _word_the_shell_decides(token, parts) or _carries_substitution(token, parts):
-        return False
-    if _carries_live_glob(token) or _carries_brace_expansion(token):
-        return False
-    if _unclean_expansion(token, known_values) is not None:
-        return False
-    shapes = _word_shapes(token, parts, known_values)
-    return shapes is not None and not any(
-        shape.startswith("-") or _flag_an_expansion_spells(shape) for shape in shapes
-    )
 
+    __slots__ = ("pieces", "source")
 
-def _word_the_shell_decides(token: str, parts: list[tuple[str, str]]) -> bool:
-    """Whether the shell, not the operator, decides what kind of word this is.
+    def __init__(self, body: str) -> None:
+        self.pieces = body.split("*")
+        self.source = body
 
-    Every flag table reads a word that is already complete. Two shapes are not:
-
-    * a word carrying a command substitution, because the body ran and its output is
-        this word -- ``sort "$(echo -o)" PWNED`` is ``sort -o PWNED`` and says so nowhere;
-    * a word that is nothing but parameter expansions, because its whole text, leading
-        ``-`` included, was set by some earlier command in the same shell -- ``sort ${o}``
-        is whatever ``o`` holds.
-
-    A parameter glued to literal text is neither, and that is deliberate: the everyday idioms
-    are ``"${_p}-example-project"``, a key with a suffix, and ``--project="${p}"``, a flag
-    whose value is a parameter. Refusing those buys nothing -- the option is already spelled
-    out in the command -- and costs every such loop.
-    The residual is narrow and real: ``"${o}-x"`` is still a flag if ``o`` begins with one.
-    """
-    if _carries_substitution(token, parts):
+    def match(self, text: str) -> bool:
+        """Whether the whole of ``text`` matches, which is the rule's own semantics."""
+        first, last = self.pieces[0], self.pieces[-1]
+        if len(self.pieces) == 1:
+            return text == first
+        if not text.startswith(first) or not text.endswith(last):
+            return False
+        position, limit = len(first), len(text) - len(last)
+        if position > limit:
+            return False
+        for piece in self.pieces[1:-1]:
+            found = text.find(piece, position, limit)
+            if found < 0:
+                return False
+            position = found + len(piece)
         return True
 
-    index, length, expansions = 0, len(token), False
-    while index < length:
-        match = PLACEHOLDER.match(token, index)
-        if match is None:
-            end = token.find(PLACEHOLDER_MARK, index)
-            chunk = token[index : length if end < 0 else end]
-            if not EXPANSION_ONLY.fullmatch(chunk):
-                return False
-            expansions = True
-            index = length if end < 0 else end
+
+def _rule_pattern(rule: str, *, blanket: bool = False) -> _GlobRule | None:
+    """A ``Bash(...)`` permission rule as a pattern over one simple command's text.
+
+    Quotes are dropped from both sides of the comparison, because the text a segment is
+    matched against has already been through the lexer: the rule
+    ``Bash(firebase database:get '/.settings/rules' *)`` and the command the operator wrote
+    differ by the quotes alone. A rule for another tool matches nothing here and returns
+    ``None``, and so does a blanket ``Bash(*)`` unless ``blanket`` is set: granting everything
+    is a decision for the operator's own rule file to carry out, not for this hook to
+    infer, while a blanket *deny* has to keep its reach.
+    """
+    if not rule.startswith("Bash(") or not rule.endswith(")"):
+        return None
+    body = rule[len("Bash(") : -1].strip().replace("'", "").replace('"', "")
+    if not body or (not blanket and set(body) <= {"*"}):
+        return None
+    return _GlobRule(body)
+
+
+def _operator_rules(
+    settings: tuple[list[dict], bool] | None = None,
+) -> tuple[list[_GlobRule], list[_GlobRule]]:
+    """The allow and deny rules the operator has already written, as patterns.
+
+    This is the second tier, and the whole of its safety argument: a command that matches
+    an allow rule is one Claude Code would run with no prompt if it stood on its own. The
+    host requires every sub-command of a compound to match a rule independently, which is
+    exactly what the caller does with these -- so recognizing them here does not widen
+    what the operator granted, it stops a pipeline losing the grant because one filter in
+    the middle of it has no rule of its own. It holds only for a rule Claude Code applies,
+    which is why ``_settings_permissions`` drops the allow rules of a file it doesn't.
+
+    Nothing is cached: the file is small, it is read once per Bash call, and a rule the
+    operator saved a moment ago through "yes, and don't ask again" applies immediately.
+
+    A file that exists and cannot be used is a file whose rules this module cannot see
+    (see ``_settings_permissions``), so the second tier is turned off for the call rather
+    than run on a partial reading of what the operator wrote. Allow rules are what tier 2
+    spends, and dropping them can only cost a prompt; deny rules that were read stay, and
+    the host evaluates its own regardless of what this hook returns.
+    """
+    allow: list[_GlobRule] = []
+    deny: list[_GlobRule] = []
+
+    found, usable = settings or _settings_permissions()
+    for permissions in found:
+        for key, target, blanket in (("allow", allow, False), ("deny", deny, True)):
+            for rule in permissions.get(key) or []:
+                if not isinstance(rule, str):
+                    continue
+                pattern = _rule_pattern(rule, blanket=blanket)
+                if pattern is not None:
+                    target.append(pattern)
+
+    return (allow if usable else []), deny
+
+
+def _settings_permissions() -> tuple[list[dict], bool]:
+    """The ``permissions`` object of each settings file, and whether every file there was usable.
+
+    Only a regular file under ``SETTINGS_SIZE_CAP`` is opened, and the decision is made
+    from ``stat`` so that a file failing either test costs nothing at all. A named pipe
+    with no writer blocks in ``open`` forever, and the host's own hook timeout is ten
+    minutes: that is not a bypass, but it is the whole Bash call spent waiting for a file
+    that was never going to answer.
+
+    A file that is missing is the ordinary case and means nothing. A file that exists and
+    cannot be used -- wrong kind, too large, unreadable, not JSON, no ``permissions`` --
+    makes the second value false, and each caller decides what that costs it.
+
+    Of a project file Claude Code doesn't apply in this session (``_sources_in_force``), only
+    the deny and ask rules are kept: they can only cost a prompt. The files ``SETTINGS_ENV``
+    names instead stand for files Claude Code applies.
+    """
+    override = os.environ.get(SETTINGS_ENV)
+    if override is None:
+        files = [(REPO_ROOT / name, SETTING_SOURCE_OF[name]) for name in SETTINGS_FILES]
+    else:
+        files = [(Path(piece), None) for piece in override.split(os.pathsep) if piece]
+
+    found: list[dict] = []
+    usable = True
+    in_force: frozenset[str] | None = None
+    for path, source in files:
+        try:
+            present, document = _load_settings_file(path)
+            if not present:
+                continue  # a settings file that is simply absent, which is the normal case
+            permissions = document["permissions"]
+        except (OSError, ValueError, KeyError, TypeError, RecursionError):
+            usable = False  # it is there and it cannot be read; see the docstring
             continue
-        kind, value = parts[int(match.group(1))]
-        # Single quotes and a backslash make the text literal; double quotes do not, and
-        # ``"${o}"`` expands exactly as ``${o}`` does.
-        if value:
-            if kind != DOUBLE_QUOTED or not EXPANSION_ONLY.fullmatch(value):
-                return False
-            expansions = True
-        index = match.end()
-    return expansions
+        if not isinstance(permissions, dict):
+            continue
+        if source is not None:
+            if in_force is None:
+                in_force = _sources_in_force()
+            if source not in in_force:
+                kept = ("deny", "ask")
+                permissions = {key: permissions[key] for key in kept if key in permissions}
+        found.append(permissions)
+    return found, usable
 
 
-def _bundled_short(arg: str, letters: str, value_letters: str = "") -> bool:
-    """Whether a short-option cluster carries one of ``letters``.
+def _load_settings_file(path: Path) -> tuple[bool, object]:
+    """Whether a settings file is there, and its document when it is.
 
-    ``-ni`` is one argument whose second letter is the write flag, so a table keyed on the
-    argument as a whole does not see it and a ``startswith('-i')`` guard does not fire.
-    Only the leading run of letters is read: an option that takes an inline value ends
-    the cluster, so ``sort -k1,1`` is ``k`` and not an ``o`` hiding behind a digit.
-
-    ``value_letters`` names the options whose value can be attached *letters*, which a
-    non-letter test cannot see the end of: ``date -Iseconds`` is ``-I`` with the value
-    ``seconds``, not ``-I -s ...``, and ``sort -to`` is ``-t`` with the separator ``o``.
-    The cluster stops after one of those. A caller that passes none is saying it has none.
+    Raises ``OSError``, ``ValueError`` or ``RecursionError`` for a file that is there and cannot
+    be read. A directory, a FIFO, a device or an oversized file is never opened: the first would
+    block for the length of the Bash call and the last would be read on every one of them.
     """
-    if not arg.startswith("-") or arg.startswith("--"):
-        return False
-    cluster = ""
-    for char in arg[1:]:
-        if not char.isalpha():
-            break
-        cluster += char
-        if char in value_letters:
-            break
-    return any(letter in cluster for letter in letters)
-
-
-def _tokenize(command: str) -> list[str]:
-    """Tokenize command into shell words with bash-aligned punctuation and comments.
-
-    The input is the reduced command, so there is no quoting left to interpret and the
-    lexer's only remaining job is to split on whitespace and on punctuation, exactly as
-    bash does.
-    """
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    # Do not let shlex drop comments mid-token; '#' must be handled safely
-    lexer.commenters = ""
     try:
-        return list(lexer)
-    except ValueError as exc:
-        raise NotReadOnly(f"unparseable syntax: {exc}") from exc
+        info = path.stat()  # follows a link, and raises for one that dangles
+    except OSError:
+        return False, None
+    if not S_ISREG(info.st_mode) or info.st_size > SETTINGS_SIZE_CAP:
+        raise ValueError("not a settings file this module will read")
+    return True, json.loads(path.read_text(encoding="utf-8", errors="replace"))
 
 
-def _segments(tokens: list[str]) -> list[list[str]]:
-    """Split token stream into simple commands, strictly rejecting invalid punctuation."""
-    out: list[list[str]] = [[]]
-    for token in tokens:
-        # Check if the token consists purely of punctuation characters
-        if set(token).issubset(PUNCTUATION_CHARS):
-            if token in SEPARATORS:
-                out.append([])
-            else:
-                # Any punctuation run not matching exact separators (; | && || & |& \n)
-                # is a redirection, subshell, or glued syntax (e.g. ';(', ';>', '<>', '&>>')
-                raise NotReadOnly(f"disallowed punctuation or redirection: {token}")
-        elif any(c in "<>" for c in token) or token.endswith(("&", "|", ";")):
-            raise NotReadOnly(f"redirection or separator inside token: {token}")
+def _permissions_of(document: object) -> dict | None:
+    """A settings document's ``permissions``: ``{}`` when it has none, ``None`` when unreadable."""
+    if not isinstance(document, dict):
+        return None
+    permissions = document.get("permissions", {})
+    return permissions if isinstance(permissions, dict) else None
+
+
+def _sources_in_force() -> frozenset[str]:
+    """The project's setting sources whose allow rules and directories Claude Code applies.
+
+    ``project`` is ``.claude/settings.json``, and ``local`` ``.claude/settings.local.json``.
+    Claude Code applies them in a session that loaded their source, which ``--setting-sources``
+    may leave out, and in a workspace it has a trust record for. Without one it ignores both
+    and says so on stderr: "Ignoring 1 permissions.allow entry from .claude/settings.json: this
+    workspace has not been trusted". An interactive session asks for that trust before it runs
+    any hook, but ``claude -p`` and the SDK run hooks in a workspace that has none, so a
+    repository's own file would otherwise get its commands approved here and nowhere else.
+
+    The source of truth is Claude Code 2.1.322's own code: it applies both files once its
+    global config holds a trust record for the workspace's key (``_trust_key``). It applies the
+    local file without one too, where git doesn't track it and ``.claude`` is no link, while a
+    folder above holds a record. This module asks for the record in that case as well, which
+    costs a prompt there and nothing else.
+    """
+    if not _workspace_trusted():
+        return frozenset()
+    return _session_setting_sources() & frozenset(SETTING_SOURCE_OF.values())
+
+
+def _session_setting_sources() -> frozenset[str]:
+    """The setting sources the session loaded, read once from Claude Code's command line.
+
+    None at all where the command line cannot be read: what it would have said is unknown.
+    """
+    global _SETTING_SOURCES  # noqa: PLW0603 - one process per call
+    if _SETTING_SOURCES is None:
+        argv = _claude_code_argv()
+        _SETTING_SOURCES = frozenset() if argv is None else _setting_sources(argv)
+    return _SETTING_SOURCES
+
+
+def _setting_sources(argv: list[str]) -> frozenset[str]:
+    """The setting sources a Claude Code command line loads.
+
+    Every source without ``--setting-sources``, the ones it lists with it, spelled as
+    ``--setting-sources user,project`` or ``--setting-sources=user,project``. Each time the
+    flag appears narrows the set, though the last one counts: a prompt that spells the flag
+    costs a prompt, never a source the session left out.
+    """
+    sources = set(SETTING_SOURCES)
+    for index, word in enumerate(argv):
+        if word == SETTING_SOURCES_FLAG:
+            value = argv[index + 1] if index + 1 < len(argv) else ""
+        elif word.startswith(SETTING_SOURCES_FLAG + "="):
+            value = word[len(SETTING_SOURCES_FLAG) + 1 :]
         else:
-            out[-1].append(token)
-    return [segment for segment in out if segment]
+            continue
+        sources &= {piece.strip() for piece in value.split(",")}
+    return frozenset(sources)
 
 
-def _strip_structure(words: list[str]) -> list[str]:
-    """The simple command in this segment, past the control structure in front of it.
+def _claude_code_argv() -> list[str] | None:
+    """The command line of this process's parent, Claude Code, or None where it cannot be read.
 
-    Refuses what `_command_index` refuses on the way to it: a binding of a name
-    `_names_the_environment` names, by an assignment or a `for` header, a header `_check_loop_names`
-    refuses, and an assignment that prefixes a command.
+    ``hooks/hooks.json`` runs the hook in exec form, with no shell between, as Claude Code
+    2.1.322 does. Claude Code names its own process in ``CLAUDE_PID``, and a parent that is
+    another is not read: its command line would say nothing of the session's sources.
     """
-    start = _command_index(words, refuse=True)
-    return [] if start is None else words[start:]
+    parent = os.getppid()
+    claimed = os.environ.get(CLAUDE_PID_ENV)
+    if parent <= 1 or (claimed is not None and claimed != str(parent)):
+        return None
+    if sys.platform == "linux":
+        try:
+            with open(f"/proc/{parent}/cmdline", "rb") as stream:
+                raw = stream.read()
+        except OSError:
+            return None
+        # Each argument ends in a NUL, so an empty one, as in `--setting-sources ''`, stays one
+        return [arg.decode("utf-8", "surrogateescape") for arg in raw.split(b"\0")[:-1]] or None
+
+    # macOS has no /proc. `ps` joins the arguments with spaces, which only ever adds a word.
+    import subprocess  # noqa: PLC0415 - as in `_run_git_uncached`, only where it is needed
+
+    try:
+        result = subprocess.run(  # noqa: S603 - the system's own `ps`, and arguments written here
+            ["/bin/ps", "-ww", "-o", "args=", "-p", str(parent)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=PARENT_COMMAND_LINE_TIMEOUT,
+            check=False,
+        )
+        text = result.stdout.decode("utf-8", "surrogateescape")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return text.split() if result.returncode == 0 and text.strip() else None
 
 
-def _names_the_environment(name: str) -> bool:
-    """Whether a later command, or the shell itself, reads ``name``'s value as configuration.
+def _workspace_trusted() -> bool:
+    """Whether Claude Code's global config holds a trust record for the workspace of the project.
 
-    `PATH` picks the program a word runs, `HOME` where git and the vendor CLIs read their
-    config, `IFS` how every later expansion splits, which a command may set by assigning the
-    name or by looping over it. The check upper-cases the name, so zsh's `path`, tied to `PATH`,
-    is one too.
+    The record is ``projects[<key>].hasTrustDialogAccepted: true`` in ``.claude.json``, an
+    internal format: whatever doesn't read as one is no trust. So is a key Claude Code never
+    records, the home directory's, and every key while ``IGNORE_TRUST_ENV`` is set. Where a
+    legacy ``.config.json`` is left, Claude Code may read that file instead, and this module
+    doesn't guess which.
     """
-    return (
-        name.upper() in DANGEROUS_ENV_VARS
-        or name.startswith(("LD_", "GIT_", "BASH_", "AWS_", "CLOUDSDK_"))
-        or name != name.lower()
+    if os.environ.get(IGNORE_TRUST_ENV) or os.environ.get(CUSTOM_OAUTH_ENV):
+        return False
+    key = _trust_key(Path(REPO_ROOT))
+    config_dir = os.environ.get(CONFIG_DIR_ENV) or None
+    if (
+        key is None
+        or key == os.path.realpath(_home())
+        or (config_dir is not None and not os.path.isabs(config_dir))
+    ):
+        return False
+    legacy_dirs = {config_dir or os.path.join(_home(), ".claude"), os.path.join(_home(), ".claude")}
+    if any(os.path.lexists(os.path.join(d, ".config.json")) for d in legacy_dirs):
+        return False
+    path = Path(config_dir or _home(), ".claude.json")
+    try:
+        info = path.stat()
+        if not S_ISREG(info.st_mode) or info.st_size > GLOBAL_CONFIG_SIZE_CAP:
+            return False
+        record = json.loads(path.read_text(encoding="utf-8"))["projects"][key]
+        return record["hasTrustDialogAccepted"] is True
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        return False
+
+
+def _trust_key(project: Path) -> str | None:
+    """The key Claude Code records the trust of a session started in ``project`` under.
+
+    The root of the git worktree around it, or the main worktree's for a linked worktree
+    (``_main_worktree``), or else ``project`` itself, as Claude Code 2.1.322 works it out. A
+    ``.git`` that is a link or that cannot be looked at leaves the key unknown, and None.
+    """
+    for directory in (project, *project.parents):
+        try:
+            mode = (directory / ".git").lstat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        if S_ISDIR(mode):
+            return str(directory)
+        if S_ISREG(mode):
+            return _main_worktree(directory)
+        return None
+    return str(project)
+
+
+def _main_worktree(root: Path) -> str | None:
+    """The key for the trust of the worktree at ``root``, whose ``.git`` is a file.
+
+    A linked worktree git made is keyed by its main worktree: ``root/.git`` names a git dir
+    under ``<main>/.git/worktrees/``, whose ``commondir`` leads back to ``<main>/.git`` and whose
+    own ``gitdir`` names ``root/.git``. A submodule's git dir has no ``commondir``, and Claude
+    Code keys it by ``root``. Anything else is None, rather than a guess at which of the two
+    Claude Code settles on.
+    """
+    line = _git_pointer(root / ".git")
+    if line is None or not line.startswith("gitdir:"):
+        return None
+    gitdir = os.path.normpath(os.path.join(root, line[len("gitdir:") :].strip()))
+    if not os.path.isdir(gitdir):
+        return None
+    if not os.path.lexists(os.path.join(gitdir, "commondir")):
+        return str(root)
+    common_line = _git_pointer(Path(gitdir, "commondir"))
+    back_line = _git_pointer(Path(gitdir, "gitdir"))
+    if common_line is None or back_line is None:
+        return None
+    common = os.path.normpath(os.path.join(gitdir, common_line))
+    main = os.path.dirname(common)
+    if (
+        os.path.basename(common) != ".git"
+        or os.path.dirname(gitdir) != os.path.join(common, "worktrees")
+        or os.path.normpath(os.path.join(gitdir, back_line)) != os.path.join(root, ".git")
+        or os.path.realpath(main) != main
+    ):
+        return None
+    return main
+
+
+def _git_pointer(path: Path) -> str | None:
+    """The one line of a small regular file that holds a path, as git writes them, or None."""
+    try:
+        info = path.lstat()
+        if not S_ISREG(info.st_mode) or info.st_size > GIT_POINTER_SIZE_CAP:
+            return None
+        line = path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return None
+    return line if line and not GIT_POINTER_CONTROL.search(line) else None
+
+
+# Claude Code applies a deny or ask rule from every settings file, and none to a `curl`, so the
+# hook reads the `WebFetch` ones beyond the project's files as well: the user's, in the directory
+# `CLAUDE_CONFIG_DIR` (`CONFIG_DIR_ENV`) names or else `~/.claude`, and the managed file with the
+# `*.json` files in the `managed-settings.d/` beside it. Managed settings that are no file on
+# disk, from the server or a macOS configuration profile, are out of its view. Source: the
+# settings and managed-settings pages of Claude Code's docs.
+MANAGED_SETTINGS_DIRS = {
+    "linux": "/etc/claude-code",
+    "darwin": "/Library/Application Support/ClaudeCode",
+}
+
+# Set in managed settings, it makes Claude Code ignore the project's permission rules, the
+# `WebFetch` allow rules the list comes from among them
+MANAGED_RULES_ONLY = "allowManagedPermissionRulesOnly"
+
+
+def _managed_rules_only(document: object) -> bool:
+    """Whether a managed settings document sets ``MANAGED_RULES_ONLY``.
+
+    At the top level or in ``permissions``: it is read as set wherever it is.
+    """
+    permissions = _permissions_of(document) or {}
+    return isinstance(document, dict) and bool(
+        document.get(MANAGED_RULES_ONLY) or permissions.get(MANAGED_RULES_ONLY)
     )
 
 
-# A word a `for` header binds. Both shells reject any other there, a quoted name among them, so
-# a word this doesn't match is no name the hook reads
-LOOP_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+def _managed_settings_dir() -> str | None:
+    """Where this platform keeps managed settings files, or ``None``."""
+    return MANAGED_SETTINGS_DIRS.get(sys.platform)
 
 
-def _check_loop_names(names: list[str]) -> None:
-    """Refuse a `for` header whose names, as `_header` reads them, hold one the hook refuses.
+def _outside_settings() -> tuple[list[object], list[object], bool]:
+    """The user's settings document and the managed ones, and whether every one could be read.
 
-    Each gets the check an assignment's name gets: zsh binds every one of them, so `for q PATH
-    in a .` sets `PATH` to `.`, as `for PATH in .` does in both shells. The first word is a name
-    even when it is `in`, `do` or another reserved word: zsh's `for in PATH in . .` sets `PATH`
-    to `.` too. A header that holds any other reserved word is refused, as zsh starts the
-    loop's body there.
+    A missing file means nothing. A file that cannot be read may hold a deny rule, so the third
+    value is then false, and so it is for a ``CLAUDE_CONFIG_DIR`` or home directory that is not
+    absolute, or a ``managed-settings.d/`` that cannot be listed.
     """
-    for index, word in enumerate(names):
-        if index and word in ZSH_RESERVED_WORDS:
-            raise NotReadOnly(f"a for header holds a word zsh runs as the loop's body: {word}")
-        if not LOOP_NAME.match(word):
-            raise NotReadOnly("a for header binds a word that is not a plain name")
-        if _names_the_environment(word):
-            raise NotReadOnly(f"a for loop over a refused environment variable: {word}")
+    config = os.environ.get(CONFIG_DIR_ENV) or os.path.join(_home(), ".claude")
+    if not os.path.isabs(config):
+        return [], [], False
+    groups: tuple[list[Path], list[Path]] = ([Path(config, "settings.json")], [])
+    managed = _managed_settings_dir()
+    if managed:
+        drop_ins = Path(managed, "managed-settings.d")
+        try:
+            names = sorted(os.listdir(drop_ins))
+        except (FileNotFoundError, NotADirectoryError):
+            names = []
+        except OSError:
+            return [], [], False
+        groups[1].append(Path(managed, "managed-settings.json"))
+        groups[1].extend(drop_ins / name for name in names if name.endswith(".json"))
+    documents: tuple[list[object], list[object]] = ([], [])
+    for paths, into in zip(groups, documents, strict=True):
+        for path in paths:
+            try:
+                present, document = _load_settings_file(path)
+            except (OSError, ValueError, RecursionError):
+                return [], [], False
+            if present:
+                into.append(document)
+    return documents[0], documents[1], True
+
+
+# --------------------------------------------------------------------------------------
+# Read scope
+#
+# Reading is what this module approves, and under a poisoned prompt the read is the attack:
+# a credential printed to stdout lands in Claude's context, where the injected instruction
+# is waiting for it. Two layers keep a read where it belongs.
+#
+# Layer B refuses a short list of known credential stores wherever their path appears -- any
+# word of any command, before the operator tier is consulted -- because a program the module
+# cannot read can still be told to open one: `shellcheck ~/.aws/credentials` echoes the
+# lines it flags, `dig -f FILE` reads its queries from a file, and both pass on an operator
+# rule. It is a denylist and is fragile the way denylists are, so it is the backstop and not
+# the boundary.
+#
+# Layer A is the boundary, for the readers this module knows: a file operand must resolve
+# inside the project, an `additionalDirectories` entry of the project's settings files
+# (`_read_roots`), or this session's scratch directory. The same roots bound where `git -C`
+# may point, and the files a git read subcommand opens (`_git_file_operands`). Anything else,
+# and anything the module cannot resolve, is not this module's to approve and falls through
+# to the operator's own rules.
+# --------------------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------------
+# Read scope, layer B: credential stores
+# --------------------------------------------------------------------------------------
+
+# Relative to the home directory. Each is a directory or file whose contents are a secret or
+# hand one out: cloud and VCS credentials, key material, package-registry tokens, database
+# passwords, Claude Code's own credentials, and the shell histories that hold whatever was
+# typed on a command line.
+# TODO(decision): this hook only ever allows or stays silent, so refusing a credential read
+# here stops the hook from approving it -- it does not stop Claude Code. `cat` is in Claude
+# Code's built-in read-only set and runs without a prompt, and a native allow rule such as
+# `Bash(shellcheck *)` approves its program whatever path it is given. What blocks the read:
+#   * native `Read()` deny rules (evaluated even when a hook says allow), e.g. in
+#     ~/.claude/settings.json: ~/.aws/sso/cache, ~/.aws/cli/cache, ~/.ssh/**,
+#     ~/.config/gh, ~/.config/op, ~/.docker/config.json, ~/.terraform.d/credentials.tfrc.json,
+#     ~/.pgpass, ~/.git-credentials, ~/.claude/.credentials.json, ~/.zsh_history
+#   * narrowing broad native allow rules, such as `Bash(shellcheck *)`, `Bash(dig *)`,
+#     `Bash(git log *)` or `Bash(git diff *)`
+#   * or flipping this module's allow-or-silent invariant so layer B emits `deny`, which
+#     the tests currently forbid
+# TODO(option): read the operator's own `Read()` deny rules from all four settings files and
+# refuse any operand that matches them, instead of keeping a second list here.
+# TODO(verify): which programs Claude Code's native Read-deny matcher recognizes beyond the
+# documented cat/head/tail/sed/tee. Probe: deny `Read(~/deny-probe/**)`, place a junk file
+# there, and ask Claude to read it with jq, sort, diff, wc and grep.
+CREDENTIAL_HOME_PATHS = (
+    ".aws",
+    ".ssh",
+    ".gnupg",
+    ".kube",
+    ".azure",
+    ".docker/config.json",
+    ".config/gcloud",
+    ".config/gh",
+    ".config/op",
+    ".config/hub",
+    ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".vault-token",
+    ".pgpass",
+    ".my.cnf",
+    ".terraform.d/credentials.tfrc.json",
+    ".claude/.credentials.json",
+    ".claude.json",
+    ".bash_history",
+    ".zsh_history",
+    ".psql_history",
+    ".mysql_history",
+    ".python_history",
+    ".node_repl_history",
+    ".lesshst",
+)
+
+# Absolute. `/root` is another user's home; the rest hold system credentials.
+CREDENTIAL_SYSTEM_PATHS = ("/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/root")
+
+# A process's environment and memory, or one of its threads'. `/proc/self/environ` is the hook's
+# own environment, which is where the session's tokens live.
+PROCESS_SECRETS = re.compile(
+    r"^/proc/(?:self|thread-self|\d+)/(?:task/\d+/)?(?:environ|mem|cmdline|auxv)\b"
+)
+
+# Paths that read nothing from disk.
+DEVICE_READS = frozenset({"/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr"})
+
+# A redirection operator glued to its target, as in `2>~/x` or `<~/x`.
+REDIRECTION_PREFIX = re.compile(r"^[0-9]*[<>&|]+")
+
+
+def _credential_roots() -> list[str]:
+    home = _home()
+    roots = [os.path.join(home, relative) for relative in CREDENTIAL_HOME_PATHS]
+    return roots + list(CREDENTIAL_SYSTEM_PATHS)
+
+
+def _is_under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _expand_home(text: str, *, tilde: bool) -> str:
+    """Replace a leading `~`, `$HOME` or `${HOME}` with the directory it names.
+
+    Any other tilde prefix, as `~-` and `~name`, is `UNREAD_VALUE`: `_tilde_word`.
+    """
+    if tilde and text.startswith("~"):
+        return _tilde_word(text)
+    for spelling in ("${HOME}", "$HOME"):
+        if text.startswith(spelling):
+            return _home() + text[len(spelling) :]
+    return text
+
+
+def _names_a_credential(text: str, *, tilde: bool, bases: list[str], live_glob: bool) -> bool:
+    try:
+        return _names_a_credential_unguarded(text, tilde=tilde, bases=bases, live_glob=live_glob)
+    except (OSError, ValueError):
+        return True  # cannot be resolved, and this is the layer that refuses outright
+
+
+def _names_a_credential_unguarded(
+    text: str, *, tilde: bool, bases: list[str], live_glob: bool
+) -> bool:
+    """Whether this word reaches a credential store, however it is spelled.
+
+    A word whose final text the shell still decides -- a glob, an expansion -- is judged by
+    the literal part in front of the first special character: `~/.a*/cred*` and `/e*/shadow`
+    could each expand into a credential store, so they are refused, while `/usr/share/*` could
+    not and is left to the read scope. That literal part is resolved as a literal path is.
+
+    A relative path, or literal part, is resolved from each of `bases`, the directories the
+    command can run in, and through any symbolic link, so a link inside the project that
+    points at `~/.ssh` is caught by its target. What a wildcard matches is not read: a
+    wildcard that matches such a link is not caught (#54). A value this module didn't read,
+    `UNREAD_VALUE`, in the word or as a base, is read by `_below_an_unread_value`.
+
+    With `live_glob`, the shell expands a wildcard in the word, and a component that can
+    match `..`, as `.*` does in a bash older than 5.2, is read as `..` too: `../.*/.ssh/x` can
+    be `../../.ssh/x`. A `..` after the wildcard is refused before this, in
+    `_refuse_credential_paths`.
+    """
+    text = REDIRECTION_PREFIX.sub("", text)
+    if "=" in text and not text.startswith(("/", "~", "$", UNREAD_VALUE)):
+        # An assignment's or a `--flag=`'s right-hand side. Bash expands a tilde after the
+        # `=` of an assignment, so `x=~/.aws/credentials` puts the real path in `x`; a
+        # `--flag=~/x` is not expanded, and treating it as if it were costs a prompt at most.
+        text = text.split("=", 1)[1]
+        tilde = True
+    if not text:
+        return False
+    # `_expand_home` reads `~name` as `UNREAD_VALUE`, which zsh can take from a named directory;
+    # bash takes the home directory of the user `name`, when there is one, read here
+    if tilde and text.startswith("~") and _tilde_expansion(text) is None:
+        user_home = os.path.expanduser(text)
+        if user_home != text and _names_a_credential_unguarded(
+            user_home, tilde=False, bases=bases, live_glob=live_glob
+        ):
+            return True
+    text = _expand_home(text, tilde=tilde)
+    if UNREAD_VALUE in text:
+        unread = [text]
+    elif text.startswith("/"):
+        unread = []
+    else:
+        unread = [os.path.join(base, text) for base in bases if UNREAD_VALUE in base]
+    if any(_below_an_unread_value(spelled, live_glob=live_glob) for spelled in unread):
+        return True
+    # Below, an unread value is an expansion: the text in front of it is the literal part
+    text = text.replace(UNREAD_VALUE, "$")
+    bases = [base for base in bases if UNREAD_VALUE not in base]
+    roots = _credential_roots()
+    spellings = [text] if text.startswith("/") else [os.path.join(base, text) for base in bases]
+
+    special = PATH_SPECIAL.search(text)
+    if special is None:
+        for absolute in spellings:
+            for candidate in {os.path.normpath(absolute), *_resolutions(absolute)}:
+                if PROCESS_SECRETS.match(candidate):
+                    return True
+                if any(_is_under(candidate, root) for root in roots):
+                    return True
+        return False
+
+    if live_glob:
+        components = text.split("/")
+        climbing = [
+            index
+            for index, component in enumerate(components)
+            if component != ".." and _may_match_dot_dot(component)
+        ]
+        # Each such component carries a wildcard or an expansion, so with two, the second
+        # read as `..` climbs from whatever the first matched, as a `..` after a wildcard does
+        if len(climbing) > 1:
+            return True
+        if climbing:
+            variant = "/".join(
+                ".." if index == climbing[0] else component
+                for index, component in enumerate(components)
+            )
+            if _glob_may_climb(variant, dot_components=False) or _names_a_credential_unguarded(
+                variant, tilde=False, bases=bases, live_glob=False
+            ):
+                return True
+
+    relative_directory, _, relative_partial = text[: special.start()].rpartition("/")
+    if not text.startswith("/") and not relative_partial and relative_directory in ("", "."):
+        # The wildcard or expansion reads the base itself, as `*` and `"$f"` do: the read
+        # scope's question. No base is in a credential store, `_working_directories` sees to
+        # that, and a link in one that the wildcard matches is read by neither layer (#54); one
+        # a reader follows while it recurses is `_refuse_followed_credential_links`'
+        return False
+    for absolute in spellings:
+        prefix = absolute[: len(absolute) - len(text) + special.start()]
+        directory, _, partial = prefix.rpartition("/")
+        for resolved in {os.path.normpath(directory or "/"), *_resolutions(directory or "/")}:
+            # `dir/` keeps its slash, so a root that starts with it is one the wildcard can
+            # reach; `dir/.ss` is a root's own name in part. A `.` or `..` is a directory
+            # too, as in `/..*`, which is `/` and every name under it.
+            if partial in (".", ".."):
+                candidate = os.path.normpath(os.path.join(resolved, partial)).rstrip("/") + "/"
+            else:
+                candidate = resolved.rstrip("/") + "/" + partial
+            # A process's secrets are a name below its directory, which a wildcard anywhere
+            # in `/proc` can reach: `/proc/*/environ` and `/proc/self/env*` are each of them
+            if (
+                any(root.startswith(candidate) or _is_under(candidate, root) for root in roots)
+                or "/proc/".startswith(candidate)
+                or _is_under(candidate, "/proc")
+            ):
+                return True
+    return False
+
+
+def _below_an_unread_value(path: str, *, live_glob: bool) -> bool:
+    """Whether the text after the last value this module didn't read names a credential store.
+
+    That value, an expansion, a command's output or a working directory, can be any directory,
+    so the text after it is read below the home directory, and without a wildcard below `/`:
+    after `$(pwd)`, `/.ssh/id_rsa` names a store, and `/etc/shadow` names one. Each `..` in
+    front of it is a directory deeper in the value. Two things are left to the read scope: text
+    glued to the value, which finishes a name the value starts, as `h` in `${d}h` does, and a
+    wildcard right after it, which reads the value's own directory, as `"$d"/*` does.
+    """
+    tail = path.rpartition(UNREAD_VALUE)[2]
+    if not tail.startswith("/"):
+        tail = tail.partition("/")[2]
+    components = os.path.normpath(tail.strip("/") or ".").split("/")
+    while components and components[0] in (".", ".."):
+        components.pop(0)
+    rest = "/".join(components)
+    special = PATH_SPECIAL.search(rest)
+    if not rest or (special is not None and special.start() == 0):
+        return False
+    below_home = f"{_home().rstrip('/')}/{rest}"
+    return _names_a_credential_unguarded(
+        below_home, tilde=False, bases=[], live_glob=live_glob
+    ) or (
+        special is None
+        and _names_a_credential_unguarded(f"/{rest}", tilde=False, bases=[], live_glob=False)
+    )
+
+
+def _refuse_credential_paths(
+    reduced: str, parts: list[tuple[str, str]], state: _ShellState
+) -> None:
+    """Layer B: refuse the command if any word in it names a credential store.
+
+    Reads the reduced command, its redirections included, so a `< ~/.ssh/id_rsa` target is a
+    word here like any other. Every word of every segment is checked, whichever program it
+    belongs to, because the operator tier never sees what a word *opens*. A relative word is
+    read from each directory the shell may be in, `CDPATH` included, and each one a program's
+    `DIRECTORY_OPTIONS` names; and each word as each of its `_spellings`.
+
+    A wildcard the shell expands, followed by a `..`, can land anywhere, credential stores
+    included, and is refused for that. Only a live wildcard counts: a quoted one is the
+    program's pattern, as in `sed 's|.*/../||'`.
+    """
+    lines = [_tokenize(line) for line in reduced.split("\n")]
+    bases = list(state.shell_bases)
+    for tokens in lines:
+        for directory in _program_directories(tokens, parts):
+            bases += _changed_directories(directory, state.values, state.shell_bases)
+    bases = list(dict.fromkeys(bases))
+    if len(bases) > MAX_WORKING_DIRECTORIES:
+        raise NotReadOnly("more working directories than this module reads, with each -C")
+    for tokens in lines:
+        for token in tokens:
+            if set(token) <= PUNCTUATION_CHARS:
+                continue
+            word = _expand(token, parts)
+            live_glob = _carries_live_glob(token)
+            if live_glob and _glob_may_climb(word, dot_components=False):
+                raise NotReadOnly(f"a glob that climbs past its wildcard can land anywhere: {word}")
+            # A tilde is expanded only at the start of an unquoted word, so a quoted
+            # `'~/x'` is the literal path it spells. A placeholder start means quoted.
+            tilde = token.startswith("~") or bool(REDIRECTION_PREFIX.match(token))
+            for spelled in _spellings(word, state.values, state.shell_bases):
+                if _names_a_credential(spelled, tilde=tilde, bases=bases, live_glob=live_glob):
+                    raise NotReadOnly(f"names a credential store: {word}")
+
+
+# --------------------------------------------------------------------------------------
+# Read scope: where the command runs
+# --------------------------------------------------------------------------------------
+
+# More directories than this that a relative word may be resolved from, and the command is
+# refused: each costs a resolution of every word in it, and the credential check, which refuses
+# outright, has to read the word from all of them
+MAX_WORKING_DIRECTORIES = 64
+
+# The programs that change the shell's working directory, and the options that leave their
+# target the next word. `_check_cd` refuses any other option, and `pushd` has no opinion.
+DIRECTORY_CHANGERS = frozenset({"cd", "pushd"})
+
+DIRECTORY_CHANGER_OPTIONS = frozenset({"-L", "-P", "-e", "-@", "-n", "--"})
+
+
+def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[str]:
+    """The target of each `cd` and `pushd` in this segment, wherever it stands.
+
+    The first word after it that isn't one of its options, as `_check_cd` reads it. A word
+    `cd` that is no command, as in `echo cd x`, adds a target the shell never uses, which costs
+    a refusal at most. A command's output is `UNREAD_VALUE`. A wildcard the shell expands
+    refuses the command: it picks the directory, which can be a link out of the project, as
+    `cd k*` can.
+
+    Where the program spells no target, the shell picks it, and the target is `UNREAD_VALUE`:
+    `pushd -` goes to `$OLDPWD`, `pushd +1` and `pushd -0` to an entry of the directory stack,
+    and a bare `cd` to `$HOME`. So does a target `_tilde_expansion` doesn't read, as `pushd ~-`,
+    and one with a second operand: zsh's `cd old new` and `pushd old new` go to the working
+    directory with its first `old` replaced by `new`, which bash refuses.
+    """
+    targets = []
+    program = _program_index(words)
+    for index, word in enumerate(words):
+        if _expand(word, parts) not in DIRECTORY_CHANGERS:
+            continue
+        spelled = None
+        for position, following in enumerate(words[index + 1 :], start=index + 1):
+            target = _expand(following, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
+            if target in DIRECTORY_CHANGER_OPTIONS:
+                continue
+            if not target.startswith(("-", "+")):
+                if following.startswith("~"):
+                    target = _tilde_expansion(target) or UNREAD_VALUE
+                if _carries_live_glob(following):
+                    raise NotReadOnly(f"cd to a directory a wildcard picks: {target}")
+                if index != program or position == len(words) - 1:
+                    spelled = target
+            break
+        if spelled is not None:
+            targets.append(spelled)
+        elif index == program:
+            targets.append(UNREAD_VALUE)
+    return targets
+
+
+# The options that run a program in another directory, which it resolves a relative word from:
+# `git -C`, `make -C`, `tar -C` and `--directory`, `env -C` and `--chdir`
+DIRECTORY_OPTIONS = frozenset({"-C", "--directory", "--chdir"})
+
+
+def _program_directories(tokens: list[str], parts: list[tuple[str, str]]) -> list[str]:
+    """The directory each `DIRECTORY_OPTIONS` option in these tokens names.
+
+    Whatever program it belongs to: `grep -C 3` adds `3`, which costs a refusal at most.
+    """
+    directories = []
+    for index, token in enumerate(tokens):
+        word = _expand(token, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
+        name, equals, value = word.partition("=")
+        following = tokens[index + 1 : index + 2]
+        if equals and name in DIRECTORY_OPTIONS:
+            directories.append(value)
+        elif word.startswith("-C") and word != "-C":
+            directories.append(word[2:])
+        elif word in DIRECTORY_OPTIONS and following and not set(following[0]) <= PUNCTUATION_CHARS:
+            directories.append(_directory_word(following[0], parts))
+    return directories
+
+
+def _directory_word(token: str, parts: list[tuple[str, str]]) -> str:
+    """The directory ``token``, a word of its own, names for a program that changes to it.
+
+    A command's output, and a wildcard the shell expands, which picks the directory, are
+    `UNREAD_VALUE`. A leading `~` is read by `_tilde_word`. A variable stays as spelled, for
+    `_spellings`.
+    """
+    if _carries_live_glob(token):
+        return UNREAD_VALUE
+    text = _expand(token, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
+    return _tilde_word(text) if token.startswith("~") else text
+
+
+def _changed_directories(
+    directory: str, values: dict[str, list[str] | None], bases: list[str]
+) -> list[str]:
+    """Each directory a program that changes to ``directory`` may run in, from each of ``bases``.
+
+    ``directory`` is read as each of its `_spellings`, as a `cd` target is, so one the shell
+    supplies gives a directory below `UNREAD_VALUE`.
+    """
+    return [
+        _joined(base, spelled) for spelled in _spellings(directory, values, bases) for base in bases
+    ]
+
+
+# The most spellings of a word the credential check reads; past it, the variables still in it
+# are read as values it didn't read, which each of them could be anyway
+MAX_SPELLINGS = 64
+
+
+def _spellings(
+    word: str, values: dict[str, list[str] | None], bases: list[str], *, before: bool = True
+) -> list[str]:
+    """The texts this word can be, for the credential check.
+
+    `$HOME` is the home directory and `$PWD` each working directory. Any other variable is each
+    value `_known_values` read for it, and a value this module didn't read, `UNREAD_VALUE`, for
+    the one the shell had before; so is a name whose values are unread, every other expansion,
+    and a command's output.
+
+    Without ``before``, a variable `_known_values` read values for is those values alone, as
+    the read scope resolves it, `_resolve_variables`, and as `_check_cd` reads a `cd $d`.
+    """
+    texts = [word.replace(SUBSTITUTION_MARKER, UNREAD_VALUE)]
+    for _ in range(8):
+        expanded: list[str] = []
+        for text in texts:
+            match = TEXT_EXPANSION.search(text)
+            if match is None:
+                expanded.append(text)
+                continue
+            name = match.group(1) or match.group(2)
+            if name == "HOME":
+                choices = [_home()]
+            elif name == "PWD":
+                choices = bases
+            elif name:
+                known = values.get(name) or []
+                choices = [*known, UNREAD_VALUE] if before or not known else known
+            else:
+                choices = [UNREAD_VALUE]
+            expanded += [text[: match.start()] + choice + text[match.end() :] for choice in choices]
+        if len(expanded) > MAX_SPELLINGS or expanded == texts:
+            break
+        texts = expanded
+    return list(dict.fromkeys(TEXT_EXPANSION.sub(UNREAD_VALUE, text) for text in texts))
+
+
+class _ShellState:
+    """What the words of a command are read against.
+
+    ``bases`` are the directories the shell may be in, and ``shell_bases`` those and the ones
+    `CDPATH` may take it to, `_working_directories`; ``values`` are the ones its variables may
+    hold, as `_known_values` reads them; ``bindings`` how many times it binds each name,
+    `_bindings`, with the bindings of the commands around it; ``backgrounds`` whether the shell
+    may not wait for it, which ``curl`` reads: it runs a job behind `&`, or sits in a process
+    substitution or in a command that does. A substitution's body runs in the shell around it,
+    so it is read against that one's.
+    """
+
+    __slots__ = ("backgrounds", "bases", "bindings", "shell_bases", "values")
+
+    def __init__(
+        self,
+        bases: list[str],
+        shell_bases: list[str],
+        values: dict[str, list[str] | None],
+        bindings: dict[str, int],
+        *,
+        backgrounds: bool = False,
+    ) -> None:
+        self.bases = bases
+        self.shell_bases = shell_bases
+        self.values = values
+        self.bindings = bindings
+        self.backgrounds = backgrounds
+
+
+def _working_directories(
+    segments: list[list[str]],
+    parts: list[tuple[str, str]],
+    inherited: _ShellState | None,
+    values: dict[str, list[str] | None],
+) -> tuple[list[str], list[str]]:
+    """Every directory a relative word in this command may be resolved from, and with `CDPATH`.
+
+    The project and the session's working directory, or for a substitution's body the
+    directories of the command it sits in, then each `cd` or `pushd` target from each of those,
+    in turn: after `cd a && cd b`, `a`, `b` and `a/b` too. That is more than the shell uses,
+    since a `cd` in a pipeline or after `||` may never move it, and the read scope and the
+    credential check read a relative word from each, which costs a no-opinion or a refusal.
+    The second list adds the directories `CDPATH` may take the shell to, which only the
+    credential check reads.
+
+    A target is read as each of its `_spellings`, so one the shell supplies, such as `"$d"`,
+    gives a directory below `UNREAD_VALUE`, and so does a target the shell picks, as `pushd -`
+    does: `_unvouched_directory` vouches for neither, nor for any program run after it. For the
+    read scope a variable whose values the command sets is those values alone, as
+    `_resolve_variables` reads a path, so after `d=src; pushd $d` a relative word is placed in
+    `src`, and the credential check reads it from the value the shell had before too.
+
+    Both shells look a target up in each directory `CDPATH` lists first, unless it starts with
+    `/`, `./` or `../`. A startup file the hook can't read sets it, and the credential stores are
+    in the home directory, so for the credential check each such target is read from there too.
+    A directory that is in a store, as `cd .ssh` can be, refuses the command outright.
+    """
+    if inherited is not None:
+        bases, shell_bases = list(inherited.bases), list(inherited.shell_bases)
+    else:
+        bases = _session_bases()
+        shell_bases = list(bases)
+    for segment in segments:
+        for target in _directory_targets(segment, parts):
+            spellings = _spellings(target, values, shell_bases)
+            placed = _spellings(target, values, shell_bases, before=False)
+            bases = list(
+                dict.fromkeys(bases + [_joined(base, path) for path in placed for base in bases])
+            )
+            moved = [
+                _joined(base, path)
+                for path in spellings
+                for base in shell_bases + ([_home()] if _searches_cdpath(path) else [])
+            ]
+            added = [base for base in dict.fromkeys(moved) if base not in shell_bases]
+            if len(shell_bases) + len(added) > MAX_WORKING_DIRECTORIES:
+                raise NotReadOnly(f"more working directories than this module reads: {target}")
+            for base in added:
+                if UNREAD_VALUE not in base and _names_a_credential(
+                    base, tilde=False, bases=[], live_glob=False
+                ):
+                    raise NotReadOnly(f"cd into a credential store, through CDPATH: {target}")
+            shell_bases += added
+    return bases, shell_bases
+
+
+def _session_bases() -> list[str]:
+    """The directories a command starts in: the project, and the session's working directory."""
+    bases = [str(REPO_ROOT)]
+    if _SESSION_CWD and os.path.isabs(_SESSION_CWD) and bases[0] != _SESSION_CWD:
+        bases.append(_SESSION_CWD)
+    return bases
+
+
+def _unvouched_directory(bases: list[str], scope: _ReadScope) -> str | None:
+    """A directory the shell may move to that the read scope doesn't vouch for, or None.
+
+    A program reads where it runs with no operand to say so: `grep -r` with no file reads the
+    whole directory, and `git status` runs the `core.fsmonitor` of the repository it is in. So
+    every program after such a `cd` or `pushd` runs somewhere this module didn't read, as after
+    `pushd ~`, `pushd ..`, `pushd "$d"` and `pushd -`. The directories a command starts in are
+    the session's, which it doesn't judge.
+    """
+    session = _session_bases()
+    for base in bases:
+        if base not in session and (UNREAD_VALUE in base or not _in_scope(base, scope)):
+            return base.replace(UNREAD_VALUE, "$")
+    return None
+
+
+def _check_where_it_runs(unvouched: str | None) -> None:
+    """Leave a program to the rules where it may run in ``unvouched``, `_unvouched_directory`."""
+    if unvouched is not None:
+        raise NoOpinion(f"runs in a directory this module can't vouch for: {unvouched}")
+
+
+def _searches_cdpath(target: str) -> bool:
+    """Whether `cd` looks ``target`` up in `CDPATH`: unless it starts with `/`, `./` or `../`."""
+    return not target.startswith(("/", "./", "../", UNREAD_VALUE)) and target not in (".", "..")
+
+
+def _joined(base: str, path: str) -> str:
+    """``path`` from ``base``, normalized.
+
+    Not where it holds a value this module didn't read, whose `..` climbs out of the value
+    rather than cancel it.
+    """
+    joined = os.path.join(base, path)
+    return joined if UNREAD_VALUE in joined else os.path.normpath(joined)
+
+
+# --------------------------------------------------------------------------------------
+# Read scope, layer A: the working directories
+# --------------------------------------------------------------------------------------
+
+
+class _ReadScope:
+    """Where a reader may read from, and what is known about the command's variables."""
+
+    __slots__ = (
+        "backgrounds",
+        "bases",
+        "git_runs",
+        "loop_values",
+        "roots",
+        "settings",
+        "spells_escape",
+        "splice_vars",
+    )
+
+    def __init__(
+        self,
+        roots: list[str],
+        bases: list[str],
+        splice_vars: dict[str, list[str]],
+        loop_values: dict[str, list[str]],
+        *,
+        spells_escape: bool = False,
+        settings: tuple[list[dict], bool] | None = None,
+        backgrounds: bool = False,
+    ) -> None:
+        self.roots = roots
+        self.bases = bases
+        self.splice_vars = splice_vars
+        self.loop_values = loop_values
+        # Whether any word of the command spells a terminal escape, which makes every value
+        # `echo` or `printf` expands one that may carry it; see `TERMINAL_CONTROL_BYTE`.
+        self.spells_escape = spells_escape
+        # What git said when asked, once per command however many git calls it makes; see
+        # `_run_git`
+        self.git_runs: dict[tuple[str, ...], tuple[int, str] | None] = {}
+        # The project's settings, which list the hosts `curl` may GET; see `_curl_sites`
+        self.settings = settings
+        # Whether the shell may not wait for the command, which `curl` may not be part of; see
+        # `_ShellState`
+        self.backgrounds = backgrounds
+
+
+def _read_roots(settings: tuple[list[dict], bool] | None = None) -> list[str]:
+    """The directories a reader may read inside: the project and its ``additionalDirectories``.
+
+    The entries come from the same two files as the operator's rules, and only from a file
+    Claude Code applies (``_settings_permissions``): a directory there is one the operator
+    already made a working directory. Claude Code also reads the user's own
+    settings file, which this module leaves alone as it does for the rules, and one added for
+    the session with ``/add-dir`` is in no file and not in the hook's payload, so this module
+    cannot see either.
+
+    An entry is resolved the way a ``cd`` target is: ``~`` expanded, a relative entry taken
+    from the project root, then ``realpath``. A settings file that cannot be read leaves the
+    project alone, since what it would have added is unknown. An entry is dropped when:
+
+    - it is not a directory
+    - it is or contains the home directory, which ``_project_root`` refuses as a project
+      for the same reason: every dotfile would be in scope
+    - it is, contains or sits inside a credential store or ``/proc``. Layer B refuses a word
+      that names a store, and a store's parent is not one: with ``~/.config`` as a root,
+      ``grep -r token ~/.config`` reads ``~/.config/gh/hosts.yml`` and names nothing Layer B
+      knows
+    """
+    roots = [os.path.realpath(REPO_ROOT)]
+    found, usable = settings or _settings_permissions()
+    if not usable:
+        return roots
+    home = os.path.realpath(_home())
+    stores = [os.path.realpath(store) for store in _credential_roots()] + ["/proc"]
+    for permissions in found:
+        entries = permissions.get("additionalDirectories")
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, str) or not entry.strip():
+                continue
+            try:
+                path = os.path.expanduser(entry) if entry.startswith("~") else entry
+                path = os.path.realpath(os.path.join(str(REPO_ROOT), path))
+                if (
+                    _is_under(home, path)
+                    or any(_is_under(store, path) or _is_under(path, store) for store in stores)
+                    or not os.path.isdir(path)
+                ):
+                    continue
+            except (OSError, ValueError):
+                continue
+            roots.append(path)
+    return roots
+
+
+def _in_scope(absolute: str, scope: _ReadScope) -> bool:
+    try:
+        return _in_scope_unguarded(absolute, scope)
+    except (OSError, ValueError):
+        return False  # a path that cannot be resolved is not one to vouch for
+
+
+def _in_scope_unguarded(absolute: str, scope: _ReadScope) -> bool:
+    normal = os.path.normpath(absolute)
+    if normal in DEVICE_READS:
+        return True
+    # The scratchpad holds a path as a root does, by the path: `absolute` is the text the program
+    # gets, which the callers have already expanded, so `<scratch>/HEAD~1` and `<scratch>/a b` are
+    # the files they name. `SCRATCH_COMPONENT`'s characters are for the redirection, which reads
+    # the command's own text. A directory below a value this module didn't read is none to place
+    # a path in: `UNREAD_VALUE`, #72.
+    scratch = _scratch_root()
+    if (
+        scratch is not None
+        and _is_under(normal, scratch)
+        and UNREAD_VALUE not in normal
+        and _resolves_into_scratch(absolute)
+    ):
+        return True
+    # Resolved as given, not as `normpath` reads it: the kernel resolves a link before the `..`
+    # after it, so `l/../x` is the `x` beside where `l` leads, and `realpath` does the same.
+    # The scratchpad's check above is given the path as it is for the same reason.
+    resolutions = _resolutions(absolute)
+    return all(
+        any(_is_under(normal, root) and _is_under(resolved, root) for root in scope.roots)
+        for resolved in resolutions
+    )
+
+
+VARIABLE_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _resolve_variables(text: str, scope: _ReadScope) -> list[str] | None:
+    """Every text this word can become, or None when one reference cannot be resolved.
+
+    `$HOME`, a name assigned a literal value in this command, and a `for` variable whose list
+    is all literals are resolved; `${x%%:*}`, `$1`, a `read` variable and every other form
+    are not. The fan-out is capped, because a word built from three loop variables of twenty
+    values each is not something to enumerate on every Bash call.
+    """
+    texts = [text]
+    for _ in range(8):
+        if not any("$" in candidate for candidate in texts):
+            return texts
+        expanded: list[str] = []
+        for candidate in texts:
+            match = VARIABLE_REFERENCE.search(candidate)
+            if match is None:
+                return None  # a `$` in some other form
+            name = match.group(1) or match.group(2)
+            if name == "HOME":
+                values = [_home()]
+            elif name in scope.splice_vars:
+                values = [" ".join(scope.splice_vars[name])]
+            elif name in scope.loop_values:
+                values = scope.loop_values[name]
+            else:
+                return None
+            expanded.extend(
+                candidate[: match.start()] + value + candidate[match.end() :] for value in values
+            )
+        if len(expanded) > 64:
+            return None
+        texts = expanded
+    return None
+
+
+def _read_scope_problem(
+    token: str, text: str, parts: list[tuple[str, str]], scope: _ReadScope
+) -> str | None:
+    """Why a reader's file operand is not in scope, or None when it is."""
+    whole = PLACEHOLDER.fullmatch(token)
+    if whole is not None and parts[int(whole.group(1))][0] == PROCESS_SUBSTITUTION:
+        return None  # `<(...)`: a pipe whose body was classified, not a path on disk
+    if text == "-":
+        return None
+    if SUBSTITUTION_MARKER in text:
+        return "a path produced by a command"
+    if token.startswith("~"):
+        directory = _tilde_expansion(text)
+        if directory is None:
+            return f"a path in a directory the shell picks: {text}"
+        text = directory
+    candidates = _resolve_variables(text, scope)
+    if candidates is None:
+        return "a path this module cannot resolve"
+    for spelled in candidates:
+        candidate = _expand_home(spelled, tilde=False)
+        if _carries_live_glob(token):
+            if _glob_may_climb(candidate):
+                return f"a glob that may climb out of its directory: {candidate}"
+            # The directory the glob runs in: everything up to the last `/` before it.
+            head = PATH_SPECIAL.split(candidate, 1)[0]
+            candidate = head.rsplit("/", 1)[0] if "/" in head else "."
+        absolutes = (
+            [candidate]
+            if candidate.startswith("/")
+            else [os.path.join(base, candidate) for base in scope.bases]
+        )
+        for absolute in absolutes:
+            if not _in_scope(absolute, scope):
+                return f"outside the working directories: {candidate}"
+    return None
+
+
+def _check_read_scope(
+    reader: str,
+    found: list[tuple[int, int]],
+    args: list[str],
+    arg_tokens: list[str],
+    parts: list[tuple[str, str]],
+    scope: _ReadScope,
+) -> None:
+    """Raise ``NoOpinion`` unless each file ``reader`` opens is in ``scope``.
+
+    ``found`` is where in ``args`` those files are, as ``_file_operands`` gives it, and
+    ``arg_tokens`` the reduced words ``args`` were expanded from.
+    """
+    for index, start in found:
+        token, text = arg_tokens[index], args[index]
+        if start:
+            # A path attached to its flag: the flag must be written out, so that the token
+            # can be cut where the text is. `'--from-file=/x'` quotes both together.
+            if token[:start] != text[:start]:
+                raise NoOpinion(f"{reader} given a file flag it cannot split: {text}")
+            token, text = token[start:], text[start:]
+        problem = _read_scope_problem(token, text, parts, scope)
+        if problem is not None:
+            raise NoOpinion(f"{reader} reads {problem}")
+
+
+def _directory_scope(
+    token: str,
+    parts: list[tuple[str, str]],
+    values: dict[str, list[str] | None],
+    scope: _ReadScope,
+) -> _ReadScope:
+    """``scope``, with the directory ``token`` names, from each base, as the bases.
+
+    For the paths a program resolves from a directory it changes to, as ``git -C`` does:
+    ``git -C sub diff --no-index ../x y`` reads the ``x`` beside ``sub``. The directory is read
+    as the credential check reads a program's directory: `_directory_word`, then
+    `_changed_directories`, with ``values`` as `_known_values` reads them.
+
+    Raises ``NoOpinion`` for a directory below `UNREAD_VALUE`, where no path can be placed: a
+    glob or a substitution, which ``_check_command`` has already refused in its place, and a
+    variable, which may still hold the value the shell had before.
+    """
+    bases = _changed_directories(_directory_word(token, parts), values, scope.bases)
+    if any(UNREAD_VALUE in base for base in bases):
+        raise NoOpinion(
+            f"a path relative to a directory this module cannot resolve: {_expand(token, parts)}"
+        )
+    return _ReadScope(
+        scope.roots,
+        bases,
+        scope.splice_vars,
+        scope.loop_values,
+        spells_escape=scope.spells_escape,
+    )
+
+
+def _input_target(target: str, parts: list[tuple[str, str]]) -> str | None:
+    """The file ``< target`` reads, when the operator wrote it out, not the shell; else None.
+
+    The pseudo-device check in ``_classify`` reads literal text, so a target assembled at
+    runtime -- ``"$x$y"``, ``"/dev/"'tcp/h/80'``, a glob -- is exactly what it cannot see.
+    Such a target, a relative one with a ``..``, and one below a directory the shell picks, as
+    ``~-/x``, is left in place for ``_segments`` to refuse as an unaccounted ``<``. Whether
+    the file is in the working directories is `_check_input_targets`'s, once they are known.
+    """
+    if re.search(r"[$*?\[\]{}`\\]", PLACEHOLDER.sub("", target)):
+        return None
+    for index in PLACEHOLDER.findall(target):
+        kind, value = parts[int(index)]
+        if kind == SUBSTITUTION or (kind == DOUBLE_QUOTED and "$" in value):
+            return None
+    expanded = PLACEHOLDER.sub(lambda match: parts[int(match.group(1))][1], target)
+    if NETWORK_DEVICE.search(expanded) is not None:
+        return None
+    if target.startswith("~"):
+        directory = _tilde_expansion(expanded)
+        if directory is None:
+            return None
+        expanded = directory
+    if not expanded.startswith("/") and ".." in Path(expanded).parts:
+        return None
+    return expanded
+
+
+def _check_input_targets(targets: list[str], scope: _ReadScope) -> None:
+    """Refuse the command where a file a ``<`` reads, `_input_target`, is outside ``scope``.
+
+    The read scope applies to ``<`` as it does to an operand: an absolute file is measured as
+    it is, and a relative one from each directory the shell may be in, through the links on
+    disk, so ``sub/out/x`` is outside where ``sub/out`` leads out (#77). A directory below a
+    value this module didn't read is none to place it in. Refused outright, as a target left
+    in place is: an allow rule matches the command with the redirection stripped.
+    """
+    for target in targets:
+        paths = (
+            [target]
+            if target.startswith("/")
+            else [os.path.join(base, target) for base in scope.bases]
+        )
+        for path in paths:
+            if UNREAD_VALUE in path or not _in_scope(path, scope):
+                raise NotReadOnly(f"< reads outside the working directories: {target}")
+
+
+# --------------------------------------------------------------------------------------
+# Read scope: the session's scratchpad
+# --------------------------------------------------------------------------------------
+
+# Claude Code gives each session a scratch directory, tells the model to use it, and names it in
+# the hook payload as `scratchpad_dir`, from Claude Code 2.1.257 on. Writes that land inside it
+# are contained: the directory sits under the system temp directory, outside the project, and
+# is this session's alone, so no other session's scratchpad is in reach. Its files last as long
+# as the session's transcript. No setting names one instead: a directory named for every session
+# would be one they all share, where one session could rewrite a script another is about to run.
+# A path is in it only while it stays there once each link in it is resolved: a link in the
+# scratchpad may lead anywhere, such as one a `git worktree add` checks out
+# (`_resolves_into_scratch`).
+
+# One path component that is not `..`, spelled only in characters the shell passes through
+# untouched. Without the lookahead the trailing `(?:/COMPONENT)+` happily matches
+# `scratchpad/../../escape.txt`; without the character class it matches a quoted
+# `"../../x"` (a placeholder by now), a `$d` the shell fills in, and a `..*` the shell globs,
+# each of which lands wherever it likes.
+SCRATCH_COMPONENT = r"(?:/(?!\.\.?(?:/|$|[\s;|&)]))[A-Za-z0-9._@%+=,-]+)"
+
+# A `scratchpad_dir` the hook can match as the shell reads it: absolute and normalized, every
+# component spelled in `SCRATCH_COMPONENT`'s characters. One of any other shape gets no
+# scratchpad, since the shell would read the same text as another path: it ends the target of
+# `> /tmp/a b/scratchpad/x` at the space, and so writes `/tmp/a`.
+SCRATCH_DIRECTORY = re.compile(SCRATCH_COMPONENT + "+")
+
+
+def _scratch_directory() -> str | None:
+    """This session's scratch directory, as a pattern; `None` when there is none.
+
+    The payload's `scratchpad_dir`, exactly: another session's scratchpad is no more in reach
+    than any other directory, since a session that could write into one could rewrite a script
+    that session is about to run. Without a `scratchpad_dir`, or with one `SCRATCH_DIRECTORY`
+    does not match, there is none.
+
+    Built per call rather than at import, from `_SCRATCHPAD_DIR`, which `main` sets per call.
+    `re.compile` caches, so the patterns built from it cost nothing after the first.
+    """
+    directory = _scratch_root()
+    return None if directory is None else re.escape(directory)
+
+
+def _scratch_root() -> str | None:
+    """This session's scratch directory, as the path `_scratch_directory` matches."""
+    if _SCRATCHPAD_DIR is None:
+        return None
+    directory = _SCRATCHPAD_DIR.rstrip("/")
+    if SCRATCH_DIRECTORY.fullmatch(directory) is None:
+        return None
+    # A scratchpad whose own path is a link takes in wherever the link leads, as one an earlier
+    # command replaced with `ln -s ~` would (#79). A link above it, as macOS's `/tmp` is, is not
+    # its own path.
+    try:
+        if S_ISLNK(os.lstat(directory).st_mode):
+            return None
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return None
+    return directory
+
+
+def _scratch_redirect() -> re.Pattern[str] | None:
+    """The redirection shape that writes into this session's scratch directory.
+
+    The group ``target`` is the path written.
+    """
+    directory = _scratch_directory()
+    if directory is None:
+        return None
+    path = directory + SCRATCH_COMPONENT + "+"
+    return re.compile(r"(?<![^\s;|&(])&?>>?\s*(?P<target>" + path + r")(?=[\s;|&)]|$)")
+
+
+def _resolves_into_scratch(path: str) -> bool:
+    """Whether ``path`` is under this session's scratch directory once each link is resolved.
+
+    ``path`` is under it by its text, and a link in the scratch directory leads wherever it
+    points: ``<scratch>/home-link/`` may be the home directory. The scratch directory is
+    resolved too, since its own path may go through a link, as ``/tmp`` does on macOS.
+    ``realpath`` resolves the part of the path that exists, so a file a redirection is about to
+    create is placed by the links in the directories above it. ``path`` is to be given as the
+    program gets it, not normalized: a link resolves before the ``..`` after it.
+    """
+    root = _scratch_root()
+    if root is None:
+        return False
+    try:
+        resolved_root = os.path.realpath(root)
+        return all(_is_under(resolved, resolved_root) for resolved in _resolutions(path))
+    except (OSError, ValueError):
+        return False  # a path that cannot be resolved is not one to vouch for
+
+
+# --------------------------------------------------------------------------------------
+# Read scope: the links a command makes
+# --------------------------------------------------------------------------------------
+
+# The links one `ln` makes, and all of a command's, past which it is one this module doesn't
+# read: each is a branch of every path resolved through it
+MAX_PLANNED_LINKS = 32
+
+# The most places one path can lead to through the planned links, and the most links one
+# resolution follows, as the kernel's own limit on a path is 40
+MAX_RESOLUTIONS = 64
+
+MAX_LINK_HOPS = 40
+
+# `ln`'s options, GNU's and BSD's: those that take nothing, and those that take the next word
+LN_FLAG_LETTERS = frozenset("bdfFhiLnPrsTvw")
+
+LN_VALUE_LETTERS = frozenset("St")
+
+LN_LONG_FLAGS = frozenset(
+    {
+        "--backup",
+        "--directory",
+        "--force",
+        "--interactive",
+        "--logical",
+        "--no-dereference",
+        "--no-target-directory",
+        "--physical",
+        "--relative",
+        "--symbolic",
+        "--verbose",
+    }
+)
+
+LN_LONG_VALUES = frozenset({"--suffix", "--target-directory"})
+
+# Programs that run the program their words name, `ln` among them, where its operands are not
+# words this module reads in order: from the input, as `xargs ln`, or among others, as
+# `find -exec ln`
+RUNS_ANOTHER_PROGRAM = frozenset(
+    {
+        "busybox",
+        "command",
+        "doas",
+        "env",
+        "exec",
+        "find",
+        "nice",
+        "nohup",
+        "setsid",
+        "stdbuf",
+        "sudo",
+        "time",
+        "timeout",
+        "xargs",
+    }
+)
+
+
+def _resolutions(path: str) -> set[str]:
+    """Where ``path`` leads, through the links on disk and those the command makes.
+
+    `os.path.realpath`, when the command makes none. Otherwise each planned link is taken and
+    not taken, since an `ln` may fail and leave what was there, and each target it may have, so
+    a path through one is each place it may be once the command has run. A branch that follows
+    more than `MAX_LINK_HOPS` links is a loop, through which the kernel opens nothing. Raises
+    `OSError` past `MAX_RESOLUTIONS`, which each caller reads as a path it can't place.
+    """
+    if not _PLANNED_LINKS:
+        return {os.path.realpath(path)}
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+    found: set[str] = {os.path.realpath(path)}
+    _resolve_planned("/", path.split("/"), 0, found)
+    return found
+
+
+def _resolve_planned(resolved: str, pending: list[str], hops: int, found: set[str]) -> None:
+    """`_resolutions`, from ``resolved``, a directory with no link in it, with ``pending`` left.
+
+    As the kernel resolves: a link before the `..` after it, and a relative target from the
+    directory that holds the link.
+    """
+    while pending:
+        component, pending = pending[0], pending[1:]
+        if component in ("", "."):
+            continue
+        if component == "..":
+            resolved = os.path.dirname(resolved)
+            continue
+        candidate = os.path.join(resolved, component)
+        if hops >= MAX_LINK_HOPS:
+            return  # the kernel's `ELOOP`: no file is opened through it
+        for target in _PLANNED_LINKS.get(candidate, ()):
+            _resolve_planned("/", target.split("/") + pending, hops + 1, found)
+        if os.path.islink(candidate):
+            target = os.readlink(candidate)
+            start = "/" if target.startswith("/") else resolved
+            _resolve_planned(start, target.split("/") + pending, hops + 1, found)
+            return
+        resolved = candidate
+    found.add(resolved)
+    if len(found) > MAX_RESOLUTIONS:
+        raise OSError("too many places one path can lead")
+
+
+def _record_planned_links(
+    segments: list[list[str]], parts: list[tuple[str, str]], bases: list[str]
+) -> None:
+    """Add to `_PLANNED_LINKS` each link an `ln` in these segments makes, from each of ``bases``.
+
+    An `ln` whose operands this module can't place, or one that another program runs, as
+    `xargs ln` does, leaves the command to the user: no rule approves a read through a link it
+    can't see. Other programs make links too, `tar x`, `unzip`, `cp -s` and `git worktree add`
+    among them; they are the gap `AGENTS.md`'s threat model names.
+    """
+    for segment in segments:
+        start = _command_index(segment, refuse=False)
+        if start is None:
+            continue
+        words = segment[start:]
+        if not words:
+            continue
+        program = os.path.basename(_expand(words[0], parts))
+        if program in RUNS_ANOTHER_PROGRAM and any(
+            os.path.basename(_expand(word, parts)) == "ln" for word in words[1:]
+        ):
+            raise NotReadOnly(f"{program} runs ln, which makes a link this module can't place")
+        if program != "ln":
+            continue
+        for key, target in _ln_links(words[1:], parts, bases):
+            _PLANNED_LINKS.setdefault(key, set()).add(target)
+    if sum(len(targets) for targets in _PLANNED_LINKS.values()) > MAX_PLANNED_LINKS:
+        raise NotReadOnly("more links than this module reads")
+
+
+def _ln_links(
+    tokens: list[str], parts: list[tuple[str, str]], bases: list[str]
+) -> list[tuple[str, str]]:
+    """Each link these `ln` arguments make, as the path it will be at and the one it leads to.
+
+    Read from each of ``bases``. Its forms: `ln T` makes `./basename(T)`, `ln T... DIR` and
+    `ln -t DIR T...` make `DIR/basename(T)`, and `ln -T T L` makes `L`. `ln T L` makes `L`, or
+    `L/basename(T)` when `L` is a directory, and both are read. A symbolic link leads where its
+    text does from the directory that holds it, or with `-r` where `T` does from the working
+    directory, as a hard link does. A hard link of a symbolic link is a copy of that link with
+    `-P`, GNU's default, whose text then leads from the new link's directory, and of where it
+    leads with `-L`, BSD's: without either, both are read.
+    """
+    symbolic = relative = no_target_directory = logical = physical = False
+    directory: str | None = None
+    operands: list[str] = []
+    words = [_ln_word(token, parts) for token in tokens]
+    index = 0
+    options = True
+    while index < len(words):
+        word = words[index]
+        index += 1
+        if options and word == "--":
+            options = False
+        elif options and word.startswith("--"):
+            name, equals, value = word.partition("=")
+            if name in LN_LONG_VALUES:
+                if not equals:
+                    if index >= len(words):
+                        raise NotReadOnly(f"ln option without its value: {word}")
+                    value, index = words[index], index + 1
+                if name == "--target-directory":
+                    directory = value
+            elif name == "--backup" or (name in LN_LONG_FLAGS and not equals):
+                symbolic = symbolic or name == "--symbolic"
+                relative = relative or name == "--relative"
+                no_target_directory = no_target_directory or name == "--no-target-directory"
+                logical = logical or name == "--logical"
+                physical = physical or name == "--physical"
+            else:
+                raise NotReadOnly(f"ln option this module doesn't read: {word}")
+        elif options and word.startswith("-") and word != "-":
+            for position, letter in enumerate(word[1:], start=1):
+                if letter in LN_VALUE_LETTERS:
+                    value = word[position + 1 :]
+                    if not value:
+                        if index >= len(words):
+                            raise NotReadOnly(f"ln option without its value: {word}")
+                        value, index = words[index], index + 1
+                    if letter == "t":
+                        directory = value
+                    break
+                if letter not in LN_FLAG_LETTERS:
+                    raise NotReadOnly(f"ln option this module doesn't read: {word}")
+                symbolic = symbolic or letter == "s"
+                relative = relative or letter == "r"
+                no_target_directory = no_target_directory or letter == "T"
+                logical = logical or letter == "L"
+                physical = physical or letter == "P"
+        else:
+            operands.append(word)
+    if not operands:
+        return []
+    places: list[tuple[str, str]] = []  # (where the link goes, what it is made from)
+    if directory is not None:
+        places = [(os.path.join(directory, os.path.basename(t.rstrip("/"))), t) for t in operands]
+    elif len(operands) == 1:
+        places = [(os.path.basename(operands[0].rstrip("/")) or ".", operands[0])]
+    elif len(operands) == 2 and no_target_directory:
+        places = [(operands[1], operands[0])]
+    elif len(operands) == 2:
+        made_from, name = operands
+        places = [
+            (name, made_from),
+            (os.path.join(name, os.path.basename(made_from.rstrip("/"))), made_from),
+        ]
+    else:
+        *sources, last = operands
+        places = [(os.path.join(last, os.path.basename(t.rstrip("/"))), t) for t in sources]
+    links: list[tuple[str, str]] = []
+    for base in bases:
+        for place, made_from in places:
+            parent, name = os.path.split(os.path.join(base, place).rstrip("/"))
+            if name in ("", ".", ".."):
+                continue  # a directory's own entry, which `ln` fails to replace
+            for resolved_parent in _resolutions(parent or "/"):
+                key = os.path.join(resolved_parent, name)
+                if symbolic and not relative:
+                    links.append((key, os.path.join(resolved_parent, made_from)))
+                elif symbolic:
+                    links.append((key, os.path.join(base, made_from)))
+                else:
+                    targets = _hard_link_targets(
+                        os.path.join(base, made_from),
+                        resolved_parent,
+                        logical=logical,
+                        physical=physical,
+                    )
+                    links += [(key, target) for target in targets]
+    if len(links) > MAX_PLANNED_LINKS:
+        raise NotReadOnly("more links than this module reads")
+    return links
+
+
+def _hard_link_targets(source: str, parent: str, *, logical: bool, physical: bool) -> list[str]:
+    """Where a hard link of ``source``, made in ``parent``, leads; see `_ln_links`.
+
+    A source that is a link this command makes is one whose text this module didn't keep, so
+    `NotReadOnly` unless `-L` makes the hard link of where it leads.
+    """
+    directory, name = os.path.split(source)
+    planned = any(
+        os.path.join(resolved, name) in _PLANNED_LINKS for resolved in _resolutions(directory)
+    )
+    if planned and not (logical and not physical):
+        raise NotReadOnly(f"ln hard-links a link this command makes: {source}")
+    targets = []
+    if os.path.islink(source) and not (logical and not physical):
+        text = os.readlink(source)
+        targets.append(text if text.startswith("/") else os.path.join(parent, text))
+    if not os.path.islink(source) or not (physical and not logical):
+        targets.append(source)
+    return targets
+
+
+def _ln_word(token: str, parts: list[tuple[str, str]]) -> str:
+    """An `ln` argument as the program gets it, or `NotReadOnly` for one the shell decides."""
+    if _word_the_shell_builds(token, parts):
+        raise NotReadOnly(f"ln given a word the shell builds: {_expand(token, parts)}")
+    word = _expand(token, parts)
+    if token.startswith("~"):
+        word = _tilde_word(word)
+    if UNREAD_VALUE in word:
+        raise NotReadOnly(f"ln given a directory the shell picks: {token}")
+    return word
+
+
+# --------------------------------------------------------------------------------------
+# Read scope: the files a reader opens
+# --------------------------------------------------------------------------------------
+
+# How each known reader takes its arguments.
+# - `pattern` is a first operand that is a pattern, script or filter rather than a file -- unless
+#   a flag in `script_flags` supplied it
+# - `values` take a following argument that is not a file
+# - `files` take a following argument that is a file
+# - `file_lists` take a file that names the files to read, which the command never shows, so no path
+#    is there to check: `sort --files0-from=list` prints whatever `list` names
+# - `pairs` take two, of which the second is a file when the flag is in `pair_files`
+# - `attached_values` take a value only when it is attached (`--color=auto`, `-w16`), so the word
+#   after one is not its value
+# - A flag missing from every set is treated as taking nothing, so its neighbour is checked as
+#   a file, and so is a value attached to it with `=`: a mistake in this table costs a prompt,
+#   never a skipped path
+# - `no_bundles` marks a program whose single-dash options are whole words (`xxd -cols`),
+#   not bundles of letters (`grep -rf`)
+READER_SPECS = {
+    "cat": {},
+    "tac": {"values": {"-s", "--separator"}},
+    "rev": {},
+    "head": {"values": {"-n", "-c", "--lines", "--bytes"}},
+    "tail": {"values": {"-n", "-c", "--lines", "--bytes", "-s", "--sleep-interval", "--pid"}},
+    "grep": {
+        "pattern": True,
+        "script_flags": {"-e", "--regexp", "-f", "--file"},
+        "values": {
+            "-e",
+            "--regexp",
+            "-m",
+            "--max-count",
+            "-A",
+            "-B",
+            "-C",
+            "--after-context",
+            "--before-context",
+            "--context",
+            "--include",
+            "--exclude",
+            "--exclude-dir",
+            "--label",
+            "-d",
+            "-D",
+            "--devices",
+            "--directories",
+            "--binary-files",
+            "--group-separator",
+        },
+        "attached_values": {"--color", "--colour"},
+        "files": {"-f", "--file", "--exclude-from"},
+    },
+    "sed": {
+        "pattern": True,
+        "script_flags": {"-e", "--expression", "-f", "--file"},
+        "values": {"-e", "--expression", "-l", "--line-length"},
+        "files": {"-f", "--file"},
+    },
+    "awk": {
+        "pattern": True,
+        "script_flags": {"-f", "--file"},
+        "values": {"-v", "-F", "--assign", "--field-separator"},
+        "files": {"-f", "--file"},
+    },
+    "jq": {
+        "pattern": True,
+        "script_flags": {"-f", "--from-file"},
+        "values": {"--indent"},
+        "files": {"-f", "--from-file", "-L"},
+        "pairs": {"--arg", "--argjson", "--slurpfile", "--rawfile"},
+        "pair_files": {"--slurpfile", "--rawfile"},
+        "positional_stop": {"--args", "--jsonargs"},
+    },
+    "wc": {"files": {"--files0-from"}, "file_lists": {"--files0-from"}},
+    "sort": {
+        "values": {
+            "-k",
+            "--key",
+            "-t",
+            "--field-separator",
+            "-S",
+            "--buffer-size",
+            "-T",
+            "--temporary-directory",
+            "--parallel",
+            "--batch-size",
+        },
+        "files": {"--files0-from"},
+        "file_lists": {"--files0-from"},
+    },
+    "uniq": {"values": {"-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"}},
+    "cut": {
+        "values": {
+            "-f",
+            "-d",
+            "-c",
+            "-b",
+            "--fields",
+            "--delimiter",
+            "--characters",
+            "--bytes",
+            "--output-delimiter",
+        }
+    },
+    "diff": {
+        "values": {
+            "-U",
+            "-C",
+            "--label",
+            "-I",
+            "--ignore-matching-lines",
+            "-x",
+            "--exclude",
+            "-W",
+            "--width",
+        },
+        "attached_values": {"--unified", "--context"},
+        "files": {"-X", "--exclude-from", "--from-file", "--to-file"},
+    },
+    "cmp": {"values": {"-i", "--ignore-initial", "-n", "--bytes"}},
+    "comm": {"values": {"--output-delimiter"}},
+    "join": {"values": {"-1", "-2", "-j", "-t", "-o", "-e"}},
+    "paste": {"values": {"-d", "--delimiters"}},
+    "nl": {"values": {"-b", "-d", "-f", "-h", "-i", "-l", "-n", "-s", "-v", "-w"}},
+    "od": {
+        "values": {
+            "-A",
+            "-j",
+            "-N",
+            "-t",
+            "--address-radix",
+            "--skip-bytes",
+            "--read-bytes",
+            "--format",
+        },
+        "attached_values": {"-w", "--width"},
+    },
+    "xxd": {
+        "values": {"-c", "-g", "-l", "-s", "-o", "-cols", "-len", "-seek"},
+        "no_bundles": True,
+    },
+    "base64": {"values": {"-w", "--wrap", "-b", "--break"}, "files": {"-i"}},
+    "md5sum": {},
+    "sha1sum": {},
+    "sha256sum": {},
+    "shasum": {"values": {"-a", "--algorithm"}},
+    "stat": {"values": {"-c", "--format", "--printf"}},
+    "file": {
+        "values": {"-F", "--separator", "-e", "--exclude", "-P", "--parameter"},
+        "files": {"-m", "--magic-file", "-f", "--files-from"},
+        "file_lists": {"-f", "--files-from"},
+    },
+    "du": {
+        "values": {
+            "-d",
+            "--max-depth",
+            "-B",
+            "--block-size",
+            "-t",
+            "--threshold",
+            "--exclude",
+            "--time-style",
+        },
+        "files": {"--files0-from", "-X", "--exclude-from"},
+        "file_lists": {"--files0-from"},
+    },
+    "ls": {
+        "values": {
+            "-I",
+            "--ignore",
+            "-w",
+            "--width",
+            "--format",
+            "--sort",
+            "--time",
+            "-T",
+            "--tabsize",
+            "--block-size",
+            "--hide",
+            "--indicator-style",
+            "--quoting-style",
+            "--time-style",
+        },
+        "attached_values": {"--color"},
+    },
+    "column": {
+        "values": {
+            "-s",
+            "-c",
+            "-o",
+            "-N",
+            "-R",
+            "-H",
+            "-W",
+            "--separator",
+            "--output-separator",
+            "--table-columns",
+        }
+    },
+    "date": {
+        "operands_are_not_files": True,
+        "values": {"-d", "--date", "--rfc-3339"},
+        "attached_values": {"-I", "--iso-8601"},
+        "files": {"-r", "--reference", "-f", "--file"},
+    },
+}
+
+READER_SPECS["egrep"] = READER_SPECS["fgrep"] = READER_SPECS["grep"]
+
+READER_SPECS["gawk"] = READER_SPECS["awk"]
+
+
+def _long_flag(name: str, listed: set[str], files: set[str]) -> str:
+    """The listed flag that the long option ``name`` stands for, or ``name`` itself.
+
+    ``getopt_long`` accepts any unambiguous prefix, so ``diff --from-f=X`` reads ``X`` as
+    ``--from-file=X`` does. A prefix of several listed flags is ambiguous, and the program
+    rejects it, but if one of them takes a file it is read as that one, so the path is checked
+    either way.
+    """
+    if name in listed:
+        return name
+    candidates = sorted(flag for flag in listed if flag.startswith(name))
+    for flag in candidates:
+        if flag in files:
+            return flag
+    return candidates[0] if len(candidates) == 1 else name
+
+
+def _short_flag(arg: str, takes_value: set[str], *, bundles: bool) -> tuple[str, int]:
+    """The flag in the single-dash word ``arg`` that takes a value, and where that value starts.
+
+    getopt reads ``-rfX`` as ``-r -f X``: the first letter that takes a value takes the rest of
+    the word, or the next word when nothing is left, so the start is 0 then. A word with no
+    such letter is a bundle of flags that take nothing, returned whole. Without ``bundles``
+    only the first letter is read: ``xxd -ps`` is one option, not ``-p -s``.
+    """
+    if arg in takes_value:
+        return arg, 0
+    for position in range(1, len(arg) if bundles else 2):
+        flag = "-" + arg[position]
+        if flag in takes_value:
+            rest = position + 1
+            return flag, rest if rest < len(arg) else 0
+    return arg, 0
+
+
+def _file_operands(
+    program: str, args: list[str], spec: dict | None = None
+) -> list[tuple[int, int]]:
+    """Where in `args` the words this reader will open as files are.
+
+    Each entry is an index into `args`, and where the path starts in that word: past
+    `--from-file=` or `-rf` when it is attached to its flag, 0 when the word is all path.
+    Raises `NoOpinion` for a flag in `file_lists`, whose files no word names. `spec` is the
+    reader's `READER_SPECS` entry, unless given.
+    """
+    spec = READER_SPECS[program] if spec is None else spec
+    values = spec.get("values", set())
+    attached_values = spec.get("attached_values", set())
+    files = spec.get("files", set())
+    file_lists = spec.get("file_lists", set())
+    pairs = spec.get("pairs", set())
+    pair_files = spec.get("pair_files", set())
+    script_flags = spec.get("script_flags", set())
+    stop_flags = spec.get("positional_stop", set())
+    operands_are_files = not spec.get("operands_are_not_files", False)
+    bundles = not spec.get("no_bundles", False)
+    listed = values | attached_values | files | pairs | script_flags | stop_flags
+
+    found: list[tuple[int, int]] = []
+    pattern_pending = bool(spec.get("pattern"))
+    positional_stop = False
+    options_done = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if not options_done and arg == "--":
+            options_done = True
+            index += 1
+            continue
+        if not options_done and arg.startswith("-") and arg != "-":
+            if arg.startswith("--"):
+                name, equals, _ = arg.partition("=")
+                flag = _long_flag(name, listed, files)
+                start = len(name) + 1 if equals else 0
+                if start and flag not in listed:
+                    found.append((index, start))  # a value attached to a flag the table lacks
+                    index += 1
+                    continue
+            else:
+                flag, start = _short_flag(arg, values | attached_values | files, bundles=bundles)
+            if flag in script_flags:
+                pattern_pending = False
+            if flag in stop_flags:
+                positional_stop = True
+            if flag in pairs:
+                if flag in pair_files and index + 2 < len(args):
+                    found.append((index + 2, 0))
+                index += 3
+                continue
+            if flag in file_lists:
+                raise NoOpinion(f"{program} {flag} reads the files another file names")
+            if flag in files:
+                if start:
+                    found.append((index, start))
+                    index += 1
+                else:
+                    if index + 1 < len(args):
+                        found.append((index + 1, 0))
+                    index += 2
+                continue
+            if flag in values and not start:
+                index += 2
+                continue
+            index += 1
+            continue
+        if pattern_pending:
+            pattern_pending = False
+        elif operands_are_files and not positional_stop:
+            found.append((index, 0))
+        index += 1
+    return found
+
+
+# --------------------------------------------------------------------------------------
+# Read scope: the links a recursive read follows
+# --------------------------------------------------------------------------------------
+
+# The readers that follow a link they meet while they recurse, and so read wherever it leads
+# from a directory that is in scope: `grep -R x .` with `k -> ~/.ssh` in it prints the key (#63).
+# `grep -r`, `rg`, `find`, `ls -R` and `du` without these follow only a link the command line
+# names, which both layers resolve. Each with the spec its operands are read by, and:
+# - `short` and `long`: the flags that make it follow; a long one by any prefix of at least
+#   `long_prefix` letters, as getopt_long reads it
+# - `recursive`: the flags it needs as well, unless it always recurses
+# - `stop`: the long flags that stop it, `diff --no-dereference`
+# - `default`: whether no operand is the working directory
+# - `pattern_free`: the flags that leave no pattern operand, as `rg --files` does
+RG_SPEC = {
+    "pattern": True,
+    "script_flags": {"-e", "--regexp", "-f", "--file", "--files", "--type-list"},
+    "values": {
+        "-A",
+        "-B",
+        "-C",
+        "-E",
+        "-M",
+        "-T",
+        "-d",
+        "-e",
+        "-f",
+        "-g",
+        "-j",
+        "-m",
+        "-r",
+        "-t",
+        "--after-context",
+        "--before-context",
+        "--color",
+        "--colors",
+        "--context",
+        "--context-separator",
+        "--dfa-size-limit",
+        "--encoding",
+        "--engine",
+        "--field-context-separator",
+        "--field-match-separator",
+        "--file",
+        "--glob",
+        "--hostname-bin",
+        "--hyperlink-format",
+        "--iglob",
+        "--ignore-file",
+        "--max-columns",
+        "--max-count",
+        "--max-depth",
+        "--max-filesize",
+        "--path-separator",
+        "--pre",
+        "--pre-glob",
+        "--regex-size-limit",
+        "--regexp",
+        "--replace",
+        "--sort",
+        "--sortr",
+        "--threads",
+        "--type",
+        "--type-add",
+        "--type-clear",
+        "--type-not",
+    },
+}
+
+LINK_FOLLOWERS = {
+    "grep": {
+        "spec": READER_SPECS["grep"],
+        "short": "RS",  # `-S` is ugrep's, which Claude Code's `grep` runs: links to files
+        "long": ("--dereference-recursive", "--dereference-files"),
+        # `--der`: `--de` is ambiguous with `--devices` and `--directories`, `--der` is not
+        "long_prefix": 5,
+        "default": True,
+    },
+    "rg": {"spec": RG_SPEC, "short": "L", "long": ("--follow",), "default": True},
+    "diff": {
+        "spec": READER_SPECS["diff"],
+        "follows_by_default": True,
+        "stop": ("--no-dereference",),
+        "long_prefix": 5,
+    },
+    "find": {"short": "L", "default": True},
+    "ls": {
+        "spec": READER_SPECS["ls"],
+        "short": "L",
+        "long": ("--dereference",),
+        "recursive": ("R", "--recursive"),
+        "default": True,
+    },
+    "du": {"spec": READER_SPECS["du"], "short": "L", "long": ("--dereference",), "default": True},
+}
+
+for _name in ("egrep", "fgrep", "ugrep", "ug"):
+    LINK_FOLLOWERS[_name] = LINK_FOLLOWERS["grep"]
+
+# Programs that hand the program after them operands no word of the command spells: from the
+# input, or each file a search finds
+OPERANDS_FROM_ELSEWHERE = frozenset({"find", "parallel", "xargs"})
+
+# The most directory entries the walk for `LINK_FOLLOWERS` reads for one command. Past it, the
+# command is refused outright: a link it didn't reach could lead into a credential store, and
+# an operator's rule for the reader would approve it.
+MAX_WALKED_ENTRIES = 50000
+
+
+def _short_letters(word: str, values: set[str]) -> str:
+    """The flag letters a single-dash ``word`` sets, up to the first that takes a value."""
+    letters = ""
+    for letter in word[1:]:
+        letters += letter
+        if "-" + letter in values:
+            break
+    return letters
+
+
+def _follow_depth(program: str, args: list[str]) -> int | None:
+    """How deep the reader `program` follows the links in its directory operands.
+
+    None where it doesn't follow one, 0 where it follows them all the way down, and 1 where it
+    reads only a directory's own entries, as `diff` without `-r` does.
+    """
+    follower = LINK_FOLLOWERS[program]
+    spec = follower.get("spec", {})
+    values = spec.get("values", set()) | spec.get("files", set())
+    long_prefix = follower.get("long_prefix", 0)
+    follows = recursive = False
+    stopped = False
+    always_recursive = "recursive" not in follower and program != "diff"
+
+    def long_match(name: str, flags: tuple[str, ...]) -> bool:
+        return any(
+            name == flag or (long_prefix and len(name) >= long_prefix and flag.startswith(name))
+            for flag in flags
+        )
+
+    expression = False
+    for index, arg in enumerate(args):
+        if arg == "--":
+            break
+        if program == "find":
+            # Its options come before the paths; `-follow` is an expression anywhere after them
+            if arg == "-follow":
+                follows = True
+            elif not expression and arg.startswith("-") and arg not in ("-H", "-L", "-P"):
+                expression = True
+            elif not expression and arg == "-L":
+                follows = True
+            continue
+        if not arg.startswith("-") or arg == "-":
+            continue
+        if index and args[index - 1] in values:
+            continue  # the value of the flag before it
+        if arg.startswith("--"):
+            name = arg.partition("=")[0]
+            follows = follows or long_match(name, follower.get("long", ()))
+            stopped = stopped or long_match(name, follower.get("stop", ()))
+            recursive = recursive or long_match(name, follower.get("recursive", ("",))[1:])
+            if program == "diff":
+                recursive = recursive or long_match(name, ("--recursive",))
+        else:
+            letters = _short_letters(arg, values)
+            follows = follows or any(letter in letters for letter in follower.get("short", ""))
+            recursive = recursive or any(
+                letter in letters for letter in follower.get("recursive", ("",))[0]
+            )
+            if program == "diff":
+                recursive = recursive or "r" in letters
+    if program == "diff":
+        if stopped:
+            return None
+        return 0 if recursive else 1
+    if not follows or not (always_recursive or recursive):
+        return None
+    return 0
+
+
+def _follower_operands(program: str, args: list[str]) -> list[int]:
+    """The indexes in `args` of the directories a `LINK_FOLLOWERS` reader reads."""
+    if program == "find":
+        operands = []
+        for index, arg in enumerate(args):
+            if arg in ("-H", "-L", "-P"):
+                continue
+            if arg.startswith(("-", "(", "!")):
+                break
+            operands.append(index)
+        return operands
+    spec = LINK_FOLLOWERS[program].get("spec", {})
+    return [index for index, start in _file_operands(program, args, spec) if not start]
+
+
+def _followed_links(
+    program: str,
+    args: list[str],
+    tokens: list[str],
+    parts: list[tuple[str, str]],
+    bases: list[str],
+    values: dict[str, list[str] | None],
+    *,
+    operands_elsewhere: bool = False,
+) -> list[tuple[str, str]]:
+    """Each link a `LINK_FOLLOWERS` reader follows in its directory operands, and where it leads.
+
+    Each place it leads to is one of its `_resolutions`, and the links the command makes count,
+    `_PLANNED_LINKS`. An operand is each of its `_spellings`, with ``values`` as `_known_values`
+    reads them, and a wildcard the shell expands is each name it matches. An operand, or a
+    working directory, below a value this module didn't read is the residual a recursive read of
+    it is, as `grep -r x "$d"`: not walked. Raises `NotReadOnly` for operands that come from
+    elsewhere, as `xargs grep -R x` takes them, and for a walk past `MAX_WALKED_ENTRIES`.
+
+    The walk reads every entry, ignore files or not, and follows each link into where it leads
+    as the reader does, so a link in a directory outside the project is found too.
+    """
+    depth = _follow_depth(program, args)
+    if depth is None:
+        return []
+    if operands_elsewhere:
+        raise NotReadOnly(f"{program} follows links below directories no word of the command names")
+    indexes = _follower_operands(program, args)
+    directories: list[str] = []
+    for index in indexes:
+        token, text = tokens[index], args[index]
+        whole = PLACEHOLDER.fullmatch(token)
+        if whole is not None and parts[int(whole.group(1))][0] == PROCESS_SUBSTITUTION:
+            continue  # `<(...)`: a pipe, not a directory
+        if token.startswith("~"):
+            text = _tilde_word(text)
+        spellings = _spellings(text, values, bases, before=False)
+        if not _carries_live_glob(token):
+            directories += spellings
+            continue
+        # A wildcard is matched once the shell has put each value in place: `d=a/b; ... "$d"/*`
+        for spelled in spellings:
+            if UNREAD_VALUE in spelled:
+                directories.append(spelled)  # the residual: see the docstring
+                continue
+            if GLOB_FROM_ITS_DIRECTORY.search(spelled) and depth:
+                depth = 0  # the literal directory holds the matches at any depth
+            directories += _glob_matches(spelled, bases)
+    if not indexes and LINK_FOLLOWERS[program].get("default"):
+        directories.append(".")
+    roots: list[str] = []
+    for directory in directories:
+        for base in bases if not directory.startswith("/") else [""]:
+            if UNREAD_VALUE in base or UNREAD_VALUE in directory:
+                continue  # the residual: see the docstring
+            if directory in ("", "."):
+                roots.append(base)
+            else:
+                roots.append(os.path.join(base, directory) if base else directory)
+    return _walk_for_links(roots, depth)
+
+
+# A wildcard `_glob_matches` doesn't match by its parts: `**`, which zsh, and bash with
+# `globstar`, read as any depth, and zsh's `***`, which follows links as it recurses; a collating
+# element, `[[.ch.]]`, which can be several characters; and the operators of bash's `extglob` and
+# zsh's `EXTENDED_GLOB`, which a startup file can set, `[^...]` among them. Such a pattern is
+# walked from the directory its literal part names instead, which holds every name it matches:
+# the walk follows each link below it anyway.
+GLOB_FROM_ITS_DIRECTORY = re.compile(r"\*\*|\[\[\.|[()|#^<>]|(?<!^)~")
+
+# How many bytes of UTF-8 a character can take: in the C locale, `?` and `[...]` match one byte
+MAX_CHARACTER_BYTES = 4
+
+
+def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
+    """Each path a wildcard the shell expands may match, from each of ``bases``: more, never fewer.
+
+    Every reading a startup file can choose is taken at once, so that none is missed: dot files
+    match, as with `dotglob` or zsh's `GLOB_DOTS`; a name matches whatever its case, as with
+    `nocaseglob` or zsh's `NO_CASE_GLOB`, which reads a literal component that way too; and a run
+    of `?` and `[...]`, each a byte in the C locale, matches from a quarter as many characters to
+    as many. A set, `[[:alpha:]]` and `[!x]` included, is any one of them. A pattern
+    `GLOB_FROM_ITS_DIRECTORY` holds is its literal directory instead, which a recursive walk
+    covers. Past `MAX_WALKED_ENTRIES` names, `NotReadOnly`.
+    """
+    if GLOB_FROM_ITS_DIRECTORY.search(pattern):
+        head = PATH_SPECIAL.split(pattern, 1)[0]
+        return [head.rsplit("/", 1)[0] or "/" if "/" in head else "."]
+    components = [component for component in pattern.split("/") if component]
+    starts = ["/"] if pattern.startswith("/") else [b for b in bases if UNREAD_VALUE not in b]
+    matches: list[str] = []
+    for start in starts:
+        current = [start]
+        for index, component in enumerate(components):
+            regex = _glob_component_regex(component)
+            last = index == len(components) - 1
+            found: list[str] = []
+            for directory in current:
+                try:
+                    names = os.listdir(directory)
+                except (OSError, ValueError):
+                    names = []
+                if regex is None:
+                    chosen = [name for name in names if name.casefold() == component.casefold()]
+                    if component in (".", ".."):
+                        chosen.append(component)
+                else:
+                    chosen = [name for name in names if regex.fullmatch(name)]
+                    # bash before 5.2 matches `.` and `..` with a pattern that starts with `.`
+                    if component.startswith("."):
+                        chosen += [name for name in (".", "..") if regex.fullmatch(name)]
+                for name in dict.fromkeys(chosen):
+                    path = os.path.join(directory, name)
+                    if last or os.path.isdir(path):
+                        found.append(path)
+                if len(found) + len(matches) > MAX_WALKED_ENTRIES:
+                    raise NotReadOnly(
+                        f"a wildcard that matches more than {MAX_WALKED_ENTRIES} names"
+                    )
+            current = found
+        matches += current
+    return matches
+
+
+def _glob_component_regex(component: str) -> re.Pattern[str] | None:
+    """The names one component of a wildcard may match, as `_glob_matches` reads them.
+
+    None for a component with no wildcard.
+    """
+    parts: list[str] = []
+    singles = 0
+    wildcard = False
+
+    def flush() -> None:
+        nonlocal singles
+        if singles:
+            parts.append(f".{{{-(-singles // MAX_CHARACTER_BYTES)},{singles}}}")
+            singles = 0
+
+    index = 0
+    while index < len(component):
+        character = component[index]
+        if character == "*":
+            flush()
+            parts.append(".*")
+            wildcard = True
+            index += 1
+        elif character == "?":
+            singles += 1
+            wildcard = True
+            index += 1
+        elif character == "[":
+            end = _bracket_end(component, index)
+            singles += 1  # a set is one character; an unmatched `[` is the character itself
+            wildcard = True
+            index = index + 1 if end is None else end + 1
+        else:
+            flush()
+            parts.append(re.escape(character))
+            index += 1
+    flush()
+    if not wildcard:
+        return None
+    return re.compile("".join(parts), re.DOTALL | re.IGNORECASE)
+
+
+def _bracket_end(text: str, start: int) -> int | None:
+    """The index of the `]` that ends the set opening at ``start``, or None for a literal `[`.
+
+    A `]` right after the `[`, or after its `!` or `^`, is a member, and so is each `[:...:]`
+    and `[=...=]` class whole.
+    """
+    index = start + 1
+    if index < len(text) and text[index] in "!^":
+        index += 1
+    if index < len(text) and text[index] == "]":
+        index += 1
+    while index < len(text):
+        if text[index] == "]":
+            return index
+        if text.startswith(("[:", "[="), index):
+            close = text.find(text[index + 1] + "]", index + 2)
+            if close < 0:
+                return None
+            index = close + 2
+            continue
+        index += 1
+    return None
+
+
+def _walk_for_links(roots: list[str], depth: int) -> list[tuple[str, str]]:
+    """`_followed_links`' walk, from each of ``roots``, to ``depth`` levels, or all with 0.
+
+    A root is each of its `_resolutions`, so one an `ln` in the command makes, or one whose
+    path goes through a link, is walked where it leads, and reported as a link to there.
+    """
+    key = (
+        tuple(roots),
+        depth,
+        tuple(sorted((link, tuple(sorted(targets))) for link, targets in _PLANNED_LINKS.items())),
+    )
+    if key not in _WALKS:
+        _WALKS[key] = _walk_for_links_uncached(roots, depth)
+    return _WALKS[key]
+
+
+def _walk_for_links_uncached(roots: list[str], depth: int) -> list[tuple[str, str]]:
+    """`_walk_for_links`, without the cache.
+
+    Each directory is listed where it resolves, and its entries are named below the path the walk
+    came by, so that a link is reported by a path the read scope places as the shell does: one in
+    a scratchpad under macOS's `/tmp -> /private/tmp` is in the scratchpad. A directory is listed
+    once, by where it resolves.
+    """
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    count = 0
+    stack: list[tuple[str, int]] = []
+    for root in roots:
+        try:
+            resolutions = _resolutions(root)
+        except (OSError, ValueError):
+            raise NotReadOnly(f"a directory this module can't resolve: {root}") from None
+        found += [
+            (root, resolved) for resolved in resolutions if resolved != os.path.normpath(root)
+        ]
+        stack.append((root, 1))
+    while stack:
+        directory, level = stack.pop()
+        try:
+            reals = _resolutions(directory)
+        except (OSError, ValueError):
+            raise NotReadOnly(f"a directory this module can't resolve: {directory}") from None
+        entries: list[tuple[str, bool, bool]] = []
+        for real in reals:
+            if real in seen or not os.path.isdir(real):
+                continue
+            seen.add(real)
+            try:
+                with os.scandir(real) as listing:
+                    entries += [
+                        (
+                            os.path.join(directory, entry.name),
+                            entry.is_symlink(),
+                            entry.is_dir(follow_symlinks=False),
+                        )
+                        for entry in listing
+                    ]
+            except (OSError, ValueError):
+                continue  # what the walk can't list, the reader can't either
+            entries += [
+                (os.path.join(directory, os.path.basename(key)), True, False)
+                for key in _PLANNED_LINKS
+                if os.path.dirname(key) == real
+            ]
+        count += len(entries)
+        if count > MAX_WALKED_ENTRIES:
+            raise NotReadOnly(
+                f"a read that follows links below more than {MAX_WALKED_ENTRIES} entries"
+            )
+        deeper = depth == 0 or level < depth
+        for path, is_link, is_directory in entries:
+            if is_link:
+                try:
+                    targets = _resolutions(path)
+                except (OSError, ValueError):
+                    raise NotReadOnly(f"a link this module can't resolve: {path}") from None
+                found += [(path, target) for target in targets]
+            if (is_link or is_directory) and deeper:
+                stack.append((path, level + 1))
+    return found
+
+
+def _refuse_followed_credential_links(
+    segments: list[list[str]], parts: list[tuple[str, str]], state: _ShellState
+) -> None:
+    """Layer B, for the links a reader follows while it recurses.
+
+    Refuses the command outright if one leads into a credential store, or to a directory that
+    holds one, as `~` does.
+
+    Every segment, whatever tier approves it: under `Bash(grep *)`, `grep -R x .` reads `~/.ssh`
+    through `k -> ~`, and no word names it. The reader is the program, or any word after one
+    that runs another, `RUNS_ANOTHER_PROGRAM`. A reader behind a program that gives it operands
+    of its own, as `xargs grep -R x` is, is refused: no word names what it reads.
+    """
+    stores = [os.path.realpath(store) for store in _credential_roots()]
+    for segment in segments:
+        start = _command_index(segment, refuse=False)
+        if start is None:
+            continue
+        tokens = segment[start:]
+        words = [_expand(token, parts) for token in tokens]
+        # The program, or any word after one that runs another, as `timeout 5 grep -R` does
+        wrapper = os.path.basename(words[0]) if words else ""
+        runs_another = wrapper in RUNS_ANOTHER_PROGRAM or wrapper in OPERANDS_FROM_ELSEWHERE
+        for index, word in enumerate(words if runs_another else words[:1]):
+            program = os.path.basename(word)
+            if program not in LINK_FOLLOWERS:
+                continue
+            elsewhere = index > 0 and wrapper in OPERANDS_FROM_ELSEWHERE
+            links = _followed_links(
+                program,
+                words[index + 1 :],
+                tokens[index + 1 :],
+                parts,
+                state.shell_bases,
+                state.values,
+                operands_elsewhere=elsewhere,
+            )
+            for link, target in links:
+                if _names_a_credential(target, tilde=False, bases=[], live_glob=False) or any(
+                    _is_under(store, target) for store in stores
+                ):
+                    raise NotReadOnly(
+                        f"{program} follows the link {link} to a credential store: {target}"
+                    )
+
+
+# --------------------------------------------------------------------------------------
+# Programs
+#
+# One section per program: its tables, then its validator. A validator takes the arguments as
+# the program gets them, and raises `NotReadOnly` for a write it found, or `NoOpinion` for a
+# call it has no reading of. `PROGRAMS`, after them, is where each is registered.
+# --------------------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------------
+# sed
+# --------------------------------------------------------------------------------------
+
+# `sed` script commands that can neither write a file nor run a program. `w`, `W`, `r`,
+# `R`, `e`, `F` and `v` are left out on purpose, and so are the branch commands `b`, `t`,
+# `T`, `:` and the `{` `}` group, whose labels would need a parser of their own to read.
+SED_SAFE_COMMANDS = set("=DGHNPQdghlnpqsxyz")
 
 
 def _skip_sed_delimited(script: str, index: int, delimiter: str) -> int:
@@ -2481,6 +4650,25 @@ def _check_sed(args: list[str]) -> None:
         _scan_sed_script(script)
 
 
+# --------------------------------------------------------------------------------------
+# awk and gawk
+# --------------------------------------------------------------------------------------
+
+# An `awk` string literal, which is the one place in a program where `>` and `|` are only
+# characters. Taken out before either rule below reads the program.
+AWK_STRING = re.compile(r'"(?:\\.|[^"\\])*"')
+
+# A `print` or `printf` statement is the only thing in `awk` that can redirect to a file or
+# pipe to a shell, and a statement ends at `;`, `{` or `}`. `||` is the logical or, which
+# is how a line selector is spelled; `|&` is `gawk`'s coprocess, which is not.
+AWK_OUTPUT = re.compile(r"\b(?:print|printf)\b[^;{}]*(?:>|(?<!\|)\|(?!\|))")
+
+# `gawk`'s `@include` and `@load` are `--include` and `--load` written inside the program,
+# where the flag table cannot see them: one pulls in another program file, the other a
+# shared object. Neither is a flag, so neither is refused by refusing the flags.
+AWK_EXTENSION = re.compile(r"@\s*(?:include|load|namespace)\b")
+
+
 def _check_awk(args: list[str]) -> None:
     """
     Validate ``awk``/``gawk``: stream computation only, no extensions, program files, or shell-outs.
@@ -2508,6 +4696,616 @@ def _check_awk(args: list[str]) -> None:
             raise NotReadOnly("awk include or load directive inside the program")
         if re.search(r"\b(?:system|getline|close|fflush|ENVIRON)\b", program):
             raise NotReadOnly("awk external access function")
+
+
+# --------------------------------------------------------------------------------------
+# jq
+# --------------------------------------------------------------------------------------
+
+# A `jq` string literal, taken out before `_check_jq` looks for what a filter reads
+JQ_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def _check_jq(args: list[str]) -> None:
+    r"""Validate jq: a filter language with no write and no exec, given two restrictions.
+
+    jq cannot create a file or run a program -- there is no `system`, no output
+    redirection, and no shell-out anywhere in its grammar -- which is what makes it safe
+    to add to a read-only set at all. Two things still need refusing:
+
+    * `-f FILE` takes the program from a file this module never read, exactly as `sed -f`
+      and `awk -f` do.
+    * `$ENV` and `env` print the process environment, and this shell's environment is
+      where the session's credentials live. That is not a write, but it puts a token in
+      Claude's context, which under a poisoned prompt is the point of the exercise.
+
+    String literals come out before the environment check, so a filter selecting a field
+    named `"env"` is not mistaken for one reading it -- except a literal carrying `\(...)`,
+    which is interpolation: code that runs, kept in so that `"\(env)"` is still seen.
+    `import` and `include` load code from a file this module never read, which is `-f`
+    under another name, and so does `-L`, which says where those files are looked for.
+    """
+    for arg in args:
+        if (
+            arg in ("-f", "--from-file", "-L", "--library-path")
+            or arg.startswith(("-f", "--from-file=", "-L", "--library-path="))
+            or _bundled_short(arg, "fL")
+        ):
+            raise NotReadOnly(f"jq program or library file argument: {arg}")
+        filter_text = JQ_STRING.sub(
+            lambda match: match.group(0) if "\\(" in match.group(0) else '""', arg
+        )
+        if re.search(r"\$ENV\b|\benv\b", filter_text):
+            raise NotReadOnly("jq reads the process environment")
+        if re.search(r"\b(?:import|include)\b", filter_text):
+            raise NotReadOnly("jq loads a module from a file")
+
+
+# --------------------------------------------------------------------------------------
+# printf
+# --------------------------------------------------------------------------------------
+
+# A `printf` conversion: `%%`, or a position (`%1$d`), flags, a width and a precision, each a
+# number or a `*` that takes it from an operand (`%*s`, `%.*f`, `%*2$d`), length modifiers, and
+# the conversion letter. zsh evaluates as arithmetic the operand of a numeric letter, and of
+# each `*`. No letter, at the end of the format, is read as unknown.
+PRINTF_CONVERSION = re.compile(
+    r"%(?:%|(\d+\$)?[-+ #0']*(\*(\d+\$)?|\d+)?(?:\.(\*(\d+\$)?|\d*))?[hlLjzt]*(.)?)", re.DOTALL
+)
+
+PRINTF_NUMERIC_LETTERS = frozenset("diouxXeEfFgGaA")
+
+PRINTF_TEXT_LETTERS = frozenset("sbqc")
+
+# A field wider than this is not alignment:
+# - `printf '%099999999d' 1` allocates 100 MB and prints them into Claude's context
+# - `find -printf` takes the same widths
+# A `*` takes the width from an argument, so a number above the cap is refused beside one.
+PRINTF_WIDTH_CAP = 1000
+
+PRINTF_WIDTH = re.compile(r"%[-+ #0']*(\d+)?(?:\.(\d+))?")
+
+PRINTF_STAR = re.compile(r"%[-+ #0']*\d*\.?\*")
+
+# A number spelled out, in the forms zsh's arithmetic reads as a constant: an integer, or a
+# decimal for `%e`, `%f` and `%g`. Anything else is an expression zsh evaluates, and a name, a
+# subscript or a `base#` prefix can run a command: `printf '%d' 'path[`cmd`1]'` runs `cmd`.
+PRINTF_NUMBER_ARGUMENT = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+
+
+def _check_printf(args: list[str]) -> None:
+    r"""Validate printf: no ``-v``, and a format the operator wrote rather than the shell.
+
+    ``printf -v name ...`` assigns without an ``=`` anywhere in the command, which is the
+    handover ``_strip_structure`` is looking for spelled so that it cannot find it.
+
+    The format is argument one and nothing else can be a flag, so it is the only word
+    checked for a leading expansion -- which is also what keeps the safe spelling working:
+    ``printf '%s\n' "${var}"`` is approved, and ``printf "${var}"``, whose format the shell
+    supplies, is not.
+    """
+    if any(arg == "-v" or _bundled_short(arg, "v") for arg in args):
+        raise NotReadOnly("printf assigns to a variable with -v")
+
+    # zsh's `printf` evaluates the argument of a numeric conversion -- and of a `*` width
+    # -- as an arithmetic expression, after the shell's quoting is gone: `printf '%d' "$x"`
+    # runs what `$((x))` runs, a quoted `'path[`cmd`1]'` runs `cmd`, and a bare name `x` is
+    # evaluated as the value the command may have assigned it. Only a number spelled out is
+    # read: each operand such a conversion consumes must be one.
+    words = args[1:] if args[:1] == ["--"] else args
+    if words:
+        evaluated = _printf_evaluated_operands(words[0], len(words) - 1)
+        if not all(PRINTF_NUMBER_ARGUMENT.fullmatch(words[1 + i]) for i in evaluated):
+            raise NotReadOnly("printf evaluates an operand that is not a number as arithmetic")
+
+    if _exceeds_width_cap(args) or (
+        any(PRINTF_STAR.search(arg) for arg in args)
+        and any(
+            PRINTF_NUMBER_ARGUMENT.fullmatch(arg) and abs(float(arg)) > PRINTF_WIDTH_CAP
+            for arg in args
+        )
+    ):
+        raise NotReadOnly(f"printf field wider than {PRINTF_WIDTH_CAP}")
+
+
+def _check_printf_unread_format(
+    args: list[str],
+    tokens: list[str],
+    parts: list[tuple[str, str]],
+    known_values: dict[str, list[str] | None],
+) -> None:
+    """Read a `printf` format that holds a value this module didn't read as an unknown conversion.
+
+    Every operand must then be a number. `$_`, a name the command binds to values unread, or one
+    it never binds, such as an environment variable, can be `%d`: in
+    `true %d; printf "a$_" 'path[`cmd`1]'`, zsh runs `cmd`. A value the command sets is read by
+    `_arg_variants` instead.
+    """
+    index = 1 if args[:1] == ["--"] else 0
+    if index >= len(args):
+        return
+    shapes = _word_shapes(tokens[index], parts, known_values)
+    if shapes is None:
+        raise NoOpinion(TOO_MANY_SHAPES)
+    for shape in shapes:
+        if UNREAD_VALUE in shape or OPERATOR_VALUE in shape:
+            unread = shape.replace(UNREAD_VALUE, "%?").replace(OPERATOR_VALUE, "%?")
+            _check_printf([*args[:index], unread, *args[index + 1 :]])
+
+
+def _printf_evaluated_operands(text: str, count: int) -> list[int]:
+    r"""The indexes of the `count` operands that zsh's `printf` evaluates as arithmetic.
+
+    `text` is the format. Each conversion consumes the next operand, and each `*` one before it;
+    the format is reused while operands remain, as in both shells. A position (`%1$d`), or a
+    letter neither table holds, is not mapped: every operand counts as evaluated then, if any
+    conversion is numeric. An escaped `%`, such as `\045`, is literal text in both shells, so
+    only a spelled `%` starts a conversion.
+    """
+    kinds: list[bool] = []
+    unmapped = False
+    for match in PRINTF_CONVERSION.finditer(text):
+        if match.group(0) == "%%":
+            continue
+        position, width, width_position, precision, precision_position, letter = match.groups()
+        if position or width_position or precision_position:
+            unmapped = True
+        if width and width.startswith("*"):
+            kinds.append(True)
+        if precision and precision.startswith("*"):
+            kinds.append(True)
+        if letter in PRINTF_NUMERIC_LETTERS:
+            kinds.append(True)
+        elif letter in PRINTF_TEXT_LETTERS:
+            kinds.append(False)
+        else:
+            unmapped = True
+            kinds.append(True)
+    if not any(kinds):
+        return []
+    if unmapped:
+        return list(range(count))
+    return [i for i in range(count) if kinds[i % len(kinds)]]
+
+
+def _exceeds_width_cap(formats: list[str]) -> bool:
+    """Whether any conversion in these formats asks for a width or precision over the cap.
+
+    Every argument is read as a format, which over-refuses a data argument that happens to
+    look like one, rather than work out which arguments a format consumes.
+    """
+    return any(
+        group and int(group) > PRINTF_WIDTH_CAP
+        for text in formats
+        for match in PRINTF_WIDTH.finditer(text)
+        for group in match.groups()
+    )
+
+
+# --------------------------------------------------------------------------------------
+# find
+# --------------------------------------------------------------------------------------
+
+
+def _check_find(args: list[str]) -> None:
+    """Validate find: prevent root traversal, execution, deletion, and file writing.
+
+    A wildcard inside `-name '*.md'` is an argument find matches for itself and the shell
+    never touches. Refusing it cost every `-name` and `-path` pattern and bought nothing, so
+    only a wildcard the shell will expand is refused, in `_check_command`.
+    """
+    if "/" in args:
+        raise NotReadOnly("find root directory traversal")
+    for index, arg in enumerate(args):
+        if arg in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls") or arg.startswith(
+            ("-exec", "-delete", "-ok", "-fprint", "-fprintf", "-fls")
+        ):
+            raise NotReadOnly(f"find writing flag: {arg}")
+        if arg == "-printf" and _exceeds_width_cap(args[index + 1 : index + 2]):
+            raise NotReadOnly(f"find -printf field wider than {PRINTF_WIDTH_CAP}")
+
+
+# --------------------------------------------------------------------------------------
+# sort, uniq, xxd, tail, date, file, hostname and base64
+# --------------------------------------------------------------------------------------
+
+
+def _check_sort(args: list[str]) -> None:
+    """Validate sort: prevent output redirection.
+
+    An unquoted wildcard, which can expand into `-o` and turn a read into a write, is refused
+    before this runs, in `_check_command`. A quoted one cannot.
+    """
+    for arg in args:
+        if (
+            arg in ("-o", "--output")
+            or arg.startswith(("-o", "--output="))
+            # `-k`, `-t`, `-S` and `-T` take a value, so `-to` is the separator `o`
+            or _bundled_short(arg, "o", "ktST")
+        ):
+            raise NotReadOnly(f"sort output flag: {arg}")
+
+
+def _check_uniq(args: list[str]) -> None:
+    """Validate uniq: reject secondary output file operand."""
+    operands = [a for a in args if not a.startswith("-") or a == "-"]
+    if len(operands) > 1:
+        raise NotReadOnly("uniq with output file operand")
+
+
+def _check_xxd(args: list[str]) -> None:
+    """Validate xxd: disallow reverse/write mode and secondary output file operand."""
+    if any(a == "-r" or a.startswith("-r") or _bundled_short(a, "r") for a in args):
+        raise NotReadOnly("xxd reverse mode")
+    operands = [a for a in args if not a.startswith("-") or a == "-"]
+    if len(operands) > 1:
+        raise NotReadOnly("xxd with output file operand")
+
+
+def _check_tail(args: list[str]) -> None:
+    """Validate tail: prevent non-terminating follow modes."""
+    if any(
+        a in ("-f", "-F", "--follow")
+        or a.startswith(("-f", "-F", "--follow="))
+        or _bundled_short(a, "fF")
+        for a in args
+    ):
+        raise NotReadOnly("tail non-terminating follow flag")
+
+
+def _check_date(args: list[str]) -> None:
+    """Validate date: prevent setting system clock."""
+    if any(
+        a in ("-s", "--set")
+        or a.startswith(("-s", "--set="))
+        # `-d`, `-f`, `-r` and `-I` take a value, `-I`'s attached as in `-Iseconds`
+        or _bundled_short(a, "s", "dfrI")
+        for a in args
+    ):
+        raise NotReadOnly("date sets system time")
+
+
+def _check_file(args: list[str]) -> None:
+    """Validate file: prevent arbitrary file opens or compilation."""
+    for arg in args:
+        if (
+            arg in ("-m", "-f", "-C", "--magic-file", "--files-from", "--compile")
+            or arg.startswith(("-m", "-f", "-C", "--magic-file=", "--files-from="))
+            or _bundled_short(arg, "mfC")
+        ):
+            raise NotReadOnly(f"file path/compile flag: {arg}")
+
+
+def _check_hostname(args: list[str]) -> None:
+    """Validate hostname: allow read-only display, reject setting hostname."""
+    if any(not a.startswith("-") for a in args):
+        raise NotReadOnly("hostname modification")
+
+
+# `base64` flags, GNU's and macOS's, that neither write nor take a file to write to. macOS has
+# `-o FILE` and `--output=FILE`, which is why this is an allowlist. `-i` is GNU's `--ignore-garbage`
+# and macOS's input file; `READER_SPECS` checks the word after it as a file either way.
+# macOS's `--input=FILE` is not listed: adding it here means adding it to `READER_SPECS` as well,
+# so that its file is checked.
+BASE64_BARE_FLAGS = frozenset({"-d", "-D", "--decode", "-i", "--ignore-garbage"})
+
+BASE64_VALUE_FLAGS = frozenset({"-w", "--wrap", "-b", "--break"})
+
+
+def _check_base64(args: list[str]) -> None:
+    """Validate base64: listed flags only, and one input at most.
+
+    Decoding prints whatever bytes were encoded, terminal escapes included, which jq's
+    ``@base64d`` and ``tr``'s octal escapes already do; see ``TERMINAL_CONTROL_BYTE``.
+    """
+    inputs = 0
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "-" or not arg.startswith("-"):
+            inputs += 1
+            continue
+        name, equals, _ = arg.partition("=") if arg.startswith("--") else (arg, "", "")
+        if arg in BASE64_BARE_FLAGS or arg in ("--help", "--version"):
+            continue
+        if name in BASE64_VALUE_FLAGS:
+            index += 0 if equals else 1
+            continue
+        if arg[:2] in ("-w", "-b") and arg[2:].isdigit():
+            continue
+        if not arg.startswith("--") and set(arg[1:]) <= set("dDi"):
+            continue
+        raise NotReadOnly(f"base64 flag not known to be read-only: {arg}")
+    if inputs > 1:
+        raise NotReadOnly("base64 with more than one operand")
+
+
+# --------------------------------------------------------------------------------------
+# The builtins command and cd
+# --------------------------------------------------------------------------------------
+
+
+def _check_command_builtin(args: list[str]) -> None:
+    """Validate the ``command`` builtin: ``command -v NAME...`` and nothing else.
+
+    ``-v`` prints how each name resolves, as ``which`` does. Without it ``command`` runs its
+    operand with functions bypassed, so ``command rm -rf build/`` is ``rm``.
+    zsh reads ``command -v`` as ``whence``, which tells no more than zsh's own ``which``.
+
+    ``-V`` is left out because it **prints a function's whole body**.
+    """
+    if args[:1] != ["-v"] or len(args) < 2 or any(arg.startswith("-") for arg in args[1:]):
+        raise NotReadOnly("command other than `command -v NAME...` runs its operand")
+
+
+def _check_cd(args: list[str]) -> None:
+    """Validate cd: one directory operand, resolving inside the project.
+
+    A command is better written from the project root with project-relative paths, since
+    that is what permission rules are written against. What this accepts is the slip, so
+    that it costs a refused approval rather than an approval the operator has to read.
+
+    The target is measured from the project root rather than from the process's own
+    working directory, which is the conservative reading: a session runs from the root, a
+    relative target can only go deeper, and anything that climbs out is refused.
+
+    It is measured with ``realpath`` rather than ``normpath``, because a textual prefix test
+    answers "how is this path written" and the question is "where does it land". ``cd``
+    follows a symlink by default, so a link inside the project pointing anywhere is a
+    path that reads as internal and is not.
+    """
+    for arg in args:
+        if arg.startswith("-") and arg not in ("-L", "-P", "-@", "--"):
+            raise NotReadOnly(f"cd option: {arg}")
+
+    operands = [arg for arg in args if not arg.startswith("-")]
+    if len(operands) != 1:
+        raise NotReadOnly("cd with no directory operand, or more than one")
+
+    target = operands[0]
+    if SUBSTITUTION_MARKER in target or "$" in target or "~" in target:
+        raise NotReadOnly(f"cd to a path this module cannot resolve: {target}")
+
+    root = os.path.realpath(REPO_ROOT)
+    # Both readings of a `..` after a link: `cd -L`, the default, drops the link's own name, as
+    # `normpath` does, and `cd -P`, or a startup file's `set -P` or zsh's `chase_dots`, climbs
+    # from where the link leads, as `realpath` alone does. `realpath` resolves a link anywhere
+    # along the way in either.
+    joined = os.path.join(root, target)
+    for resolved in {*_resolutions(os.path.normpath(joined)), *_resolutions(joined)}:
+        if resolved != root and not resolved.startswith(root + os.sep):
+            raise NotReadOnly(f"cd outside the project: {target}")
+
+
+# --------------------------------------------------------------------------------------
+# git
+# --------------------------------------------------------------------------------------
+
+# Git options that write a file or run a program: `--ext-diff`, `--textconv` and `--filters`
+# run whatever the repository's own config or `.gitattributes` names, and
+# `--open-files-in-pager` runs the program it is given. The `--no-` spellings are the safe
+# ones and match none of these.
+GIT_EXECUTION_OPTS = (
+    "--output",
+    "--exec-path",
+    "--open-files-in-pager",
+    "--ext-diff",
+    "--textconv",
+    "--filters",
+    "--upload-pack",
+    "--receive-pack",
+)
+
+# Git options that point it at a repository whose config this module never read
+GIT_LOCATION_OPTS = ("--git-dir", "--work-tree", "--namespace")
+
+# Global options that take a value, which hides the subcommand git runs when the value is the
+# next word (see `GIT_GLOBAL_FLAGS`): `--attr-source` (git 2.41 and later), `--shallow-file`, and
+# `--super-prefix` (git 2.39 and earlier)
+GIT_VALUE_GLOBAL_OPTS = ("--attr-source", "--shallow-file", "--super-prefix")
+
+# The global options, before the subcommand, that `_git_global_options` walks past besides
+# `-C <dir>`. None takes a value, and git matches each exactly (`handle_options` in `git.c`
+# compares with `strcmp`), so this set is matched exactly too.
+# - An allowlist, because a global option that takes the next word as its value makes that word
+#   look like the subcommand: `git --attr-source log clean -fdx` reads as `git log`, and git runs
+#   `git clean -fdx`. `GIT_VALUE_GLOBAL_OPTS` lists the ones known, and git can add another
+# - Left out:
+#   - `--bare`, which makes the current directory the repository: `--git-dir=.`
+#   - `--help` and `-h`, which end the options, and git runs `help` in their place:
+#     `git --help log` is `git help log`, which starts a man viewer
+#   - `--version` and `-v`, which end the options too: see `GIT_VERSION_FLAGS`
+GIT_GLOBAL_FLAGS = frozenset(
+    {"-p", "--paginate", "-P", "--no-pager"}
+    | {"--no-replace-objects", "--no-lazy-fetch", "--no-optional-locks", "--no-advice"}
+    | {"--literal-pathspecs", "--no-literal-pathspecs", "--glob-pathspecs"}
+    | {"--noglob-pathspecs", "--icase-pathspecs"}
+)
+
+# Global options that end git's options, where git runs `git version` in their place and hands
+# it the words after them: `git --version clean -fdx` fails with `unknown switch 'f'`
+GIT_VERSION_FLAGS = frozenset({"--version", "-v"})
+
+# Exact options that are also a prefix of one in `GIT_EXECUTION_OPTS`, which git reads as
+# themselves: `git grep --text` and `git diff --text` treat binary files as text.
+GIT_EXACT_SAFE_OPTS = frozenset({"--text"})
+
+# Git subcommands that read repository state, and `version`, which prints git's own
+GIT_READ_SUBCOMMANDS = {
+    "blame",
+    "cat-file",
+    "check-ignore",
+    "describe",
+    "diff",
+    "grep",
+    "log",
+    "ls-files",
+    "ls-tree",
+    "merge-base",
+    "range-diff",
+    "rev-list",
+    "rev-parse",
+    "shortlog",
+    "show",
+    "show-ref",
+    "status",
+    "tag",
+    "version",
+    "worktree",
+}
+
+# The options of git's read subcommands that open the file they are given, and what each
+# prints of it: `blame --contents` the file, `blame -S` each line, as bad graft data, `blame
+# --ignore-revs-file` its first line, as an invalid object name, and `grep -f` the first line
+# that is not a valid pattern. `ls-files -X` prints none of it, and neither does `-O`, the order
+# file of the subcommands that write a diff, which a FIFO hangs. For each subcommand:
+# - `long`: the long options, whose value is attached after `=` or is the next word. git takes
+#   an unambiguous prefix of one as that option (`blame --cont`)
+# - `exact`: long options that are a prefix of one in `long`, which git reads as themselves:
+#   `ls-files --exclude <pattern>`
+# - `short`: the letter of the short option, whose value is the rest of the word
+#   (`blame -wS<file>`) or the next word
+# - `values`: the letters before which a `short` in the same word is a value, not an option:
+#   each takes the rest of the word as its own value (`grep -e<pattern>`)
+# - `names`: long options whose value is a file name, which git joins to each directory it
+#   reads, from the top of the working tree: `ls-files --exclude-per-directory=.gitignore`
+# `diff` opens every operand too, which `_git_file_operands` reads.
+# `ls-files --exclude-per-directory=../../x` reads `x` two levels above each directory, so a
+# `names` value must be a plain file name: `GIT_FILE_NAME`.
+# The order file has no long option, and git takes it only attached to its letter.
+# `_check_git` refuses a word that starts with `-O`, as `grep`'s runs a program, so here it is
+# read bundled after another letter: `git log -pO<file>`. `-G`, `-I`, `-S` and `-l` take the rest
+# of the word, so an `O` after them is part of their value; git stops on most other letters
+# before it reads the file, which costs this table no more than a prompt.
+# `_check_git` reads `grep`'s `short` and `values` too, to find its `-O` in a bundle, so a letter
+# there that takes nothing would hide an `O` after it: `grep -nO<cmd>` runs `<cmd>`.
+# Checked against git 2.48.1 (`builtin/blame.c`, `builtin/grep.c`, `builtin/ls-files.c`), and
+# the order file by running each subcommand with a FIFO as the file.
+GIT_ORDER_FILE = {"short": "O", "values": "GISl"}
+
+GIT_FILE_OPTIONS = {
+    "blame": {
+        "long": frozenset({"--contents", "--ignore-revs-file"}),
+        "exact": frozenset({"--ignore-rev"}),
+        "short": "S",
+        "values": "LMC",
+    },
+    "grep": {"short": "f", "values": "eABCmO"},
+    "ls-files": {
+        "long": frozenset({"--exclude-from"}),
+        "exact": frozenset({"--exclude"}),
+        "short": "X",
+        "values": "x",
+        "names": frozenset({"--exclude-per-directory"}),
+    },
+    "diff": GIT_ORDER_FILE,
+    "log": GIT_ORDER_FILE,
+    "range-diff": GIT_ORDER_FILE,
+    "show": GIT_ORDER_FILE,
+    "stash": GIT_ORDER_FILE,
+}
+
+# A file name with no directory in it, in characters the shell passes through untouched. `.`
+# and `..` match, and name a directory, which git cannot read as a file.
+GIT_FILE_NAME = re.compile(r"[A-Za-z0-9._-]+")
+
+# `diff`'s short options that take the rest of their word as their value. A letter after one of
+# these is that one's value, so the next word is an operand again: `-IS <path>`.
+# `GIT_DIFF_NEXT_WORD_VALUES`: those that take the next word when nothing is left, which git
+# never opens: the string or the regex `-S` and `-G` search the changes for, and the regex of
+# lines `-I` ignores. Checked against git 2.48.1, with a file outside the repository as the next
+# word, after each letter. Left out:
+# - `-O`, whose value git takes only attached
+# - `-l`, whose rename limit git 2.48.1 takes from the next word too, but which before git 2.22
+#   took it only attached, so the next word was an operand: from git's history, not run
+# The long options whose next word git never opens are `GIT_REVISION_VALUES`.
+GIT_DIFF_VALUE_LETTERS = frozenset({"-G", "-I", "-O", "-S", "-l"})
+
+GIT_DIFF_NEXT_WORD_VALUES = GIT_DIFF_VALUE_LETTERS - {"-O", "-l"}
+
+# `git branch` lists unless it is handed a name, which creates a branch, or a flag that
+# deletes, moves, copies, or sets an upstream. So only the listing flags are read, and
+# a name only beside a flag that forces list mode, where it is a pattern or a commit.
+# `-l` is left out: before git 2.19 it was `--create-reflog`, so `git branch -l x` created x.
+GIT_BRANCH_BARE_FLAGS = frozenset(
+    {"--all", "--remotes", "--verbose", "--quiet", "--ignore-case", "--list"}
+    | {"--show-current", "--omit-empty", "--no-abbrev", "--no-color", "--no-column"}
+)
+
+GIT_BRANCH_BARE_SHORTS = frozenset("arvqi")
+
+# Optional values git reads only when attached: `--abbrev 7` makes 7 a branch name.
+GIT_BRANCH_ATTACHED_ONLY = frozenset({"--abbrev", "--color", "--column"})
+
+GIT_BRANCH_VALUE_FLAGS = frozenset({"--sort", "--format", "--points-at"})
+
+GIT_BRANCH_LIST_MODE = frozenset(
+    {"--list", "--points-at", "--contains", "--no-contains", "--merged", "--no-merged"}
+)
+
+# `git tag` likewise: it creates a tag from a name unless one of these flags, anywhere in the
+# command, puts it in list mode, where every operand is a pattern, and the word after a flag
+# that takes a commit is that commit or a pattern. So does a short flag with `l` or `n` in it,
+# `GIT_TAG_SHORTS`. Every other flag is refused: the ones that create (`-a`, `-m`, `-e` and the
+# rest), `-d`, and `-v`, which verifies. Checked against git 2.48.1, `git tag v9 --contains HEAD`
+# included, which creates nothing.
+# Not stopped here: a `--format` with a `%(signature)` atom runs the program `gpg.program` names,
+# as `git branch --format` and `git log --show-signature` do. A repository config that names a
+# program is #104's.
+# A set of its own, not `GIT_BRANCH_LIST_MODE`: a flag added there for `git branch` would make
+# every operand of `git tag` a pattern, though git may read that flag otherwise in `git tag`.
+GIT_TAG_LIST_MODE = frozenset(
+    {"--list", "--points-at", "--contains", "--no-contains", "--merged", "--no-merged"}
+)
+
+GIT_TAG_BARE_FLAGS = frozenset({"--ignore-case", "--no-column", "--no-color", "--omit-empty"})
+
+# Optional values git reads only when attached: `git tag --column v9` creates `v9`
+GIT_TAG_ATTACHED_ONLY = frozenset({"--column", "--color"})
+
+GIT_TAG_VALUE_FLAGS = frozenset({"--sort", "--format"})
+
+# `-i`, `-l` and `-n` alone or bundled, as `-ln5`: `-n` takes a number only attached, so it ends
+# the bundle, and git stops at its usage message on `-nl`
+GIT_TAG_SHORTS = re.compile(r"-(?:[il]+(?:n[0-9]*)?|n[0-9]*)")
+
+# `git ls-remote` flags that only shape what is printed. `--sort` is read too, attached only,
+# as `--sort=<key>`. Left out on purpose:
+# - `--upload-pack` (`-u`), which names a program to run
+# - `--server-option` (`-o`), which sends text of the caller's choosing to the server
+GIT_LS_REMOTE_FLAGS = frozenset(
+    {
+        "--heads",
+        "--branches",
+        "--tags",
+        "--refs",
+        "--quiet",
+        "--exit-code",
+        "--get-url",
+        "--symref",
+    }
+)
+
+GIT_LS_REMOTE_SHORTS = frozenset("hbtq")
+
+# A remote as the repository's config names it, never a URL or a path: no `:`, which a scheme,
+# `ext::` and `host:path` all need, and no `/`.
+GIT_REMOTE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+
+# A URL git reaches over the network with a transport of its own: `http(s)`, `ssh` and `git`
+# with a host, and the scp-like `[user@]host:path`, which has no `/` before its first `:` and no
+# `//` after it, since git reads `<word>://` as a scheme. Not a path or `file://`, which open a
+# repository on this machine, and not `<helper>::<address>` or another scheme, which run a
+# `git-remote-<name>` program from `PATH`.
+GIT_NETWORK_URL = re.compile(
+    r"(?:https?|ssh|git|git\+ssh|ssh\+git)://(?!-)[^/]+(?:/.*)?"
+    r"|(?!-)[^:/]+:(?!:|//).*"
+)
+
+# The longest the hook waits for git to say where a remote leads: `git ls-remote --get-url`
+# reads config and contacts nothing, so it takes milliseconds unless a file it opens blocks
+GIT_RESOLVE_TIMEOUT = 5.0
 
 
 def _check_git(args: list[str]) -> None:
@@ -2959,6 +5757,282 @@ def _git_file_operands(args: list[str], index: int) -> list[tuple[int, int]]:
     return [(position, start) for position, start in dict.fromkeys(found) if position < len(args)]
 
 
+# The read subcommands whose operands include paths git resolves in its repository: pathspecs,
+# and `<rev>:<path>` and `:<path>`, which it reads from the repository's root
+GIT_PATH_SUBCOMMANDS = frozenset(
+    {
+        "blame",
+        "cat-file",
+        "check-ignore",
+        "diff",
+        "grep",
+        "log",
+        "ls-files",
+        "ls-tree",
+        "range-diff",
+        "rev-list",
+        "shortlog",
+        "show",
+        "stash",
+        "status",
+    }
+)
+
+# The options of `GIT_PATH_SUBCOMMANDS` whose value, the next word, is no path: a pattern, a
+# string, a number or a name. `_check_git_paths` skips that word. Only a value spelled as its own
+# word is listed: one attached, as `--author=x` or `-Sx`, is part of a word that starts with `-`.
+# `--pretty`, whose value is optional, and `--format`, whose value git takes only after `=`, are
+# not: the word after either is a path.
+# `-L`, of `log`, is `<range>:<file>`, whose file is read from where git runs, so it is measured.
+# `_git_file_operands` skips the same words after `diff`, where git opens its operands: an entry
+# that took no next word would hide one. Each was run on git 2.48.1 in `diff` and `log`, where it
+# takes the next word, and in `diff`, with a FIFO outside the repository as that word, which git
+# never opened, `--no-index` or not: in that mode it rejects the revision options, and the rest
+# take the word as their value. Left out: the options whose value git takes only attached, so
+# that the next word is an operand, such as `-U`, `--unified`, `--relative`, `--word-diff` and
+# `--abbrev`; and `-l`, which took its value only attached before git 2.22, as
+# `GIT_DIFF_NEXT_WORD_VALUES` says. Its short options, `-G`, `-I` and `-S`, come from there, so
+# that `diff` reads them the same, bare or at the end of a bundle.
+GIT_REVISION_VALUES = GIT_DIFF_NEXT_WORD_VALUES | frozenset(
+    {
+        "-n",
+        "--after",
+        "--anchored",
+        "--author",
+        "--before",
+        "--committer",
+        "--date",
+        "--diff-algorithm",
+        "--diff-filter",
+        "--diff-merges",
+        "--dst-prefix",
+        "--encoding",
+        "--find-object",
+        "--grep",
+        "--ignore-matching-lines",
+        "--inter-hunk-context",
+        "--line-prefix",
+        "--max-count",
+        "--since",
+        "--skip",
+        "--src-prefix",
+        "--stat-count",
+        "--stat-graph-width",
+        "--stat-name-width",
+        "--stat-width",
+        "--until",
+        "--word-diff-regex",
+    }
+)
+
+GIT_PATH_FLAG_VALUES = {
+    "blame": frozenset({"-L", "--ignore-rev"}),
+    "grep": frozenset({"-e", "-A", "-B", "-C", "-m", "--max-count", "--max-depth", "--threads"}),
+    "ls-files": frozenset({"-x", "--exclude", "--format", "--exclude-per-directory"}),
+    "ls-tree": frozenset({"--format"}),
+    "diff": GIT_REVISION_VALUES,
+    "log": GIT_REVISION_VALUES,
+    # `range-diff` stops at its usage message on the options of `log` it doesn't take
+    "range-diff": GIT_REVISION_VALUES | {"--creation-factor"},
+    "rev-list": GIT_REVISION_VALUES,
+    "shortlog": GIT_REVISION_VALUES,
+    "show": GIT_REVISION_VALUES,
+    "stash": GIT_REVISION_VALUES,
+}
+
+# Pathspec magic: `:(top,icase)path`, or the short `:/!path`, whose `/` is `top`
+PATHSPEC_LONG_MAGIC = re.compile(r":\(([^)]*)\)(.*)", re.DOTALL)
+
+PATHSPEC_SHORT_MAGIC = re.compile(r":([/!^]*):?(.*)", re.DOTALL)
+
+
+def _check_git_paths(
+    args: list[str],
+    index: int,
+    tokens: list[str],
+    parts: list[tuple[str, str]],
+    scope: _ReadScope,
+) -> None:
+    """Raise ``NoOpinion`` for a path git reads out of the working directories (#48).
+
+    git resolves its paths in the whole repository it runs in, and stops at its root, so where
+    that root is in the read roots, as the project's own is, no path git takes reaches out of
+    them. Where it isn't, as for a project that is a package of a larger repository, or under
+    a dotfiles repository at `~`, each operand of a subcommand in `GIT_PATH_SUBCOMMANDS` is
+    measured from the directory git runs in: a pathspec, and before `--` any word, which git
+    reads as a revision or a path. It has no opinion on magic that starts at the root, `:/` and
+    `:(top)`, on a tree or index path git reads from the root, `<rev>:<path>` and `:<path>`,
+    unless the path starts with `./` or `../`, and on `ls-tree --full-tree`.
+
+    Not measured: what a subcommand reads with no path, as `git log -p` and `git diff` read the
+    whole repository; `AGENTS.md` names that gap.
+    """
+    subcommand = args[index]
+    if subcommand not in GIT_PATH_SUBCOMMANDS:
+        return
+    if not any(_repository_root_out_of_scope(base, scope) for base in scope.bases):
+        return
+    values = GIT_PATH_FLAG_VALUES.get(subcommand, frozenset())
+    # `git grep`'s first operand is its pattern, unless an `-e` or `-f` gave one
+    pattern_pending = subcommand == "grep" and not any(
+        arg in ("-e", "-f") or (arg[:1] == "-" and arg[1:2] != "-" and set("ef") & set(arg))
+        for arg in args[index + 1 :]
+    )
+    after_dashes = False
+    skip = False
+    for position in range(index + 1, len(args)):
+        word, token = args[position], tokens[position]
+        if skip:
+            skip = False
+            continue
+        if word == "--" and not after_dashes:
+            after_dashes = True
+            continue
+        if not after_dashes and word.startswith("-"):
+            if word == "--full-tree" and subcommand == "ls-tree":
+                raise NoOpinion(
+                    "git ls-tree --full-tree reads the root of a repository out of scope"
+                )
+            if word == "-L" and subcommand == "log" and position + 1 < len(args):
+                # `-L <range>:<file>`: the file, after the last `:`, is read from where git runs
+                value = args[position + 1]
+                _check_git_path(value.rpartition(":")[2], tokens[position + 1], parts, scope, value)
+                skip = True
+            elif word.startswith("-L") and subcommand == "log":
+                _check_git_path(word.rpartition(":")[2], token, parts, scope, word)
+            else:
+                skip = word in values
+            continue
+        if position == index + 1 and subcommand == "stash":
+            continue  # `show`
+        if pattern_pending and not after_dashes:
+            pattern_pending = False
+            continue
+        path = _git_path_from_cwd(word, after_dashes=after_dashes)
+        _check_git_path(path, token, parts, scope, word)
+
+
+def _check_git_path(
+    path: str, token: str, parts: list[tuple[str, str]], scope: _ReadScope, word: str
+) -> None:
+    """Raise ``NoOpinion`` unless ``path``, which git reads from where it runs, is in ``scope``."""
+    if _word_the_shell_builds(token, parts):
+        raise NoOpinion(f"git given a path the shell builds: {word}")
+    for base in scope.bases:
+        if not _in_scope(os.path.join(base, path or "."), scope):
+            raise NoOpinion(f"git reads out of the working directories: {word}")
+
+
+def _git_path_from_cwd(word: str, *, after_dashes: bool) -> str:
+    """The path in ``word`` that git resolves from its working directory.
+
+    Raises ``NoOpinion`` for one it resolves from its repository's root, which
+    `_check_git_paths` reads only where that root is out of scope.
+    """
+    root_reason = f"git reads {word} from the root of a repository out of the working directories"
+    if word.startswith(":"):
+        long_magic = PATHSPEC_LONG_MAGIC.fullmatch(word)
+        if long_magic is not None:
+            names = {name.strip().split(":")[0] for name in long_magic.group(1).split(",")}
+            if "top" in names:
+                raise NoOpinion(root_reason)
+            return long_magic.group(2)
+        short_magic = PATHSPEC_SHORT_MAGIC.fullmatch(word)
+        magic, rest = short_magic.group(1), short_magic.group(2)
+        if "/" in magic:
+            raise NoOpinion(root_reason)
+        # Before `--`, a word with no magic can be the index's `:<path>` or `:<stage>:<path>`
+        if not after_dashes and not magic and not rest.startswith(("./", "../")):
+            raise NoOpinion(root_reason)
+        return rest
+    if not after_dashes and ":" in word:
+        _, _, path = word.partition(":")
+        if path in (".", "..") or path.startswith(("./", "../")):
+            return path
+        raise NoOpinion(root_reason)
+    return word
+
+
+def _repository_root_out_of_scope(base: str, scope: _ReadScope) -> bool:
+    """Whether git, run in ``base``, finds a repository whose root is out of ``scope``.
+
+    The nearest directory with a `.git`, from ``base``'s real path up, as git looks for one.
+    `GIT_DIR` or `GIT_WORK_TREE` in the environment the hook shares with the shell puts the
+    repository anywhere, and so out of scope. No repository is none to read paths in.
+    """
+    if os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE"):
+        return True
+    try:
+        directory = os.path.realpath(base)
+    except (OSError, ValueError):
+        return True
+    while True:
+        if os.path.lexists(os.path.join(directory, ".git")):
+            return not _in_scope(directory, scope)
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return False
+        directory = parent
+
+
+# --------------------------------------------------------------------------------------
+# aws
+# --------------------------------------------------------------------------------------
+
+# `aws` read operations pattern
+AWS_READ_OP = re.compile(r"^(?:describe|get|list|lookup|search|batch-get|help)\b|^help$")
+
+# `aws` global options that take an argument (to avoid positional shift)
+AWS_GLOBAL_OPTS_WITH_ARG = {
+    "--profile",
+    "--region",
+    "--output",
+    "--color",
+    "--query",
+    "--cli-read-timeout",
+    "--cli-connect-timeout",
+    "--user-agent",
+}
+
+# `aws` global options that decide where a signed request goes, what it will trust when it
+# arrives, or what the argument list even is. A read verb is still a read; the credential
+# it is read with is the operator's, and `--cli-input-json` replaces every other argument
+# from a file this module never opened, so the verb it checked is not the verb that runs.
+AWS_BLOCKED_OPTS = (
+    "--endpoint-url",
+    "--ca-bundle",
+    "--no-verify-ssl",
+    "--cli-input-json",
+    "--cli-input-yaml",
+)
+
+# Options blocked for one service
+AWS_BLOCKED_SERVICE_OPTS = {
+    "ssm": (
+        # Makes every `ssm get-parameter*` print a `SecureString` in plain text, and a Secrets
+        # Manager secret too (read through the reserved `/aws/reference/secretsmanager/` path).
+        # Without it, the same reads return ciphertext.
+        "--with-decryption",
+    )
+}
+
+# AWS operations that output files, mint credentials, or print a secret
+AWS_BLOCKED_OPS = {
+    "batch-get-secret-value",
+    "get-object",
+    "get-login-password",
+    "get-secret-value",
+    "get-session-token",
+}
+
+# Operations blocked for one service only, because the verb alone is the read everywhere else
+AWS_BLOCKED_SERVICE_OPS = {
+    # `aws configure get` prints a key from the credentials file.
+    # It also refuses the harmless `aws configure get region`, which costs a prompt.
+    ("configure", "get")
+}
+
+
 def _check_aws(args: list[str]) -> None:
     """Validate ``aws`` calls, accounting for global options and positional verbs."""
     # The usual way to record which CLI ran: it prints the version and exits before reading
@@ -3015,6 +6089,86 @@ def _aws_option_is(arg: str, option: str) -> bool:
     return len(name) > 2 and name.startswith("--") and option.startswith(name)
 
 
+# --------------------------------------------------------------------------------------
+# gcloud
+# --------------------------------------------------------------------------------------
+
+# `gcloud` verbs that strictly only read
+GCLOUD_READ_VERBS = {
+    "analyze-iam-policy",
+    "describe",
+    "get",
+    "get-ancestors",
+    "get-iam-policy",
+    "get-value",
+    "list",
+    "lookup",
+    "search-all-iam-policies",
+    "search-all-resources",
+    "test-iam-permissions",
+    "version",
+}
+
+# `gcloud` global flags that move where the call goes or who it goes as. A named
+# configuration can carry `api_endpoint_overrides`, so `--configuration` is an endpoint
+# flag spelled indirectly, and the credential flags run the read as somebody else.
+GCLOUD_BLOCKED_OPTS = (
+    "--configuration",
+    "--account",
+    "--impersonate-service-account",
+    "--access-token-file",
+    "--credential-file-override",
+    "--billing-project",
+)
+
+# `gcloud` mutating, executing, or credential verbs that must be refused
+GCLOUD_BLOCKED_VERBS = {
+    "add",
+    "add-iam-policy-binding",
+    "attach-disk",
+    "auth",
+    "call",
+    "copy-files",
+    "cp",
+    "create",
+    "delete",
+    "deploy",
+    "detach-disk",
+    "disable",
+    "enable",
+    "grant",
+    "import",
+    "invoke",
+    "login",
+    "move",
+    "patch",
+    "print-access-token",
+    "publish",
+    "remove",
+    "remove-iam-policy-binding",
+    "reset",
+    "restart",
+    "restore",
+    "resume",
+    "revoke",
+    "rm",
+    "run",
+    "scp",
+    "set",
+    "set-iam-policy",
+    "ssh",
+    "start",
+    "stop",
+    "submit",
+    "suspend",
+    "sync",
+    "terminate",
+    "undelete",
+    "update",
+    "upload",
+}
+
+
 def _check_gcloud(args: list[str]) -> None:
     """Validate ``gcloud`` CLI calls, enforcing read-only verbs and rejecting flags files."""
     if any(arg == "--flags-file" or arg.startswith("--flags-file=") for arg in args):
@@ -3039,6 +6193,10 @@ def _check_gcloud(args: list[str]) -> None:
         raise NotReadOnly("gcloud with no read verb")
 
 
+# --------------------------------------------------------------------------------------
+# gh
+# --------------------------------------------------------------------------------------
+
 # `gh api` flags that cannot send a body, change the method, or reach another host, split
 # by whether they take a value. `-X`/`--method` is read separately: only `GET` passes.
 GH_API_VALUE_FLAGS = {
@@ -3052,7 +6210,9 @@ GH_API_VALUE_FLAGS = {
     "--preview",
     "--cache",
 }
+
 GH_API_BARE_FLAGS = {"-i", "--include", "--paginate", "--slurp", "--silent"}
+
 # Only these headers may be set, because a header can carry a method override.
 GH_API_HEADERS = re.compile(r"^\s*(?:accept|x-github-api-version)\s*:", re.IGNORECASE)
 
@@ -3150,15 +6310,18 @@ def _check_gh(args: list[str]) -> None:
 # `NoOpinion`, so the operator's own rules can still grant it. `-w` is `--workflow` in
 # `run list` and `--web` everywhere else, which is why the tables are per verb.
 _GH_JSON_FLAGS = frozenset({"--json", "-q", "--jq", "-R", "--repo"})
+
 # `gh search issues|prs` take their query as any number of words, which only filter what the
 # API returns: `GH_SEARCH_QUERY` in place of an operand count says so, and lets a `--` end
 # the flags, so that a word may start with `-`, as `-label:bug` does. Their lists are
 # `gh search issues|prs --help` as of gh 2.103, minus `-w/--web` and `-t/--template`.
 GH_SEARCH_QUERY = -1
+
 _GH_SEARCH_BARE = frozenset({"--archived", "--locked", "--no-assignee", "--no-label"}) | {
     "--no-milestone",
     "--no-project",
 }
+
 _GH_SEARCH_VALUED = (
     _GH_JSON_FLAGS
     | {"--app", "--assignee", "--author", "--closed", "--commenter", "--comments"}
@@ -3167,6 +6330,7 @@ _GH_SEARCH_VALUED = (
     | {"--project", "--reactions", "--sort", "--state", "--team-mentions", "--updated"}
     | {"--visibility"}
 )
+
 GH_READ_SPECS: dict[tuple[str, str], tuple[frozenset[str], frozenset[str], int]] = {
     ("pr", "view"): (frozenset({"-c", "--comments"}), _GH_JSON_FLAGS, 1),
     ("pr", "list"): (
@@ -3220,6 +6384,7 @@ GH_READ_SPECS: dict[tuple[str, str], tuple[frozenset[str], frozenset[str], int]]
 # `[HOST/]OWNER/REPO` is how gh names a repository; only the two-part form stays on the host the
 # token belongs to, the same reason `gh api` refuses `--hostname` and a full URL.
 GH_REPO_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
 # A pull request, issue or run is a number or a branch; a URL carries a host of its own.
 GH_REFERENCE = re.compile(r"^[A-Za-z0-9_./@#:+-]+$")
 
@@ -3265,39 +6430,6 @@ def _check_gh_jq(args: list[str], rewritten: list[bool]) -> None:
                 _check_gh_filter(tail, rewritten=own and rewritten[index])
             elif following < len(args):
                 _check_gh_filter(args[following], rewritten=own and rewritten[following])
-
-
-def _rewritten_words(
-    tokens: list[str], live_globs: list[bool], parts: list[tuple[str, str]]
-) -> list[bool]:
-    """Word by word, whether the shell rewrites or computes it before the program runs.
-
-    For the validators that read every word whole and leave the rest to the operator's rules,
-    ``gh`` and ``curl``: an unquoted wildcard, a tilde or zsh's ``=cmd``, a variable, a command
-    substitution, or an arithmetic expansion, which ``_expand`` shows as ``0`` and the shell
-    computes, so that ``https://docs$((1)).example.com/`` names another host than it reads as.
-    """
-    return [
-        glob
-        or _carries_tilde_or_equals(token)
-        or _has_bare_variable(token, parts)
-        or _carries_substitution(token, parts)
-        or _carries_arithmetic(token, parts)
-        for glob, token in zip(live_globs, tokens, strict=True)
-    ]
-
-
-def _carries_tilde_or_equals(token: str) -> bool:
-    """Whether bash or zsh rewrites this word through a tilde, or zsh through ``=cmd``.
-
-    Both shells expand ``~``, ``~+`` and ``~user`` at the start of a word, and bash expands one
-    after the ``=`` of a word shaped like an assignment, so ``x=~`` reaches the program as
-    ``x=$HOME``. zsh replaces a word that starts with ``=`` with the path of the command it
-    names, ``=ls`` with ``/usr/bin/ls``. Any unquoted ``~`` counts, so that no spelling has to
-    be listed. Only the reduced token is read, so a quoted ``'~+'`` or ``'=ls'`` is the literal
-    it spells.
-    """
-    return "~" in PLACEHOLDER.sub("", token) or token.startswith("=")
 
 
 def _check_gh_read(args: list[str], rewritten: list[bool]) -> None:
@@ -3413,15 +6545,6 @@ def _gh_give_up(words: list[str], rewritten: list[bool], start: int, reason: str
     raise NoOpinion(reason)
 
 
-def _word_is_built(word: str) -> bool:
-    """Whether this word, as ``_expand`` gives it, still shows the shell building it.
-
-    The text check that goes with ``_rewritten_words``, for ``gh`` and ``curl``: a ``$`` even in
-    a quoted word, and what a substitution leaves.
-    """
-    return "$" in word or SUBSTITUTION_MARKER in word or PLACEHOLDER_MARK in word
-
-
 # --------------------------------------------------------------------------------------
 # curl
 #
@@ -3438,12 +6561,16 @@ def _word_is_built(word: str) -> bool:
 # whole name is sure not to be the prefix of an option it reads instead, since curl prefers an
 # exact match -- `--head` is `--head`, not `--header`.
 CURL_BARE_SHORT = frozenset("sSfIi")
+
 CURL_BARE_LONG = frozenset(
     {"--silent", "--show-error", "--fail", "--fail-with-body", "--head", "--include"}
     | {"--compressed"}
 )
+
 CURL_SECONDS_SHORT = frozenset("m")
+
 CURL_SECONDS_LONG = frozenset({"--max-time", "--connect-timeout"})
+
 CURL_SECONDS = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 
 # curl skips the curlrc only for these, and only as its first argument: curl(1), `-q, --disable`.
@@ -3467,6 +6594,7 @@ CURLRC_LOCATIONS = (
 # number is an IPv4 address to a URL parser (`127.1`, `0x7f.1`), which is no site, so it is no
 # host here either.
 _HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+
 CURL_HOST = re.compile(
     rf"(?=.{{1,253}}$)(?!.*\.(?:[0-9]+|0x[0-9a-f]*)$){_HOST_LABEL}(?:\.{_HOST_LABEL})+"
 )
@@ -3474,24 +6602,12 @@ CURL_HOST = re.compile(
 # A `WebFetch` permission rule, bare or with a specifier, and the one specifier a site comes from:
 # how a deny or ask rule is read, broadly.
 WEBFETCH_RULE = re.compile(r"WebFetch(?:\((.*)\))?", re.DOTALL)
+
 WEBFETCH_DOMAIN = "domain:"
+
 # An allow rule is read as written, with no whitespace or capital letter: Claude Code may forgive
 # them in its own match, and a rule this reads as no site only costs a prompt.
 WEBFETCH_ALLOW_RULE = re.compile(r"WebFetch\(domain:([a-z0-9.-]+)\)")
-
-# Claude Code applies a deny or ask rule from every settings file, and none to a `curl`, so the
-# hook reads the `WebFetch` ones beyond the project's files as well: the user's, in the directory
-# `CLAUDE_CONFIG_DIR` (`CONFIG_DIR_ENV`) names or else `~/.claude`, and the managed file with the
-# `*.json` files in the `managed-settings.d/` beside it. Managed settings that are no file on
-# disk, from the server or a macOS configuration profile, are out of its view. Source: the
-# settings and managed-settings pages of Claude Code's docs.
-MANAGED_SETTINGS_DIRS = {
-    "linux": "/etc/claude-code",
-    "darwin": "/Library/Application Support/ClaudeCode",
-}
-# Set in managed settings, it makes Claude Code ignore the project's permission rules, the
-# `WebFetch` allow rules the list comes from among them
-MANAGED_RULES_ONLY = "allowManagedPermissionRulesOnly"
 
 
 def _webfetch_allowed_host(rule: object) -> str | None:
@@ -3573,64 +6689,6 @@ def _curl_sites(
     return frozenset(
         host for host in listed if not any(_withholds(domain, host) for domain in withheld)
     )
-
-
-def _permissions_of(document: object) -> dict | None:
-    """A settings document's ``permissions``: ``{}`` when it has none, ``None`` when unreadable."""
-    if not isinstance(document, dict):
-        return None
-    permissions = document.get("permissions", {})
-    return permissions if isinstance(permissions, dict) else None
-
-
-def _managed_rules_only(document: object) -> bool:
-    """Whether a managed settings document sets ``MANAGED_RULES_ONLY``.
-
-    At the top level or in ``permissions``: it is read as set wherever it is.
-    """
-    permissions = _permissions_of(document) or {}
-    return isinstance(document, dict) and bool(
-        document.get(MANAGED_RULES_ONLY) or permissions.get(MANAGED_RULES_ONLY)
-    )
-
-
-def _managed_settings_dir() -> str | None:
-    """Where this platform keeps managed settings files, or ``None``."""
-    return MANAGED_SETTINGS_DIRS.get(sys.platform)
-
-
-def _outside_settings() -> tuple[list[object], list[object], bool]:
-    """The user's settings document and the managed ones, and whether every one could be read.
-
-    A missing file means nothing. A file that cannot be read may hold a deny rule, so the third
-    value is then false, and so it is for a ``CLAUDE_CONFIG_DIR`` or home directory that is not
-    absolute, or a ``managed-settings.d/`` that cannot be listed.
-    """
-    config = os.environ.get(CONFIG_DIR_ENV) or os.path.join(_home(), ".claude")
-    if not os.path.isabs(config):
-        return [], [], False
-    groups: tuple[list[Path], list[Path]] = ([Path(config, "settings.json")], [])
-    managed = _managed_settings_dir()
-    if managed:
-        drop_ins = Path(managed, "managed-settings.d")
-        try:
-            names = sorted(os.listdir(drop_ins))
-        except (FileNotFoundError, NotADirectoryError):
-            names = []
-        except OSError:
-            return [], [], False
-        groups[1].append(Path(managed, "managed-settings.json"))
-        groups[1].extend(drop_ins / name for name in names if name.endswith(".json"))
-    documents: tuple[list[object], list[object]] = ([], [])
-    for paths, into in zip(groups, documents, strict=True):
-        for path in paths:
-            try:
-                present, document = _load_settings_file(path)
-            except (OSError, ValueError, RecursionError):
-                return [], [], False
-            if present:
-                into.append(document)
-    return documents[0], documents[1], True
 
 
 def _check_curl(
@@ -3762,20 +6820,6 @@ def _curlrc_paths() -> list[str]:
     return paths
 
 
-def _account_home() -> str | None:
-    """The home directory of the account the hook runs as, as curl finds it without ``HOME``.
-
-    ``pwd`` is imported here rather than at the top: it exists on Linux and macOS only, and
-    elsewhere ``main`` returns before anything calls this.
-    """
-    try:
-        import pwd  # noqa: PLC0415 - see the docstring
-
-        return pwd.getpwuid(os.geteuid()).pw_dir
-    except (ImportError, KeyError, OSError):
-        return None
-
-
 def _may_exist(path: str) -> bool:
     """Whether ``path`` exists, or cannot be shown not to: a stat that fails otherwise counts."""
     try:
@@ -3787,328 +6831,9 @@ def _may_exist(path: str) -> bool:
     return True
 
 
-def _check_find(args: list[str]) -> None:
-    """Validate find: prevent root traversal, execution, deletion, and file writing.
-
-    A wildcard inside `-name '*.md'` is an argument find matches for itself and the shell
-    never touches. Refusing it cost every `-name` and `-path` pattern and bought nothing, so
-    only a wildcard the shell will expand is refused, in `_check_command`.
-    """
-    if "/" in args:
-        raise NotReadOnly("find root directory traversal")
-    for index, arg in enumerate(args):
-        if arg in ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls") or arg.startswith(
-            ("-exec", "-delete", "-ok", "-fprint", "-fprintf", "-fls")
-        ):
-            raise NotReadOnly(f"find writing flag: {arg}")
-        if arg == "-printf" and _exceeds_width_cap(args[index + 1 : index + 2]):
-            raise NotReadOnly(f"find -printf field wider than {PRINTF_WIDTH_CAP}")
-
-
-def _check_jq(args: list[str]) -> None:
-    r"""Validate jq: a filter language with no write and no exec, given two restrictions.
-
-    jq cannot create a file or run a program -- there is no `system`, no output
-    redirection, and no shell-out anywhere in its grammar -- which is what makes it safe
-    to add to a read-only set at all. Two things still need refusing:
-
-    * `-f FILE` takes the program from a file this module never read, exactly as `sed -f`
-      and `awk -f` do.
-    * `$ENV` and `env` print the process environment, and this shell's environment is
-      where the session's credentials live. That is not a write, but it puts a token in
-      Claude's context, which under a poisoned prompt is the point of the exercise.
-
-    String literals come out before the environment check, so a filter selecting a field
-    named `"env"` is not mistaken for one reading it -- except a literal carrying `\(...)`,
-    which is interpolation: code that runs, kept in so that `"\(env)"` is still seen.
-    `import` and `include` load code from a file this module never read, which is `-f`
-    under another name, and so does `-L`, which says where those files are looked for.
-    """
-    for arg in args:
-        if (
-            arg in ("-f", "--from-file", "-L", "--library-path")
-            or arg.startswith(("-f", "--from-file=", "-L", "--library-path="))
-            or _bundled_short(arg, "fL")
-        ):
-            raise NotReadOnly(f"jq program or library file argument: {arg}")
-        filter_text = JQ_STRING.sub(
-            lambda match: match.group(0) if "\\(" in match.group(0) else '""', arg
-        )
-        if re.search(r"\$ENV\b|\benv\b", filter_text):
-            raise NotReadOnly("jq reads the process environment")
-        if re.search(r"\b(?:import|include)\b", filter_text):
-            raise NotReadOnly("jq loads a module from a file")
-
-
-def _check_sort(args: list[str]) -> None:
-    """Validate sort: prevent output redirection.
-
-    An unquoted wildcard, which can expand into `-o` and turn a read into a write, is refused
-    before this runs, in `_check_command`. A quoted one cannot.
-    """
-    for arg in args:
-        if (
-            arg in ("-o", "--output")
-            or arg.startswith(("-o", "--output="))
-            # `-k`, `-t`, `-S` and `-T` take a value, so `-to` is the separator `o`
-            or _bundled_short(arg, "o", "ktST")
-        ):
-            raise NotReadOnly(f"sort output flag: {arg}")
-
-
-def _check_uniq(args: list[str]) -> None:
-    """Validate uniq: reject secondary output file operand."""
-    operands = [a for a in args if not a.startswith("-") or a == "-"]
-    if len(operands) > 1:
-        raise NotReadOnly("uniq with output file operand")
-
-
-def _check_xxd(args: list[str]) -> None:
-    """Validate xxd: disallow reverse/write mode and secondary output file operand."""
-    if any(a == "-r" or a.startswith("-r") or _bundled_short(a, "r") for a in args):
-        raise NotReadOnly("xxd reverse mode")
-    operands = [a for a in args if not a.startswith("-") or a == "-"]
-    if len(operands) > 1:
-        raise NotReadOnly("xxd with output file operand")
-
-
-def _check_tail(args: list[str]) -> None:
-    """Validate tail: prevent non-terminating follow modes."""
-    if any(
-        a in ("-f", "-F", "--follow")
-        or a.startswith(("-f", "-F", "--follow="))
-        or _bundled_short(a, "fF")
-        for a in args
-    ):
-        raise NotReadOnly("tail non-terminating follow flag")
-
-
-def _check_date(args: list[str]) -> None:
-    """Validate date: prevent setting system clock."""
-    if any(
-        a in ("-s", "--set")
-        or a.startswith(("-s", "--set="))
-        # `-d`, `-f`, `-r` and `-I` take a value, `-I`'s attached as in `-Iseconds`
-        or _bundled_short(a, "s", "dfrI")
-        for a in args
-    ):
-        raise NotReadOnly("date sets system time")
-
-
-def _check_file(args: list[str]) -> None:
-    """Validate file: prevent arbitrary file opens or compilation."""
-    for arg in args:
-        if (
-            arg in ("-m", "-f", "-C", "--magic-file", "--files-from", "--compile")
-            or arg.startswith(("-m", "-f", "-C", "--magic-file=", "--files-from="))
-            or _bundled_short(arg, "mfC")
-        ):
-            raise NotReadOnly(f"file path/compile flag: {arg}")
-
-
-def _check_printf(args: list[str]) -> None:
-    r"""Validate printf: no ``-v``, and a format the operator wrote rather than the shell.
-
-    ``printf -v name ...`` assigns without an ``=`` anywhere in the command, which is the
-    handover ``_strip_structure`` is looking for spelled so that it cannot find it.
-
-    The format is argument one and nothing else can be a flag, so it is the only word
-    checked for a leading expansion -- which is also what keeps the safe spelling working:
-    ``printf '%s\n' "${var}"`` is approved, and ``printf "${var}"``, whose format the shell
-    supplies, is not.
-    """
-    if any(arg == "-v" or _bundled_short(arg, "v") for arg in args):
-        raise NotReadOnly("printf assigns to a variable with -v")
-
-    # zsh's `printf` evaluates the argument of a numeric conversion -- and of a `*` width
-    # -- as an arithmetic expression, after the shell's quoting is gone: `printf '%d' "$x"`
-    # runs what `$((x))` runs, a quoted `'path[`cmd`1]'` runs `cmd`, and a bare name `x` is
-    # evaluated as the value the command may have assigned it. Only a number spelled out is
-    # read: each operand such a conversion consumes must be one.
-    words = args[1:] if args[:1] == ["--"] else args
-    if words:
-        evaluated = _printf_evaluated_operands(words[0], len(words) - 1)
-        if not all(PRINTF_NUMBER_ARGUMENT.fullmatch(words[1 + i]) for i in evaluated):
-            raise NotReadOnly("printf evaluates an operand that is not a number as arithmetic")
-
-    if _exceeds_width_cap(args) or (
-        any(PRINTF_STAR.search(arg) for arg in args)
-        and any(
-            PRINTF_NUMBER_ARGUMENT.fullmatch(arg) and abs(float(arg)) > PRINTF_WIDTH_CAP
-            for arg in args
-        )
-    ):
-        raise NotReadOnly(f"printf field wider than {PRINTF_WIDTH_CAP}")
-
-
-def _check_printf_unread_format(
-    args: list[str],
-    tokens: list[str],
-    parts: list[tuple[str, str]],
-    known_values: dict[str, list[str] | None],
-) -> None:
-    """Read a `printf` format that holds a value this module didn't read as an unknown conversion.
-
-    Every operand must then be a number. `$_`, a name the command binds to values unread, or one
-    it never binds, such as an environment variable, can be `%d`: in
-    `true %d; printf "a$_" 'path[`cmd`1]'`, zsh runs `cmd`. A value the command sets is read by
-    `_arg_variants` instead.
-    """
-    index = 1 if args[:1] == ["--"] else 0
-    if index >= len(args):
-        return
-    shapes = _word_shapes(tokens[index], parts, known_values)
-    if shapes is None:
-        raise NoOpinion(TOO_MANY_SHAPES)
-    for shape in shapes:
-        if UNREAD_VALUE in shape or OPERATOR_VALUE in shape:
-            unread = shape.replace(UNREAD_VALUE, "%?").replace(OPERATOR_VALUE, "%?")
-            _check_printf([*args[:index], unread, *args[index + 1 :]])
-
-
-def _printf_evaluated_operands(text: str, count: int) -> list[int]:
-    r"""The indexes of the `count` operands that zsh's `printf` evaluates as arithmetic.
-
-    `text` is the format. Each conversion consumes the next operand, and each `*` one before it;
-    the format is reused while operands remain, as in both shells. A position (`%1$d`), or a
-    letter neither table holds, is not mapped: every operand counts as evaluated then, if any
-    conversion is numeric. An escaped `%`, such as `\045`, is literal text in both shells, so
-    only a spelled `%` starts a conversion.
-    """
-    kinds: list[bool] = []
-    unmapped = False
-    for match in PRINTF_CONVERSION.finditer(text):
-        if match.group(0) == "%%":
-            continue
-        position, width, width_position, precision, precision_position, letter = match.groups()
-        if position or width_position or precision_position:
-            unmapped = True
-        if width and width.startswith("*"):
-            kinds.append(True)
-        if precision and precision.startswith("*"):
-            kinds.append(True)
-        if letter in PRINTF_NUMERIC_LETTERS:
-            kinds.append(True)
-        elif letter in PRINTF_TEXT_LETTERS:
-            kinds.append(False)
-        else:
-            unmapped = True
-            kinds.append(True)
-    if not any(kinds):
-        return []
-    if unmapped:
-        return list(range(count))
-    return [i for i in range(count) if kinds[i % len(kinds)]]
-
-
-def _exceeds_width_cap(formats: list[str]) -> bool:
-    """Whether any conversion in these formats asks for a width or precision over the cap.
-
-    Every argument is read as a format, which over-refuses a data argument that happens to
-    look like one, rather than work out which arguments a format consumes.
-    """
-    return any(
-        group and int(group) > PRINTF_WIDTH_CAP
-        for text in formats
-        for match in PRINTF_WIDTH.finditer(text)
-        for group in match.groups()
-    )
-
-
-def _check_hostname(args: list[str]) -> None:
-    """Validate hostname: allow read-only display, reject setting hostname."""
-    if any(not a.startswith("-") for a in args):
-        raise NotReadOnly("hostname modification")
-
-
-def _check_command_builtin(args: list[str]) -> None:
-    """Validate the ``command`` builtin: ``command -v NAME...`` and nothing else.
-
-    ``-v`` prints how each name resolves, as ``which`` does. Without it ``command`` runs its
-    operand with functions bypassed, so ``command rm -rf build/`` is ``rm``.
-    zsh reads ``command -v`` as ``whence``, which tells no more than zsh's own ``which``.
-
-    ``-V`` is left out because it **prints a function's whole body**.
-    """
-    if args[:1] != ["-v"] or len(args) < 2 or any(arg.startswith("-") for arg in args[1:]):
-        raise NotReadOnly("command other than `command -v NAME...` runs its operand")
-
-
-# `base64` flags, GNU's and macOS's, that neither write nor take a file to write to. macOS has
-# `-o FILE` and `--output=FILE`, which is why this is an allowlist. `-i` is GNU's `--ignore-garbage`
-# and macOS's input file; `READER_SPECS` checks the word after it as a file either way.
-# macOS's `--input=FILE` is not listed: adding it here means adding it to `READER_SPECS` as well,
-# so that its file is checked.
-BASE64_BARE_FLAGS = frozenset({"-d", "-D", "--decode", "-i", "--ignore-garbage"})
-BASE64_VALUE_FLAGS = frozenset({"-w", "--wrap", "-b", "--break"})
-
-
-def _check_base64(args: list[str]) -> None:
-    """Validate base64: listed flags only, and one input at most.
-
-    Decoding prints whatever bytes were encoded, terminal escapes included, which jq's
-    ``@base64d`` and ``tr``'s octal escapes already do; see ``TERMINAL_CONTROL_BYTE``.
-    """
-    inputs = 0
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        index += 1
-        if arg == "-" or not arg.startswith("-"):
-            inputs += 1
-            continue
-        name, equals, _ = arg.partition("=") if arg.startswith("--") else (arg, "", "")
-        if arg in BASE64_BARE_FLAGS or arg in ("--help", "--version"):
-            continue
-        if name in BASE64_VALUE_FLAGS:
-            index += 0 if equals else 1
-            continue
-        if arg[:2] in ("-w", "-b") and arg[2:].isdigit():
-            continue
-        if not arg.startswith("--") and set(arg[1:]) <= set("dDi"):
-            continue
-        raise NotReadOnly(f"base64 flag not known to be read-only: {arg}")
-    if inputs > 1:
-        raise NotReadOnly("base64 with more than one operand")
-
-
-def _check_cd(args: list[str]) -> None:
-    """Validate cd: one directory operand, resolving inside the project.
-
-    A command is better written from the project root with project-relative paths, since
-    that is what permission rules are written against. What this accepts is the slip, so
-    that it costs a refused approval rather than an approval the operator has to read.
-
-    The target is measured from the project root rather than from the process's own
-    working directory, which is the conservative reading: a session runs from the root, a
-    relative target can only go deeper, and anything that climbs out is refused.
-
-    It is measured with ``realpath`` rather than ``normpath``, because a textual prefix test
-    answers "how is this path written" and the question is "where does it land". ``cd``
-    follows a symlink by default, so a link inside the project pointing anywhere is a
-    path that reads as internal and is not.
-    """
-    for arg in args:
-        if arg.startswith("-") and arg not in ("-L", "-P", "-@", "--"):
-            raise NotReadOnly(f"cd option: {arg}")
-
-    operands = [arg for arg in args if not arg.startswith("-")]
-    if len(operands) != 1:
-        raise NotReadOnly("cd with no directory operand, or more than one")
-
-    target = operands[0]
-    if SUBSTITUTION_MARKER in target or "$" in target or "~" in target:
-        raise NotReadOnly(f"cd to a path this module cannot resolve: {target}")
-
-    root = os.path.realpath(REPO_ROOT)
-    # Both readings of a `..` after a link: `cd -L`, the default, drops the link's own name, as
-    # `normpath` does, and `cd -P`, or a startup file's `set -P` or zsh's `chase_dots`, climbs
-    # from where the link leads, as `realpath` alone does. `realpath` resolves a link anywhere
-    # along the way in either.
-    joined = os.path.join(root, target)
-    for resolved in {*_resolutions(os.path.normpath(joined)), *_resolutions(joined)}:
-        if resolved != root and not resolved.startswith(root + os.sep):
-            raise NotReadOnly(f"cd outside the project: {target}")
+# --------------------------------------------------------------------------------------
+# Wrappers: programs that run the rest of the command line
+# --------------------------------------------------------------------------------------
 
 
 def _strip_timeout(args: list[str]) -> list[str]:
@@ -4136,6 +6861,55 @@ WRAPPERS = {
 
 # `timeout timeout timeout ...` parses; it just has nothing to say.
 MAX_WRAPPER_DEPTH = 4
+
+# --------------------------------------------------------------------------------------
+# Dispatch: one simple command
+# --------------------------------------------------------------------------------------
+
+# Base programs that only ever read. Must be invoked by bare name (no slashes).
+READ_ONLY = {
+    "basename",
+    "cat",
+    "cmp",
+    "column",
+    "comm",
+    "cut",
+    "diff",
+    "dirname",
+    "du",
+    "echo",
+    "egrep",
+    "false",
+    "fgrep",
+    "grep",
+    "head",
+    "id",
+    "join",
+    "jq",
+    "ls",
+    "md5sum",
+    "nl",
+    "od",
+    "paste",
+    "printf",
+    "pwd",
+    "readlink",
+    "realpath",
+    "rev",
+    "shasum",
+    "sha1sum",
+    "sha256sum",
+    "stat",
+    "tac",
+    "tail",
+    "test",
+    "tr",
+    "true",
+    "uname",
+    "wc",
+    "which",
+    "whoami",
+}
 
 # Explicit dispatch table mapping programs to their dedicated validator functions
 PROGRAM_VALIDATORS = {
@@ -4432,2559 +7206,9 @@ def _check_command(
                 raise NoOpinion(f"{program} follows the link {link} out of the working directories")
 
 
-# The read subcommands whose operands include paths git resolves in its repository: pathspecs,
-# and `<rev>:<path>` and `:<path>`, which it reads from the repository's root
-GIT_PATH_SUBCOMMANDS = frozenset(
-    {
-        "blame",
-        "cat-file",
-        "check-ignore",
-        "diff",
-        "grep",
-        "log",
-        "ls-files",
-        "ls-tree",
-        "range-diff",
-        "rev-list",
-        "shortlog",
-        "show",
-        "stash",
-        "status",
-    }
-)
-
-# The options of `GIT_PATH_SUBCOMMANDS` whose value, the next word, is no path: a pattern, a
-# string, a number or a name. `_check_git_paths` skips that word. Only a value spelled as its own
-# word is listed: one attached, as `--author=x` or `-Sx`, is part of a word that starts with `-`.
-# `--pretty`, whose value is optional, and `--format`, whose value git takes only after `=`, are
-# not: the word after either is a path.
-# `-L`, of `log`, is `<range>:<file>`, whose file is read from where git runs, so it is measured.
-# `_git_file_operands` skips the same words after `diff`, where git opens its operands: an entry
-# that took no next word would hide one. Each was run on git 2.48.1 in `diff` and `log`, where it
-# takes the next word, and in `diff`, with a FIFO outside the repository as that word, which git
-# never opened, `--no-index` or not: in that mode it rejects the revision options, and the rest
-# take the word as their value. Left out: the options whose value git takes only attached, so
-# that the next word is an operand, such as `-U`, `--unified`, `--relative`, `--word-diff` and
-# `--abbrev`; and `-l`, which took its value only attached before git 2.22, as
-# `GIT_DIFF_NEXT_WORD_VALUES` says. Its short options, `-G`, `-I` and `-S`, come from there, so
-# that `diff` reads them the same, bare or at the end of a bundle.
-GIT_REVISION_VALUES = GIT_DIFF_NEXT_WORD_VALUES | frozenset(
-    {
-        "-n",
-        "--after",
-        "--anchored",
-        "--author",
-        "--before",
-        "--committer",
-        "--date",
-        "--diff-algorithm",
-        "--diff-filter",
-        "--diff-merges",
-        "--dst-prefix",
-        "--encoding",
-        "--find-object",
-        "--grep",
-        "--ignore-matching-lines",
-        "--inter-hunk-context",
-        "--line-prefix",
-        "--max-count",
-        "--since",
-        "--skip",
-        "--src-prefix",
-        "--stat-count",
-        "--stat-graph-width",
-        "--stat-name-width",
-        "--stat-width",
-        "--until",
-        "--word-diff-regex",
-    }
-)
-GIT_PATH_FLAG_VALUES = {
-    "blame": frozenset({"-L", "--ignore-rev"}),
-    "grep": frozenset({"-e", "-A", "-B", "-C", "-m", "--max-count", "--max-depth", "--threads"}),
-    "ls-files": frozenset({"-x", "--exclude", "--format", "--exclude-per-directory"}),
-    "ls-tree": frozenset({"--format"}),
-    "diff": GIT_REVISION_VALUES,
-    "log": GIT_REVISION_VALUES,
-    # `range-diff` stops at its usage message on the options of `log` it doesn't take
-    "range-diff": GIT_REVISION_VALUES | {"--creation-factor"},
-    "rev-list": GIT_REVISION_VALUES,
-    "shortlog": GIT_REVISION_VALUES,
-    "show": GIT_REVISION_VALUES,
-    "stash": GIT_REVISION_VALUES,
-}
-
-# Pathspec magic: `:(top,icase)path`, or the short `:/!path`, whose `/` is `top`
-PATHSPEC_LONG_MAGIC = re.compile(r":\(([^)]*)\)(.*)", re.DOTALL)
-PATHSPEC_SHORT_MAGIC = re.compile(r":([/!^]*):?(.*)", re.DOTALL)
-
-
-def _check_git_paths(
-    args: list[str],
-    index: int,
-    tokens: list[str],
-    parts: list[tuple[str, str]],
-    scope: _ReadScope,
-) -> None:
-    """Raise ``NoOpinion`` for a path git reads out of the working directories (#48).
-
-    git resolves its paths in the whole repository it runs in, and stops at its root, so where
-    that root is in the read roots, as the project's own is, no path git takes reaches out of
-    them. Where it isn't, as for a project that is a package of a larger repository, or under
-    a dotfiles repository at `~`, each operand of a subcommand in `GIT_PATH_SUBCOMMANDS` is
-    measured from the directory git runs in: a pathspec, and before `--` any word, which git
-    reads as a revision or a path. It has no opinion on magic that starts at the root, `:/` and
-    `:(top)`, on a tree or index path git reads from the root, `<rev>:<path>` and `:<path>`,
-    unless the path starts with `./` or `../`, and on `ls-tree --full-tree`.
-
-    Not measured: what a subcommand reads with no path, as `git log -p` and `git diff` read the
-    whole repository; `AGENTS.md` names that gap.
-    """
-    subcommand = args[index]
-    if subcommand not in GIT_PATH_SUBCOMMANDS:
-        return
-    if not any(_repository_root_out_of_scope(base, scope) for base in scope.bases):
-        return
-    values = GIT_PATH_FLAG_VALUES.get(subcommand, frozenset())
-    # `git grep`'s first operand is its pattern, unless an `-e` or `-f` gave one
-    pattern_pending = subcommand == "grep" and not any(
-        arg in ("-e", "-f") or (arg[:1] == "-" and arg[1:2] != "-" and set("ef") & set(arg))
-        for arg in args[index + 1 :]
-    )
-    after_dashes = False
-    skip = False
-    for position in range(index + 1, len(args)):
-        word, token = args[position], tokens[position]
-        if skip:
-            skip = False
-            continue
-        if word == "--" and not after_dashes:
-            after_dashes = True
-            continue
-        if not after_dashes and word.startswith("-"):
-            if word == "--full-tree" and subcommand == "ls-tree":
-                raise NoOpinion(
-                    "git ls-tree --full-tree reads the root of a repository out of scope"
-                )
-            if word == "-L" and subcommand == "log" and position + 1 < len(args):
-                # `-L <range>:<file>`: the file, after the last `:`, is read from where git runs
-                value = args[position + 1]
-                _check_git_path(value.rpartition(":")[2], tokens[position + 1], parts, scope, value)
-                skip = True
-            elif word.startswith("-L") and subcommand == "log":
-                _check_git_path(word.rpartition(":")[2], token, parts, scope, word)
-            else:
-                skip = word in values
-            continue
-        if position == index + 1 and subcommand == "stash":
-            continue  # `show`
-        if pattern_pending and not after_dashes:
-            pattern_pending = False
-            continue
-        path = _git_path_from_cwd(word, after_dashes=after_dashes)
-        _check_git_path(path, token, parts, scope, word)
-
-
-def _check_git_path(
-    path: str, token: str, parts: list[tuple[str, str]], scope: _ReadScope, word: str
-) -> None:
-    """Raise ``NoOpinion`` unless ``path``, which git reads from where it runs, is in ``scope``."""
-    if _word_the_shell_builds(token, parts):
-        raise NoOpinion(f"git given a path the shell builds: {word}")
-    for base in scope.bases:
-        if not _in_scope(os.path.join(base, path or "."), scope):
-            raise NoOpinion(f"git reads out of the working directories: {word}")
-
-
-def _git_path_from_cwd(word: str, *, after_dashes: bool) -> str:
-    """The path in ``word`` that git resolves from its working directory.
-
-    Raises ``NoOpinion`` for one it resolves from its repository's root, which
-    `_check_git_paths` reads only where that root is out of scope.
-    """
-    root_reason = f"git reads {word} from the root of a repository out of the working directories"
-    if word.startswith(":"):
-        long_magic = PATHSPEC_LONG_MAGIC.fullmatch(word)
-        if long_magic is not None:
-            names = {name.strip().split(":")[0] for name in long_magic.group(1).split(",")}
-            if "top" in names:
-                raise NoOpinion(root_reason)
-            return long_magic.group(2)
-        short_magic = PATHSPEC_SHORT_MAGIC.fullmatch(word)
-        magic, rest = short_magic.group(1), short_magic.group(2)
-        if "/" in magic:
-            raise NoOpinion(root_reason)
-        # Before `--`, a word with no magic can be the index's `:<path>` or `:<stage>:<path>`
-        if not after_dashes and not magic and not rest.startswith(("./", "../")):
-            raise NoOpinion(root_reason)
-        return rest
-    if not after_dashes and ":" in word:
-        _, _, path = word.partition(":")
-        if path in (".", "..") or path.startswith(("./", "../")):
-            return path
-        raise NoOpinion(root_reason)
-    return word
-
-
-def _repository_root_out_of_scope(base: str, scope: _ReadScope) -> bool:
-    """Whether git, run in ``base``, finds a repository whose root is out of ``scope``.
-
-    The nearest directory with a `.git`, from ``base``'s real path up, as git looks for one.
-    `GIT_DIR` or `GIT_WORK_TREE` in the environment the hook shares with the shell puts the
-    repository anywhere, and so out of scope. No repository is none to read paths in.
-    """
-    if os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE"):
-        return True
-    try:
-        directory = os.path.realpath(base)
-    except (OSError, ValueError):
-        return True
-    while True:
-        if os.path.lexists(os.path.join(directory, ".git")):
-            return not _in_scope(directory, scope)
-        parent = os.path.dirname(directory)
-        if parent == directory:
-            return False
-        directory = parent
-
-
-def _check_read_scope(
-    reader: str,
-    found: list[tuple[int, int]],
-    args: list[str],
-    arg_tokens: list[str],
-    parts: list[tuple[str, str]],
-    scope: _ReadScope,
-) -> None:
-    """Raise ``NoOpinion`` unless each file ``reader`` opens is in ``scope``.
-
-    ``found`` is where in ``args`` those files are, as ``_file_operands`` gives it, and
-    ``arg_tokens`` the reduced words ``args`` were expanded from.
-    """
-    for index, start in found:
-        token, text = arg_tokens[index], args[index]
-        if start:
-            # A path attached to its flag: the flag must be written out, so that the token
-            # can be cut where the text is. `'--from-file=/x'` quotes both together.
-            if token[:start] != text[:start]:
-                raise NoOpinion(f"{reader} given a file flag it cannot split: {text}")
-            token, text = token[start:], text[start:]
-        problem = _read_scope_problem(token, text, parts, scope)
-        if problem is not None:
-            raise NoOpinion(f"{reader} reads {problem}")
-
-
-def _directory_scope(
-    token: str,
-    parts: list[tuple[str, str]],
-    values: dict[str, list[str] | None],
-    scope: _ReadScope,
-) -> _ReadScope:
-    """``scope``, with the directory ``token`` names, from each base, as the bases.
-
-    For the paths a program resolves from a directory it changes to, as ``git -C`` does:
-    ``git -C sub diff --no-index ../x y`` reads the ``x`` beside ``sub``. The directory is read
-    as the credential check reads a program's directory: `_directory_word`, then
-    `_changed_directories`, with ``values`` as `_known_values` reads them.
-
-    Raises ``NoOpinion`` for a directory below `UNREAD_VALUE`, where no path can be placed: a
-    glob or a substitution, which ``_check_command`` has already refused in its place, and a
-    variable, which may still hold the value the shell had before.
-    """
-    bases = _changed_directories(_directory_word(token, parts), values, scope.bases)
-    if any(UNREAD_VALUE in base for base in bases):
-        raise NoOpinion(
-            f"a path relative to a directory this module cannot resolve: {_expand(token, parts)}"
-        )
-    return _ReadScope(
-        scope.roots,
-        bases,
-        scope.splice_vars,
-        scope.loop_values,
-        spells_escape=scope.spells_escape,
-    )
-
-
-class _GlobRule:
-    """A ``Bash(...)`` rule body as an anchored ``*``-glob, matched without a regexp.
-
-    ``"*x" * 12 + "y"`` translated to ``.*x.*x...y`` and matched against a four-hundred
-    character command takes minutes: every star can give back, and the engine tries all
-    of it before reporting no match. A hook that takes minutes is a Bash call that takes
-    minutes, since the host waits for the decision.
-
-    ``*`` is the only wildcard a Bash rule has, and for a pure-``*`` glob the leftmost match
-    of each piece is always the right one -- taking more of the text can only make the
-    rest harder to place. So a single forward scan decides it, in time proportional to
-    the command length, with no backtracking to bound.
-    """
-
-    __slots__ = ("pieces", "source")
-
-    def __init__(self, body: str) -> None:
-        self.pieces = body.split("*")
-        self.source = body
-
-    def match(self, text: str) -> bool:
-        """Whether the whole of ``text`` matches, which is the rule's own semantics."""
-        first, last = self.pieces[0], self.pieces[-1]
-        if len(self.pieces) == 1:
-            return text == first
-        if not text.startswith(first) or not text.endswith(last):
-            return False
-        position, limit = len(first), len(text) - len(last)
-        if position > limit:
-            return False
-        for piece in self.pieces[1:-1]:
-            found = text.find(piece, position, limit)
-            if found < 0:
-                return False
-            position = found + len(piece)
-        return True
-
-
-def _rule_pattern(rule: str, *, blanket: bool = False) -> _GlobRule | None:
-    """A ``Bash(...)`` permission rule as a pattern over one simple command's text.
-
-    Quotes are dropped from both sides of the comparison, because the text a segment is
-    matched against has already been through the lexer: the rule
-    ``Bash(firebase database:get '/.settings/rules' *)`` and the command the operator wrote
-    differ by the quotes alone. A rule for another tool matches nothing here and returns
-    ``None``, and so does a blanket ``Bash(*)`` unless ``blanket`` is set: granting everything
-    is a decision for the operator's own rule file to carry out, not for this hook to
-    infer, while a blanket *deny* has to keep its reach.
-    """
-    if not rule.startswith("Bash(") or not rule.endswith(")"):
-        return None
-    body = rule[len("Bash(") : -1].strip().replace("'", "").replace('"', "")
-    if not body or (not blanket and set(body) <= {"*"}):
-        return None
-    return _GlobRule(body)
-
-
-def _operator_rules(
-    settings: tuple[list[dict], bool] | None = None,
-) -> tuple[list[_GlobRule], list[_GlobRule]]:
-    """The allow and deny rules the operator has already written, as patterns.
-
-    This is the second tier, and the whole of its safety argument: a command that matches
-    an allow rule is one Claude Code would run with no prompt if it stood on its own. The
-    host requires every sub-command of a compound to match a rule independently, which is
-    exactly what the caller does with these -- so recognizing them here does not widen
-    what the operator granted, it stops a pipeline losing the grant because one filter in
-    the middle of it has no rule of its own. It holds only for a rule Claude Code applies,
-    which is why ``_settings_permissions`` drops the allow rules of a file it doesn't.
-
-    Nothing is cached: the file is small, it is read once per Bash call, and a rule the
-    operator saved a moment ago through "yes, and don't ask again" applies immediately.
-
-    A file that exists and cannot be used is a file whose rules this module cannot see
-    (see ``_settings_permissions``), so the second tier is turned off for the call rather
-    than run on a partial reading of what the operator wrote. Allow rules are what tier 2
-    spends, and dropping them can only cost a prompt; deny rules that were read stay, and
-    the host evaluates its own regardless of what this hook returns.
-    """
-    allow: list[_GlobRule] = []
-    deny: list[_GlobRule] = []
-
-    found, usable = settings or _settings_permissions()
-    for permissions in found:
-        for key, target, blanket in (("allow", allow, False), ("deny", deny, True)):
-            for rule in permissions.get(key) or []:
-                if not isinstance(rule, str):
-                    continue
-                pattern = _rule_pattern(rule, blanket=blanket)
-                if pattern is not None:
-                    target.append(pattern)
-
-    return (allow if usable else []), deny
-
-
-def _settings_permissions() -> tuple[list[dict], bool]:
-    """The ``permissions`` object of each settings file, and whether every file there was usable.
-
-    Only a regular file under ``SETTINGS_SIZE_CAP`` is opened, and the decision is made
-    from ``stat`` so that a file failing either test costs nothing at all. A named pipe
-    with no writer blocks in ``open`` forever, and the host's own hook timeout is ten
-    minutes: that is not a bypass, but it is the whole Bash call spent waiting for a file
-    that was never going to answer.
-
-    A file that is missing is the ordinary case and means nothing. A file that exists and
-    cannot be used -- wrong kind, too large, unreadable, not JSON, no ``permissions`` --
-    makes the second value false, and each caller decides what that costs it.
-
-    Of a project file Claude Code doesn't apply in this session (``_sources_in_force``), only
-    the deny and ask rules are kept: they can only cost a prompt. The files ``SETTINGS_ENV``
-    names instead stand for files Claude Code applies.
-    """
-    override = os.environ.get(SETTINGS_ENV)
-    if override is None:
-        files = [(REPO_ROOT / name, SETTING_SOURCE_OF[name]) for name in SETTINGS_FILES]
-    else:
-        files = [(Path(piece), None) for piece in override.split(os.pathsep) if piece]
-
-    found: list[dict] = []
-    usable = True
-    in_force: frozenset[str] | None = None
-    for path, source in files:
-        try:
-            present, document = _load_settings_file(path)
-            if not present:
-                continue  # a settings file that is simply absent, which is the normal case
-            permissions = document["permissions"]
-        except (OSError, ValueError, KeyError, TypeError, RecursionError):
-            usable = False  # it is there and it cannot be read; see the docstring
-            continue
-        if not isinstance(permissions, dict):
-            continue
-        if source is not None:
-            if in_force is None:
-                in_force = _sources_in_force()
-            if source not in in_force:
-                kept = ("deny", "ask")
-                permissions = {key: permissions[key] for key in kept if key in permissions}
-        found.append(permissions)
-    return found, usable
-
-
-def _sources_in_force() -> frozenset[str]:
-    """The project's setting sources whose allow rules and directories Claude Code applies.
-
-    ``project`` is ``.claude/settings.json``, and ``local`` ``.claude/settings.local.json``.
-    Claude Code applies them in a session that loaded their source, which ``--setting-sources``
-    may leave out, and in a workspace it has a trust record for. Without one it ignores both
-    and says so on stderr: "Ignoring 1 permissions.allow entry from .claude/settings.json: this
-    workspace has not been trusted". An interactive session asks for that trust before it runs
-    any hook, but ``claude -p`` and the SDK run hooks in a workspace that has none, so a
-    repository's own file would otherwise get its commands approved here and nowhere else.
-
-    The source of truth is Claude Code 2.1.322's own code: it applies both files once its
-    global config holds a trust record for the workspace's key (``_trust_key``). It applies the
-    local file without one too, where git doesn't track it and ``.claude`` is no link, while a
-    folder above holds a record. This module asks for the record in that case as well, which
-    costs a prompt there and nothing else.
-    """
-    if not _workspace_trusted():
-        return frozenset()
-    return _session_setting_sources() & frozenset(SETTING_SOURCE_OF.values())
-
-
-def _session_setting_sources() -> frozenset[str]:
-    """The setting sources the session loaded, read once from Claude Code's command line.
-
-    None at all where the command line cannot be read: what it would have said is unknown.
-    """
-    global _SETTING_SOURCES  # noqa: PLW0603 - one process per call
-    if _SETTING_SOURCES is None:
-        argv = _claude_code_argv()
-        _SETTING_SOURCES = frozenset() if argv is None else _setting_sources(argv)
-    return _SETTING_SOURCES
-
-
-def _setting_sources(argv: list[str]) -> frozenset[str]:
-    """The setting sources a Claude Code command line loads.
-
-    Every source without ``--setting-sources``, the ones it lists with it, spelled as
-    ``--setting-sources user,project`` or ``--setting-sources=user,project``. Each time the
-    flag appears narrows the set, though the last one counts: a prompt that spells the flag
-    costs a prompt, never a source the session left out.
-    """
-    sources = set(SETTING_SOURCES)
-    for index, word in enumerate(argv):
-        if word == SETTING_SOURCES_FLAG:
-            value = argv[index + 1] if index + 1 < len(argv) else ""
-        elif word.startswith(SETTING_SOURCES_FLAG + "="):
-            value = word[len(SETTING_SOURCES_FLAG) + 1 :]
-        else:
-            continue
-        sources &= {piece.strip() for piece in value.split(",")}
-    return frozenset(sources)
-
-
-def _claude_code_argv() -> list[str] | None:
-    """The command line of this process's parent, Claude Code, or None where it cannot be read.
-
-    ``hooks/hooks.json`` runs the hook in exec form, with no shell between, as Claude Code
-    2.1.322 does. Claude Code names its own process in ``CLAUDE_PID``, and a parent that is
-    another is not read: its command line would say nothing of the session's sources.
-    """
-    parent = os.getppid()
-    claimed = os.environ.get(CLAUDE_PID_ENV)
-    if parent <= 1 or (claimed is not None and claimed != str(parent)):
-        return None
-    if sys.platform == "linux":
-        try:
-            with open(f"/proc/{parent}/cmdline", "rb") as stream:
-                raw = stream.read()
-        except OSError:
-            return None
-        # Each argument ends in a NUL, so an empty one, as in `--setting-sources ''`, stays one
-        return [arg.decode("utf-8", "surrogateescape") for arg in raw.split(b"\0")[:-1]] or None
-
-    # macOS has no /proc. `ps` joins the arguments with spaces, which only ever adds a word.
-    import subprocess  # noqa: PLC0415 - as in `_run_git_uncached`, only where it is needed
-
-    try:
-        result = subprocess.run(  # noqa: S603 - the system's own `ps`, and arguments written here
-            ["/bin/ps", "-ww", "-o", "args=", "-p", str(parent)],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=PARENT_COMMAND_LINE_TIMEOUT,
-            check=False,
-        )
-        text = result.stdout.decode("utf-8", "surrogateescape")
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return text.split() if result.returncode == 0 and text.strip() else None
-
-
-def _workspace_trusted() -> bool:
-    """Whether Claude Code's global config holds a trust record for the workspace of the project.
-
-    The record is ``projects[<key>].hasTrustDialogAccepted: true`` in ``.claude.json``, an
-    internal format: whatever doesn't read as one is no trust. So is a key Claude Code never
-    records, the home directory's, and every key while ``IGNORE_TRUST_ENV`` is set. Where a
-    legacy ``.config.json`` is left, Claude Code may read that file instead, and this module
-    doesn't guess which.
-    """
-    if os.environ.get(IGNORE_TRUST_ENV) or os.environ.get(CUSTOM_OAUTH_ENV):
-        return False
-    key = _trust_key(Path(REPO_ROOT))
-    config_dir = os.environ.get(CONFIG_DIR_ENV) or None
-    if (
-        key is None
-        or key == os.path.realpath(_home())
-        or (config_dir is not None and not os.path.isabs(config_dir))
-    ):
-        return False
-    legacy_dirs = {config_dir or os.path.join(_home(), ".claude"), os.path.join(_home(), ".claude")}
-    if any(os.path.lexists(os.path.join(d, ".config.json")) for d in legacy_dirs):
-        return False
-    path = Path(config_dir or _home(), ".claude.json")
-    try:
-        info = path.stat()
-        if not S_ISREG(info.st_mode) or info.st_size > GLOBAL_CONFIG_SIZE_CAP:
-            return False
-        record = json.loads(path.read_text(encoding="utf-8"))["projects"][key]
-        return record["hasTrustDialogAccepted"] is True
-    except (OSError, ValueError, KeyError, TypeError, RecursionError):
-        return False
-
-
-def _trust_key(project: Path) -> str | None:
-    """The key Claude Code records the trust of a session started in ``project`` under.
-
-    The root of the git worktree around it, or the main worktree's for a linked worktree
-    (``_main_worktree``), or else ``project`` itself, as Claude Code 2.1.322 works it out. A
-    ``.git`` that is a link or that cannot be looked at leaves the key unknown, and None.
-    """
-    for directory in (project, *project.parents):
-        try:
-            mode = (directory / ".git").lstat().st_mode
-        except FileNotFoundError:
-            continue
-        except OSError:
-            return None
-        if S_ISDIR(mode):
-            return str(directory)
-        if S_ISREG(mode):
-            return _main_worktree(directory)
-        return None
-    return str(project)
-
-
-def _main_worktree(root: Path) -> str | None:
-    """The key for the trust of the worktree at ``root``, whose ``.git`` is a file.
-
-    A linked worktree git made is keyed by its main worktree: ``root/.git`` names a git dir
-    under ``<main>/.git/worktrees/``, whose ``commondir`` leads back to ``<main>/.git`` and whose
-    own ``gitdir`` names ``root/.git``. A submodule's git dir has no ``commondir``, and Claude
-    Code keys it by ``root``. Anything else is None, rather than a guess at which of the two
-    Claude Code settles on.
-    """
-    line = _git_pointer(root / ".git")
-    if line is None or not line.startswith("gitdir:"):
-        return None
-    gitdir = os.path.normpath(os.path.join(root, line[len("gitdir:") :].strip()))
-    if not os.path.isdir(gitdir):
-        return None
-    if not os.path.lexists(os.path.join(gitdir, "commondir")):
-        return str(root)
-    common_line = _git_pointer(Path(gitdir, "commondir"))
-    back_line = _git_pointer(Path(gitdir, "gitdir"))
-    if common_line is None or back_line is None:
-        return None
-    common = os.path.normpath(os.path.join(gitdir, common_line))
-    main = os.path.dirname(common)
-    if (
-        os.path.basename(common) != ".git"
-        or os.path.dirname(gitdir) != os.path.join(common, "worktrees")
-        or os.path.normpath(os.path.join(gitdir, back_line)) != os.path.join(root, ".git")
-        or os.path.realpath(main) != main
-    ):
-        return None
-    return main
-
-
-def _git_pointer(path: Path) -> str | None:
-    """The one line of a small regular file that holds a path, as git writes them, or None."""
-    try:
-        info = path.lstat()
-        if not S_ISREG(info.st_mode) or info.st_size > GIT_POINTER_SIZE_CAP:
-            return None
-        line = path.read_text(encoding="utf-8").strip()
-    except (OSError, ValueError):
-        return None
-    return line if line and not GIT_POINTER_CONTROL.search(line) else None
-
-
-def _load_settings_file(path: Path) -> tuple[bool, object]:
-    """Whether a settings file is there, and its document when it is.
-
-    Raises ``OSError``, ``ValueError`` or ``RecursionError`` for a file that is there and cannot
-    be read. A directory, a FIFO, a device or an oversized file is never opened: the first would
-    block for the length of the Bash call and the last would be read on every one of them.
-    """
-    try:
-        info = path.stat()  # follows a link, and raises for one that dangles
-    except OSError:
-        return False, None
-    if not S_ISREG(info.st_mode) or info.st_size > SETTINGS_SIZE_CAP:
-        raise ValueError("not a settings file this module will read")
-    return True, json.loads(path.read_text(encoding="utf-8", errors="replace"))
-
-
-def _read_roots(settings: tuple[list[dict], bool] | None = None) -> list[str]:
-    """The directories a reader may read inside: the project and its ``additionalDirectories``.
-
-    The entries come from the same two files as the operator's rules, and only from a file
-    Claude Code applies (``_settings_permissions``): a directory there is one the operator
-    already made a working directory. Claude Code also reads the user's own
-    settings file, which this module leaves alone as it does for the rules, and one added for
-    the session with ``/add-dir`` is in no file and not in the hook's payload, so this module
-    cannot see either.
-
-    An entry is resolved the way a ``cd`` target is: ``~`` expanded, a relative entry taken
-    from the project root, then ``realpath``. A settings file that cannot be read leaves the
-    project alone, since what it would have added is unknown. An entry is dropped when:
-
-    - it is not a directory
-    - it is or contains the home directory, which ``_project_root`` refuses as a project
-      for the same reason: every dotfile would be in scope
-    - it is, contains or sits inside a credential store or ``/proc``. Layer B refuses a word
-      that names a store, and a store's parent is not one: with ``~/.config`` as a root,
-      ``grep -r token ~/.config`` reads ``~/.config/gh/hosts.yml`` and names nothing Layer B
-      knows
-    """
-    roots = [os.path.realpath(REPO_ROOT)]
-    found, usable = settings or _settings_permissions()
-    if not usable:
-        return roots
-    home = os.path.realpath(_home())
-    stores = [os.path.realpath(store) for store in _credential_roots()] + ["/proc"]
-    for permissions in found:
-        entries = permissions.get("additionalDirectories")
-        for entry in entries if isinstance(entries, list) else []:
-            if not isinstance(entry, str) or not entry.strip():
-                continue
-            try:
-                path = os.path.expanduser(entry) if entry.startswith("~") else entry
-                path = os.path.realpath(os.path.join(str(REPO_ROOT), path))
-                if (
-                    _is_under(home, path)
-                    or any(_is_under(store, path) or _is_under(path, store) for store in stores)
-                    or not os.path.isdir(path)
-                ):
-                    continue
-            except (OSError, ValueError):
-                continue
-            roots.append(path)
-    return roots
-
-
-def _home() -> str:
-    """The home directory, read at call time so a test can point it elsewhere."""
-    return os.path.expanduser("~")
-
-
-def _credential_roots() -> list[str]:
-    home = _home()
-    roots = [os.path.join(home, relative) for relative in CREDENTIAL_HOME_PATHS]
-    return roots + list(CREDENTIAL_SYSTEM_PATHS)
-
-
-def _is_under(path: str, root: str) -> bool:
-    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
-
-
-def _expand_home(text: str, *, tilde: bool) -> str:
-    """Replace a leading `~`, `$HOME` or `${HOME}` with the directory it names.
-
-    Any other tilde prefix, as `~-` and `~name`, is `UNREAD_VALUE`: `_tilde_word`.
-    """
-    if tilde and text.startswith("~"):
-        return _tilde_word(text)
-    for spelling in ("${HOME}", "$HOME"):
-        if text.startswith(spelling):
-            return _home() + text[len(spelling) :]
-    return text
-
-
-def _names_a_credential(text: str, *, tilde: bool, bases: list[str], live_glob: bool) -> bool:
-    try:
-        return _names_a_credential_unguarded(text, tilde=tilde, bases=bases, live_glob=live_glob)
-    except (OSError, ValueError):
-        return True  # cannot be resolved, and this is the layer that refuses outright
-
-
-def _names_a_credential_unguarded(
-    text: str, *, tilde: bool, bases: list[str], live_glob: bool
-) -> bool:
-    """Whether this word reaches a credential store, however it is spelled.
-
-    A word whose final text the shell still decides -- a glob, an expansion -- is judged by
-    the literal part in front of the first special character: `~/.a*/cred*` and `/e*/shadow`
-    could each expand into a credential store, so they are refused, while `/usr/share/*` could
-    not and is left to the read scope. That literal part is resolved as a literal path is.
-
-    A relative path, or literal part, is resolved from each of `bases`, the directories the
-    command can run in, and through any symbolic link, so a link inside the project that
-    points at `~/.ssh` is caught by its target. What a wildcard matches is not read: a
-    wildcard that matches such a link is not caught (#54). A value this module didn't read,
-    `UNREAD_VALUE`, in the word or as a base, is read by `_below_an_unread_value`.
-
-    With `live_glob`, the shell expands a wildcard in the word, and a component that can
-    match `..`, as `.*` does in a bash older than 5.2, is read as `..` too: `../.*/.ssh/x` can
-    be `../../.ssh/x`. A `..` after the wildcard is refused before this, in
-    `_refuse_credential_paths`.
-    """
-    text = REDIRECTION_PREFIX.sub("", text)
-    if "=" in text and not text.startswith(("/", "~", "$", UNREAD_VALUE)):
-        # An assignment's or a `--flag=`'s right-hand side. Bash expands a tilde after the
-        # `=` of an assignment, so `x=~/.aws/credentials` puts the real path in `x`; a
-        # `--flag=~/x` is not expanded, and treating it as if it were costs a prompt at most.
-        text = text.split("=", 1)[1]
-        tilde = True
-    if not text:
-        return False
-    # `_expand_home` reads `~name` as `UNREAD_VALUE`, which zsh can take from a named directory;
-    # bash takes the home directory of the user `name`, when there is one, read here
-    if tilde and text.startswith("~") and _tilde_expansion(text) is None:
-        user_home = os.path.expanduser(text)
-        if user_home != text and _names_a_credential_unguarded(
-            user_home, tilde=False, bases=bases, live_glob=live_glob
-        ):
-            return True
-    text = _expand_home(text, tilde=tilde)
-    if UNREAD_VALUE in text:
-        unread = [text]
-    elif text.startswith("/"):
-        unread = []
-    else:
-        unread = [os.path.join(base, text) for base in bases if UNREAD_VALUE in base]
-    if any(_below_an_unread_value(spelled, live_glob=live_glob) for spelled in unread):
-        return True
-    # Below, an unread value is an expansion: the text in front of it is the literal part
-    text = text.replace(UNREAD_VALUE, "$")
-    bases = [base for base in bases if UNREAD_VALUE not in base]
-    roots = _credential_roots()
-    spellings = [text] if text.startswith("/") else [os.path.join(base, text) for base in bases]
-
-    special = PATH_SPECIAL.search(text)
-    if special is None:
-        for absolute in spellings:
-            for candidate in {os.path.normpath(absolute), *_resolutions(absolute)}:
-                if PROCESS_SECRETS.match(candidate):
-                    return True
-                if any(_is_under(candidate, root) for root in roots):
-                    return True
-        return False
-
-    if live_glob:
-        components = text.split("/")
-        climbing = [
-            index
-            for index, component in enumerate(components)
-            if component != ".." and _may_match_dot_dot(component)
-        ]
-        # Each such component carries a wildcard or an expansion, so with two, the second
-        # read as `..` climbs from whatever the first matched, as a `..` after a wildcard does
-        if len(climbing) > 1:
-            return True
-        if climbing:
-            variant = "/".join(
-                ".." if index == climbing[0] else component
-                for index, component in enumerate(components)
-            )
-            if _glob_may_climb(variant, dot_components=False) or _names_a_credential_unguarded(
-                variant, tilde=False, bases=bases, live_glob=False
-            ):
-                return True
-
-    relative_directory, _, relative_partial = text[: special.start()].rpartition("/")
-    if not text.startswith("/") and not relative_partial and relative_directory in ("", "."):
-        # The wildcard or expansion reads the base itself, as `*` and `"$f"` do: the read
-        # scope's question. No base is in a credential store, `_working_directories` sees to
-        # that, and a link in one that the wildcard matches is read by neither layer (#54); one
-        # a reader follows while it recurses is `_refuse_followed_credential_links`'
-        return False
-    for absolute in spellings:
-        prefix = absolute[: len(absolute) - len(text) + special.start()]
-        directory, _, partial = prefix.rpartition("/")
-        for resolved in {os.path.normpath(directory or "/"), *_resolutions(directory or "/")}:
-            # `dir/` keeps its slash, so a root that starts with it is one the wildcard can
-            # reach; `dir/.ss` is a root's own name in part. A `.` or `..` is a directory
-            # too, as in `/..*`, which is `/` and every name under it.
-            if partial in (".", ".."):
-                candidate = os.path.normpath(os.path.join(resolved, partial)).rstrip("/") + "/"
-            else:
-                candidate = resolved.rstrip("/") + "/" + partial
-            # A process's secrets are a name below its directory, which a wildcard anywhere
-            # in `/proc` can reach: `/proc/*/environ` and `/proc/self/env*` are each of them
-            if (
-                any(root.startswith(candidate) or _is_under(candidate, root) for root in roots)
-                or "/proc/".startswith(candidate)
-                or _is_under(candidate, "/proc")
-            ):
-                return True
-    return False
-
-
-def _below_an_unread_value(path: str, *, live_glob: bool) -> bool:
-    """Whether the text after the last value this module didn't read names a credential store.
-
-    That value, an expansion, a command's output or a working directory, can be any directory,
-    so the text after it is read below the home directory, and without a wildcard below `/`:
-    after `$(pwd)`, `/.ssh/id_rsa` names a store, and `/etc/shadow` names one. Each `..` in
-    front of it is a directory deeper in the value. Two things are left to the read scope: text
-    glued to the value, which finishes a name the value starts, as `h` in `${d}h` does, and a
-    wildcard right after it, which reads the value's own directory, as `"$d"/*` does.
-    """
-    tail = path.rpartition(UNREAD_VALUE)[2]
-    if not tail.startswith("/"):
-        tail = tail.partition("/")[2]
-    components = os.path.normpath(tail.strip("/") or ".").split("/")
-    while components and components[0] in (".", ".."):
-        components.pop(0)
-    rest = "/".join(components)
-    special = PATH_SPECIAL.search(rest)
-    if not rest or (special is not None and special.start() == 0):
-        return False
-    below_home = f"{_home().rstrip('/')}/{rest}"
-    return _names_a_credential_unguarded(
-        below_home, tilde=False, bases=[], live_glob=live_glob
-    ) or (
-        special is None
-        and _names_a_credential_unguarded(f"/{rest}", tilde=False, bases=[], live_glob=False)
-    )
-
-
-# More directories than this that a relative word may be resolved from, and the command is
-# refused: each costs a resolution of every word in it, and the credential check, which refuses
-# outright, has to read the word from all of them
-MAX_WORKING_DIRECTORIES = 64
-
-# The programs that change the shell's working directory, and the options that leave their
-# target the next word. `_check_cd` refuses any other option, and `pushd` has no opinion.
-DIRECTORY_CHANGERS = frozenset({"cd", "pushd"})
-DIRECTORY_CHANGER_OPTIONS = frozenset({"-L", "-P", "-e", "-@", "-n", "--"})
-
-
-def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[str]:
-    """The target of each `cd` and `pushd` in this segment, wherever it stands.
-
-    The first word after it that isn't one of its options, as `_check_cd` reads it. A word
-    `cd` that is no command, as in `echo cd x`, adds a target the shell never uses, which costs
-    a refusal at most. A command's output is `UNREAD_VALUE`. A wildcard the shell expands
-    refuses the command: it picks the directory, which can be a link out of the project, as
-    `cd k*` can.
-
-    Where the program spells no target, the shell picks it, and the target is `UNREAD_VALUE`:
-    `pushd -` goes to `$OLDPWD`, `pushd +1` and `pushd -0` to an entry of the directory stack,
-    and a bare `cd` to `$HOME`. So does a target `_tilde_expansion` doesn't read, as `pushd ~-`,
-    and one with a second operand: zsh's `cd old new` and `pushd old new` go to the working
-    directory with its first `old` replaced by `new`, which bash refuses.
-    """
-    targets = []
-    program = _program_index(words)
-    for index, word in enumerate(words):
-        if _expand(word, parts) not in DIRECTORY_CHANGERS:
-            continue
-        spelled = None
-        for position, following in enumerate(words[index + 1 :], start=index + 1):
-            target = _expand(following, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
-            if target in DIRECTORY_CHANGER_OPTIONS:
-                continue
-            if not target.startswith(("-", "+")):
-                if following.startswith("~"):
-                    target = _tilde_expansion(target) or UNREAD_VALUE
-                if _carries_live_glob(following):
-                    raise NotReadOnly(f"cd to a directory a wildcard picks: {target}")
-                if index != program or position == len(words) - 1:
-                    spelled = target
-            break
-        if spelled is not None:
-            targets.append(spelled)
-        elif index == program:
-            targets.append(UNREAD_VALUE)
-    return targets
-
-
-# The options that run a program in another directory, which it resolves a relative word from:
-# `git -C`, `make -C`, `tar -C` and `--directory`, `env -C` and `--chdir`
-DIRECTORY_OPTIONS = frozenset({"-C", "--directory", "--chdir"})
-
-
-def _program_directories(tokens: list[str], parts: list[tuple[str, str]]) -> list[str]:
-    """The directory each `DIRECTORY_OPTIONS` option in these tokens names.
-
-    Whatever program it belongs to: `grep -C 3` adds `3`, which costs a refusal at most.
-    """
-    directories = []
-    for index, token in enumerate(tokens):
-        word = _expand(token, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
-        name, equals, value = word.partition("=")
-        following = tokens[index + 1 : index + 2]
-        if equals and name in DIRECTORY_OPTIONS:
-            directories.append(value)
-        elif word.startswith("-C") and word != "-C":
-            directories.append(word[2:])
-        elif word in DIRECTORY_OPTIONS and following and not set(following[0]) <= PUNCTUATION_CHARS:
-            directories.append(_directory_word(following[0], parts))
-    return directories
-
-
-def _directory_word(token: str, parts: list[tuple[str, str]]) -> str:
-    """The directory ``token``, a word of its own, names for a program that changes to it.
-
-    A command's output, and a wildcard the shell expands, which picks the directory, are
-    `UNREAD_VALUE`. A leading `~` is read by `_tilde_word`. A variable stays as spelled, for
-    `_spellings`.
-    """
-    if _carries_live_glob(token):
-        return UNREAD_VALUE
-    text = _expand(token, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
-    return _tilde_word(text) if token.startswith("~") else text
-
-
-def _changed_directories(
-    directory: str, values: dict[str, list[str] | None], bases: list[str]
-) -> list[str]:
-    """Each directory a program that changes to ``directory`` may run in, from each of ``bases``.
-
-    ``directory`` is read as each of its `_spellings`, as a `cd` target is, so one the shell
-    supplies gives a directory below `UNREAD_VALUE`.
-    """
-    return [
-        _joined(base, spelled) for spelled in _spellings(directory, values, bases) for base in bases
-    ]
-
-
-# The most spellings of a word the credential check reads; past it, the variables still in it
-# are read as values it didn't read, which each of them could be anyway
-MAX_SPELLINGS = 64
-
-
-def _spellings(
-    word: str, values: dict[str, list[str] | None], bases: list[str], *, before: bool = True
-) -> list[str]:
-    """The texts this word can be, for the credential check.
-
-    `$HOME` is the home directory and `$PWD` each working directory. Any other variable is each
-    value `_known_values` read for it, and a value this module didn't read, `UNREAD_VALUE`, for
-    the one the shell had before; so is a name whose values are unread, every other expansion,
-    and a command's output.
-
-    Without ``before``, a variable `_known_values` read values for is those values alone, as
-    the read scope resolves it, `_resolve_variables`, and as `_check_cd` reads a `cd $d`.
-    """
-    texts = [word.replace(SUBSTITUTION_MARKER, UNREAD_VALUE)]
-    for _ in range(8):
-        expanded: list[str] = []
-        for text in texts:
-            match = TEXT_EXPANSION.search(text)
-            if match is None:
-                expanded.append(text)
-                continue
-            name = match.group(1) or match.group(2)
-            if name == "HOME":
-                choices = [_home()]
-            elif name == "PWD":
-                choices = bases
-            elif name:
-                known = values.get(name) or []
-                choices = [*known, UNREAD_VALUE] if before or not known else known
-            else:
-                choices = [UNREAD_VALUE]
-            expanded += [text[: match.start()] + choice + text[match.end() :] for choice in choices]
-        if len(expanded) > MAX_SPELLINGS or expanded == texts:
-            break
-        texts = expanded
-    return list(dict.fromkeys(TEXT_EXPANSION.sub(UNREAD_VALUE, text) for text in texts))
-
-
-class _ShellState:
-    """What the words of a command are read against.
-
-    ``bases`` are the directories the shell may be in, and ``shell_bases`` those and the ones
-    `CDPATH` may take it to, `_working_directories`; ``values`` are the ones its variables may
-    hold, as `_known_values` reads them; ``bindings`` how many times it binds each name,
-    `_bindings`, with the bindings of the commands around it; ``backgrounds`` whether the shell
-    may not wait for it, which ``curl`` reads: it runs a job behind `&`, or sits in a process
-    substitution or in a command that does. A substitution's body runs in the shell around it,
-    so it is read against that one's.
-    """
-
-    __slots__ = ("backgrounds", "bases", "bindings", "shell_bases", "values")
-
-    def __init__(
-        self,
-        bases: list[str],
-        shell_bases: list[str],
-        values: dict[str, list[str] | None],
-        bindings: dict[str, int],
-        *,
-        backgrounds: bool = False,
-    ) -> None:
-        self.bases = bases
-        self.shell_bases = shell_bases
-        self.values = values
-        self.bindings = bindings
-        self.backgrounds = backgrounds
-
-
-def _working_directories(
-    segments: list[list[str]],
-    parts: list[tuple[str, str]],
-    inherited: _ShellState | None,
-    values: dict[str, list[str] | None],
-) -> tuple[list[str], list[str]]:
-    """Every directory a relative word in this command may be resolved from, and with `CDPATH`.
-
-    The project and the session's working directory, or for a substitution's body the
-    directories of the command it sits in, then each `cd` or `pushd` target from each of those,
-    in turn: after `cd a && cd b`, `a`, `b` and `a/b` too. That is more than the shell uses,
-    since a `cd` in a pipeline or after `||` may never move it, and the read scope and the
-    credential check read a relative word from each, which costs a no-opinion or a refusal.
-    The second list adds the directories `CDPATH` may take the shell to, which only the
-    credential check reads.
-
-    A target is read as each of its `_spellings`, so one the shell supplies, such as `"$d"`,
-    gives a directory below `UNREAD_VALUE`, and so does a target the shell picks, as `pushd -`
-    does: `_unvouched_directory` vouches for neither, nor for any program run after it. For the
-    read scope a variable whose values the command sets is those values alone, as
-    `_resolve_variables` reads a path, so after `d=src; pushd $d` a relative word is placed in
-    `src`, and the credential check reads it from the value the shell had before too.
-
-    Both shells look a target up in each directory `CDPATH` lists first, unless it starts with
-    `/`, `./` or `../`. A startup file the hook can't read sets it, and the credential stores are
-    in the home directory, so for the credential check each such target is read from there too.
-    A directory that is in a store, as `cd .ssh` can be, refuses the command outright.
-    """
-    if inherited is not None:
-        bases, shell_bases = list(inherited.bases), list(inherited.shell_bases)
-    else:
-        bases = _session_bases()
-        shell_bases = list(bases)
-    for segment in segments:
-        for target in _directory_targets(segment, parts):
-            spellings = _spellings(target, values, shell_bases)
-            placed = _spellings(target, values, shell_bases, before=False)
-            bases = list(
-                dict.fromkeys(bases + [_joined(base, path) for path in placed for base in bases])
-            )
-            moved = [
-                _joined(base, path)
-                for path in spellings
-                for base in shell_bases + ([_home()] if _searches_cdpath(path) else [])
-            ]
-            added = [base for base in dict.fromkeys(moved) if base not in shell_bases]
-            if len(shell_bases) + len(added) > MAX_WORKING_DIRECTORIES:
-                raise NotReadOnly(f"more working directories than this module reads: {target}")
-            for base in added:
-                if UNREAD_VALUE not in base and _names_a_credential(
-                    base, tilde=False, bases=[], live_glob=False
-                ):
-                    raise NotReadOnly(f"cd into a credential store, through CDPATH: {target}")
-            shell_bases += added
-    return bases, shell_bases
-
-
-def _session_bases() -> list[str]:
-    """The directories a command starts in: the project, and the session's working directory."""
-    bases = [str(REPO_ROOT)]
-    if _SESSION_CWD and os.path.isabs(_SESSION_CWD) and bases[0] != _SESSION_CWD:
-        bases.append(_SESSION_CWD)
-    return bases
-
-
-def _unvouched_directory(bases: list[str], scope: _ReadScope) -> str | None:
-    """A directory the shell may move to that the read scope doesn't vouch for, or None.
-
-    A program reads where it runs with no operand to say so: `grep -r` with no file reads the
-    whole directory, and `git status` runs the `core.fsmonitor` of the repository it is in. So
-    every program after such a `cd` or `pushd` runs somewhere this module didn't read, as after
-    `pushd ~`, `pushd ..`, `pushd "$d"` and `pushd -`. The directories a command starts in are
-    the session's, which it doesn't judge.
-    """
-    session = _session_bases()
-    for base in bases:
-        if base not in session and (UNREAD_VALUE in base or not _in_scope(base, scope)):
-            return base.replace(UNREAD_VALUE, "$")
-    return None
-
-
-def _check_where_it_runs(unvouched: str | None) -> None:
-    """Leave a program to the rules where it may run in ``unvouched``, `_unvouched_directory`."""
-    if unvouched is not None:
-        raise NoOpinion(f"runs in a directory this module can't vouch for: {unvouched}")
-
-
-def _searches_cdpath(target: str) -> bool:
-    """Whether `cd` looks ``target`` up in `CDPATH`: unless it starts with `/`, `./` or `../`."""
-    return not target.startswith(("/", "./", "../", UNREAD_VALUE)) and target not in (".", "..")
-
-
-def _joined(base: str, path: str) -> str:
-    """``path`` from ``base``, normalized.
-
-    Not where it holds a value this module didn't read, whose `..` climbs out of the value
-    rather than cancel it.
-    """
-    joined = os.path.join(base, path)
-    return joined if UNREAD_VALUE in joined else os.path.normpath(joined)
-
-
-def _refuse_credential_paths(
-    reduced: str, parts: list[tuple[str, str]], state: _ShellState
-) -> None:
-    """Layer B: refuse the command if any word in it names a credential store.
-
-    Reads the reduced command, its redirections included, so a `< ~/.ssh/id_rsa` target is a
-    word here like any other. Every word of every segment is checked, whichever program it
-    belongs to, because the operator tier never sees what a word *opens*. A relative word is
-    read from each directory the shell may be in, `CDPATH` included, and each one a program's
-    `DIRECTORY_OPTIONS` names; and each word as each of its `_spellings`.
-
-    A wildcard the shell expands, followed by a `..`, can land anywhere, credential stores
-    included, and is refused for that. Only a live wildcard counts: a quoted one is the
-    program's pattern, as in `sed 's|.*/../||'`.
-    """
-    lines = [_tokenize(line) for line in reduced.split("\n")]
-    bases = list(state.shell_bases)
-    for tokens in lines:
-        for directory in _program_directories(tokens, parts):
-            bases += _changed_directories(directory, state.values, state.shell_bases)
-    bases = list(dict.fromkeys(bases))
-    if len(bases) > MAX_WORKING_DIRECTORIES:
-        raise NotReadOnly("more working directories than this module reads, with each -C")
-    for tokens in lines:
-        for token in tokens:
-            if set(token) <= PUNCTUATION_CHARS:
-                continue
-            word = _expand(token, parts)
-            live_glob = _carries_live_glob(token)
-            if live_glob and _glob_may_climb(word, dot_components=False):
-                raise NotReadOnly(f"a glob that climbs past its wildcard can land anywhere: {word}")
-            # A tilde is expanded only at the start of an unquoted word, so a quoted
-            # `'~/x'` is the literal path it spells. A placeholder start means quoted.
-            tilde = token.startswith("~") or bool(REDIRECTION_PREFIX.match(token))
-            for spelled in _spellings(word, state.values, state.shell_bases):
-                if _names_a_credential(spelled, tilde=tilde, bases=bases, live_glob=live_glob):
-                    raise NotReadOnly(f"names a credential store: {word}")
-
-
-class _ReadScope:
-    """Where a reader may read from, and what is known about the command's variables."""
-
-    __slots__ = (
-        "backgrounds",
-        "bases",
-        "git_runs",
-        "loop_values",
-        "roots",
-        "settings",
-        "spells_escape",
-        "splice_vars",
-    )
-
-    def __init__(
-        self,
-        roots: list[str],
-        bases: list[str],
-        splice_vars: dict[str, list[str]],
-        loop_values: dict[str, list[str]],
-        *,
-        spells_escape: bool = False,
-        settings: tuple[list[dict], bool] | None = None,
-        backgrounds: bool = False,
-    ) -> None:
-        self.roots = roots
-        self.bases = bases
-        self.splice_vars = splice_vars
-        self.loop_values = loop_values
-        # Whether any word of the command spells a terminal escape, which makes every value
-        # `echo` or `printf` expands one that may carry it; see `TERMINAL_CONTROL_BYTE`.
-        self.spells_escape = spells_escape
-        # What git said when asked, once per command however many git calls it makes; see
-        # `_run_git`
-        self.git_runs: dict[tuple[str, ...], tuple[int, str] | None] = {}
-        # The project's settings, which list the hosts `curl` may GET; see `_curl_sites`
-        self.settings = settings
-        # Whether the shell may not wait for the command, which `curl` may not be part of; see
-        # `_ShellState`
-        self.backgrounds = backgrounds
-
-
-def _in_scope(absolute: str, scope: _ReadScope) -> bool:
-    try:
-        return _in_scope_unguarded(absolute, scope)
-    except (OSError, ValueError):
-        return False  # a path that cannot be resolved is not one to vouch for
-
-
-def _in_scope_unguarded(absolute: str, scope: _ReadScope) -> bool:
-    normal = os.path.normpath(absolute)
-    if normal in DEVICE_READS:
-        return True
-    # The scratchpad holds a path as a root does, by the path: `absolute` is the text the program
-    # gets, which the callers have already expanded, so `<scratch>/HEAD~1` and `<scratch>/a b` are
-    # the files they name. `SCRATCH_COMPONENT`'s characters are for the redirection, which reads
-    # the command's own text. A directory below a value this module didn't read is none to place
-    # a path in: `UNREAD_VALUE`, #72.
-    scratch = _scratch_root()
-    if (
-        scratch is not None
-        and _is_under(normal, scratch)
-        and UNREAD_VALUE not in normal
-        and _resolves_into_scratch(absolute)
-    ):
-        return True
-    # Resolved as given, not as `normpath` reads it: the kernel resolves a link before the `..`
-    # after it, so `l/../x` is the `x` beside where `l` leads, and `realpath` does the same.
-    # The scratchpad's check above is given the path as it is for the same reason.
-    resolutions = _resolutions(absolute)
-    return all(
-        any(_is_under(normal, root) and _is_under(resolved, root) for root in scope.roots)
-        for resolved in resolutions
-    )
-
-
-VARIABLE_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
-
-
-def _resolve_variables(text: str, scope: _ReadScope) -> list[str] | None:
-    """Every text this word can become, or None when one reference cannot be resolved.
-
-    `$HOME`, a name assigned a literal value in this command, and a `for` variable whose list
-    is all literals are resolved; `${x%%:*}`, `$1`, a `read` variable and every other form
-    are not. The fan-out is capped, because a word built from three loop variables of twenty
-    values each is not something to enumerate on every Bash call.
-    """
-    texts = [text]
-    for _ in range(8):
-        if not any("$" in candidate for candidate in texts):
-            return texts
-        expanded: list[str] = []
-        for candidate in texts:
-            match = VARIABLE_REFERENCE.search(candidate)
-            if match is None:
-                return None  # a `$` in some other form
-            name = match.group(1) or match.group(2)
-            if name == "HOME":
-                values = [_home()]
-            elif name in scope.splice_vars:
-                values = [" ".join(scope.splice_vars[name])]
-            elif name in scope.loop_values:
-                values = scope.loop_values[name]
-            else:
-                return None
-            expanded.extend(
-                candidate[: match.start()] + value + candidate[match.end() :] for value in values
-            )
-        if len(expanded) > 64:
-            return None
-        texts = expanded
-    return None
-
-
-def _read_scope_problem(
-    token: str, text: str, parts: list[tuple[str, str]], scope: _ReadScope
-) -> str | None:
-    """Why a reader's file operand is not in scope, or None when it is."""
-    whole = PLACEHOLDER.fullmatch(token)
-    if whole is not None and parts[int(whole.group(1))][0] == PROCESS_SUBSTITUTION:
-        return None  # `<(...)`: a pipe whose body was classified, not a path on disk
-    if text == "-":
-        return None
-    if SUBSTITUTION_MARKER in text:
-        return "a path produced by a command"
-    if token.startswith("~"):
-        directory = _tilde_expansion(text)
-        if directory is None:
-            return f"a path in a directory the shell picks: {text}"
-        text = directory
-    candidates = _resolve_variables(text, scope)
-    if candidates is None:
-        return "a path this module cannot resolve"
-    for spelled in candidates:
-        candidate = _expand_home(spelled, tilde=False)
-        if _carries_live_glob(token):
-            if _glob_may_climb(candidate):
-                return f"a glob that may climb out of its directory: {candidate}"
-            # The directory the glob runs in: everything up to the last `/` before it.
-            head = PATH_SPECIAL.split(candidate, 1)[0]
-            candidate = head.rsplit("/", 1)[0] if "/" in head else "."
-        absolutes = (
-            [candidate]
-            if candidate.startswith("/")
-            else [os.path.join(base, candidate) for base in scope.bases]
-        )
-        for absolute in absolutes:
-            if not _in_scope(absolute, scope):
-                return f"outside the working directories: {candidate}"
-    return None
-
-
-# How each known reader takes its arguments.
-# - `pattern` is a first operand that is a pattern, script or filter rather than a file -- unless
-#   a flag in `script_flags` supplied it
-# - `values` take a following argument that is not a file
-# - `files` take a following argument that is a file
-# - `file_lists` take a file that names the files to read, which the command never shows, so no path
-#    is there to check: `sort --files0-from=list` prints whatever `list` names
-# - `pairs` take two, of which the second is a file when the flag is in `pair_files`
-# - `attached_values` take a value only when it is attached (`--color=auto`, `-w16`), so the word
-#   after one is not its value
-# - A flag missing from every set is treated as taking nothing, so its neighbour is checked as
-#   a file, and so is a value attached to it with `=`: a mistake in this table costs a prompt,
-#   never a skipped path
-# - `no_bundles` marks a program whose single-dash options are whole words (`xxd -cols`),
-#   not bundles of letters (`grep -rf`)
-READER_SPECS = {
-    "cat": {},
-    "tac": {"values": {"-s", "--separator"}},
-    "rev": {},
-    "head": {"values": {"-n", "-c", "--lines", "--bytes"}},
-    "tail": {"values": {"-n", "-c", "--lines", "--bytes", "-s", "--sleep-interval", "--pid"}},
-    "grep": {
-        "pattern": True,
-        "script_flags": {"-e", "--regexp", "-f", "--file"},
-        "values": {
-            "-e",
-            "--regexp",
-            "-m",
-            "--max-count",
-            "-A",
-            "-B",
-            "-C",
-            "--after-context",
-            "--before-context",
-            "--context",
-            "--include",
-            "--exclude",
-            "--exclude-dir",
-            "--label",
-            "-d",
-            "-D",
-            "--devices",
-            "--directories",
-            "--binary-files",
-            "--group-separator",
-        },
-        "attached_values": {"--color", "--colour"},
-        "files": {"-f", "--file", "--exclude-from"},
-    },
-    "sed": {
-        "pattern": True,
-        "script_flags": {"-e", "--expression", "-f", "--file"},
-        "values": {"-e", "--expression", "-l", "--line-length"},
-        "files": {"-f", "--file"},
-    },
-    "awk": {
-        "pattern": True,
-        "script_flags": {"-f", "--file"},
-        "values": {"-v", "-F", "--assign", "--field-separator"},
-        "files": {"-f", "--file"},
-    },
-    "jq": {
-        "pattern": True,
-        "script_flags": {"-f", "--from-file"},
-        "values": {"--indent"},
-        "files": {"-f", "--from-file", "-L"},
-        "pairs": {"--arg", "--argjson", "--slurpfile", "--rawfile"},
-        "pair_files": {"--slurpfile", "--rawfile"},
-        "positional_stop": {"--args", "--jsonargs"},
-    },
-    "wc": {"files": {"--files0-from"}, "file_lists": {"--files0-from"}},
-    "sort": {
-        "values": {
-            "-k",
-            "--key",
-            "-t",
-            "--field-separator",
-            "-S",
-            "--buffer-size",
-            "-T",
-            "--temporary-directory",
-            "--parallel",
-            "--batch-size",
-        },
-        "files": {"--files0-from"},
-        "file_lists": {"--files0-from"},
-    },
-    "uniq": {"values": {"-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"}},
-    "cut": {
-        "values": {
-            "-f",
-            "-d",
-            "-c",
-            "-b",
-            "--fields",
-            "--delimiter",
-            "--characters",
-            "--bytes",
-            "--output-delimiter",
-        }
-    },
-    "diff": {
-        "values": {
-            "-U",
-            "-C",
-            "--label",
-            "-I",
-            "--ignore-matching-lines",
-            "-x",
-            "--exclude",
-            "-W",
-            "--width",
-        },
-        "attached_values": {"--unified", "--context"},
-        "files": {"-X", "--exclude-from", "--from-file", "--to-file"},
-    },
-    "cmp": {"values": {"-i", "--ignore-initial", "-n", "--bytes"}},
-    "comm": {"values": {"--output-delimiter"}},
-    "join": {"values": {"-1", "-2", "-j", "-t", "-o", "-e"}},
-    "paste": {"values": {"-d", "--delimiters"}},
-    "nl": {"values": {"-b", "-d", "-f", "-h", "-i", "-l", "-n", "-s", "-v", "-w"}},
-    "od": {
-        "values": {
-            "-A",
-            "-j",
-            "-N",
-            "-t",
-            "--address-radix",
-            "--skip-bytes",
-            "--read-bytes",
-            "--format",
-        },
-        "attached_values": {"-w", "--width"},
-    },
-    "xxd": {
-        "values": {"-c", "-g", "-l", "-s", "-o", "-cols", "-len", "-seek"},
-        "no_bundles": True,
-    },
-    "base64": {"values": {"-w", "--wrap", "-b", "--break"}, "files": {"-i"}},
-    "md5sum": {},
-    "sha1sum": {},
-    "sha256sum": {},
-    "shasum": {"values": {"-a", "--algorithm"}},
-    "stat": {"values": {"-c", "--format", "--printf"}},
-    "file": {
-        "values": {"-F", "--separator", "-e", "--exclude", "-P", "--parameter"},
-        "files": {"-m", "--magic-file", "-f", "--files-from"},
-        "file_lists": {"-f", "--files-from"},
-    },
-    "du": {
-        "values": {
-            "-d",
-            "--max-depth",
-            "-B",
-            "--block-size",
-            "-t",
-            "--threshold",
-            "--exclude",
-            "--time-style",
-        },
-        "files": {"--files0-from", "-X", "--exclude-from"},
-        "file_lists": {"--files0-from"},
-    },
-    "ls": {
-        "values": {
-            "-I",
-            "--ignore",
-            "-w",
-            "--width",
-            "--format",
-            "--sort",
-            "--time",
-            "-T",
-            "--tabsize",
-            "--block-size",
-            "--hide",
-            "--indicator-style",
-            "--quoting-style",
-            "--time-style",
-        },
-        "attached_values": {"--color"},
-    },
-    "column": {
-        "values": {
-            "-s",
-            "-c",
-            "-o",
-            "-N",
-            "-R",
-            "-H",
-            "-W",
-            "--separator",
-            "--output-separator",
-            "--table-columns",
-        }
-    },
-    "date": {
-        "operands_are_not_files": True,
-        "values": {"-d", "--date", "--rfc-3339"},
-        "attached_values": {"-I", "--iso-8601"},
-        "files": {"-r", "--reference", "-f", "--file"},
-    },
-}
-READER_SPECS["egrep"] = READER_SPECS["fgrep"] = READER_SPECS["grep"]
-READER_SPECS["gawk"] = READER_SPECS["awk"]
-
-
-def _long_flag(name: str, listed: set[str], files: set[str]) -> str:
-    """The listed flag that the long option ``name`` stands for, or ``name`` itself.
-
-    ``getopt_long`` accepts any unambiguous prefix, so ``diff --from-f=X`` reads ``X`` as
-    ``--from-file=X`` does. A prefix of several listed flags is ambiguous, and the program
-    rejects it, but if one of them takes a file it is read as that one, so the path is checked
-    either way.
-    """
-    if name in listed:
-        return name
-    candidates = sorted(flag for flag in listed if flag.startswith(name))
-    for flag in candidates:
-        if flag in files:
-            return flag
-    return candidates[0] if len(candidates) == 1 else name
-
-
-def _short_flag(arg: str, takes_value: set[str], *, bundles: bool) -> tuple[str, int]:
-    """The flag in the single-dash word ``arg`` that takes a value, and where that value starts.
-
-    getopt reads ``-rfX`` as ``-r -f X``: the first letter that takes a value takes the rest of
-    the word, or the next word when nothing is left, so the start is 0 then. A word with no
-    such letter is a bundle of flags that take nothing, returned whole. Without ``bundles``
-    only the first letter is read: ``xxd -ps`` is one option, not ``-p -s``.
-    """
-    if arg in takes_value:
-        return arg, 0
-    for position in range(1, len(arg) if bundles else 2):
-        flag = "-" + arg[position]
-        if flag in takes_value:
-            rest = position + 1
-            return flag, rest if rest < len(arg) else 0
-    return arg, 0
-
-
-def _file_operands(
-    program: str, args: list[str], spec: dict | None = None
-) -> list[tuple[int, int]]:
-    """Where in `args` the words this reader will open as files are.
-
-    Each entry is an index into `args`, and where the path starts in that word: past
-    `--from-file=` or `-rf` when it is attached to its flag, 0 when the word is all path.
-    Raises `NoOpinion` for a flag in `file_lists`, whose files no word names. `spec` is the
-    reader's `READER_SPECS` entry, unless given.
-    """
-    spec = READER_SPECS[program] if spec is None else spec
-    values = spec.get("values", set())
-    attached_values = spec.get("attached_values", set())
-    files = spec.get("files", set())
-    file_lists = spec.get("file_lists", set())
-    pairs = spec.get("pairs", set())
-    pair_files = spec.get("pair_files", set())
-    script_flags = spec.get("script_flags", set())
-    stop_flags = spec.get("positional_stop", set())
-    operands_are_files = not spec.get("operands_are_not_files", False)
-    bundles = not spec.get("no_bundles", False)
-    listed = values | attached_values | files | pairs | script_flags | stop_flags
-
-    found: list[tuple[int, int]] = []
-    pattern_pending = bool(spec.get("pattern"))
-    positional_stop = False
-    options_done = False
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if not options_done and arg == "--":
-            options_done = True
-            index += 1
-            continue
-        if not options_done and arg.startswith("-") and arg != "-":
-            if arg.startswith("--"):
-                name, equals, _ = arg.partition("=")
-                flag = _long_flag(name, listed, files)
-                start = len(name) + 1 if equals else 0
-                if start and flag not in listed:
-                    found.append((index, start))  # a value attached to a flag the table lacks
-                    index += 1
-                    continue
-            else:
-                flag, start = _short_flag(arg, values | attached_values | files, bundles=bundles)
-            if flag in script_flags:
-                pattern_pending = False
-            if flag in stop_flags:
-                positional_stop = True
-            if flag in pairs:
-                if flag in pair_files and index + 2 < len(args):
-                    found.append((index + 2, 0))
-                index += 3
-                continue
-            if flag in file_lists:
-                raise NoOpinion(f"{program} {flag} reads the files another file names")
-            if flag in files:
-                if start:
-                    found.append((index, start))
-                    index += 1
-                else:
-                    if index + 1 < len(args):
-                        found.append((index + 1, 0))
-                    index += 2
-                continue
-            if flag in values and not start:
-                index += 2
-                continue
-            index += 1
-            continue
-        if pattern_pending:
-            pattern_pending = False
-        elif operands_are_files and not positional_stop:
-            found.append((index, 0))
-        index += 1
-    return found
-
-
-# The readers that follow a link they meet while they recurse, and so read wherever it leads
-# from a directory that is in scope: `grep -R x .` with `k -> ~/.ssh` in it prints the key (#63).
-# `grep -r`, `rg`, `find`, `ls -R` and `du` without these follow only a link the command line
-# names, which both layers resolve. Each with the spec its operands are read by, and:
-# - `short` and `long`: the flags that make it follow; a long one by any prefix of at least
-#   `long_prefix` letters, as getopt_long reads it
-# - `recursive`: the flags it needs as well, unless it always recurses
-# - `stop`: the long flags that stop it, `diff --no-dereference`
-# - `default`: whether no operand is the working directory
-# - `pattern_free`: the flags that leave no pattern operand, as `rg --files` does
-RG_SPEC = {
-    "pattern": True,
-    "script_flags": {"-e", "--regexp", "-f", "--file", "--files", "--type-list"},
-    "values": {
-        "-A",
-        "-B",
-        "-C",
-        "-E",
-        "-M",
-        "-T",
-        "-d",
-        "-e",
-        "-f",
-        "-g",
-        "-j",
-        "-m",
-        "-r",
-        "-t",
-        "--after-context",
-        "--before-context",
-        "--color",
-        "--colors",
-        "--context",
-        "--context-separator",
-        "--dfa-size-limit",
-        "--encoding",
-        "--engine",
-        "--field-context-separator",
-        "--field-match-separator",
-        "--file",
-        "--glob",
-        "--hostname-bin",
-        "--hyperlink-format",
-        "--iglob",
-        "--ignore-file",
-        "--max-columns",
-        "--max-count",
-        "--max-depth",
-        "--max-filesize",
-        "--path-separator",
-        "--pre",
-        "--pre-glob",
-        "--regex-size-limit",
-        "--regexp",
-        "--replace",
-        "--sort",
-        "--sortr",
-        "--threads",
-        "--type",
-        "--type-add",
-        "--type-clear",
-        "--type-not",
-    },
-}
-LINK_FOLLOWERS = {
-    "grep": {
-        "spec": READER_SPECS["grep"],
-        "short": "RS",  # `-S` is ugrep's, which Claude Code's `grep` runs: links to files
-        "long": ("--dereference-recursive", "--dereference-files"),
-        # `--der`: `--de` is ambiguous with `--devices` and `--directories`, `--der` is not
-        "long_prefix": 5,
-        "default": True,
-    },
-    "rg": {"spec": RG_SPEC, "short": "L", "long": ("--follow",), "default": True},
-    "diff": {
-        "spec": READER_SPECS["diff"],
-        "follows_by_default": True,
-        "stop": ("--no-dereference",),
-        "long_prefix": 5,
-    },
-    "find": {"short": "L", "default": True},
-    "ls": {
-        "spec": READER_SPECS["ls"],
-        "short": "L",
-        "long": ("--dereference",),
-        "recursive": ("R", "--recursive"),
-        "default": True,
-    },
-    "du": {"spec": READER_SPECS["du"], "short": "L", "long": ("--dereference",), "default": True},
-}
-for _name in ("egrep", "fgrep", "ugrep", "ug"):
-    LINK_FOLLOWERS[_name] = LINK_FOLLOWERS["grep"]
-
-# Programs that hand the program after them operands no word of the command spells: from the
-# input, or each file a search finds
-OPERANDS_FROM_ELSEWHERE = frozenset({"find", "parallel", "xargs"})
-
-# The most directory entries the walk for `LINK_FOLLOWERS` reads for one command. Past it, the
-# command is refused outright: a link it didn't reach could lead into a credential store, and
-# an operator's rule for the reader would approve it.
-MAX_WALKED_ENTRIES = 50000
-
-
-def _short_letters(word: str, values: set[str]) -> str:
-    """The flag letters a single-dash ``word`` sets, up to the first that takes a value."""
-    letters = ""
-    for letter in word[1:]:
-        letters += letter
-        if "-" + letter in values:
-            break
-    return letters
-
-
-def _follow_depth(program: str, args: list[str]) -> int | None:
-    """How deep the reader `program` follows the links in its directory operands.
-
-    None where it doesn't follow one, 0 where it follows them all the way down, and 1 where it
-    reads only a directory's own entries, as `diff` without `-r` does.
-    """
-    follower = LINK_FOLLOWERS[program]
-    spec = follower.get("spec", {})
-    values = spec.get("values", set()) | spec.get("files", set())
-    long_prefix = follower.get("long_prefix", 0)
-    follows = recursive = False
-    stopped = False
-    always_recursive = "recursive" not in follower and program != "diff"
-
-    def long_match(name: str, flags: tuple[str, ...]) -> bool:
-        return any(
-            name == flag or (long_prefix and len(name) >= long_prefix and flag.startswith(name))
-            for flag in flags
-        )
-
-    expression = False
-    for index, arg in enumerate(args):
-        if arg == "--":
-            break
-        if program == "find":
-            # Its options come before the paths; `-follow` is an expression anywhere after them
-            if arg == "-follow":
-                follows = True
-            elif not expression and arg.startswith("-") and arg not in ("-H", "-L", "-P"):
-                expression = True
-            elif not expression and arg == "-L":
-                follows = True
-            continue
-        if not arg.startswith("-") or arg == "-":
-            continue
-        if index and args[index - 1] in values:
-            continue  # the value of the flag before it
-        if arg.startswith("--"):
-            name = arg.partition("=")[0]
-            follows = follows or long_match(name, follower.get("long", ()))
-            stopped = stopped or long_match(name, follower.get("stop", ()))
-            recursive = recursive or long_match(name, follower.get("recursive", ("",))[1:])
-            if program == "diff":
-                recursive = recursive or long_match(name, ("--recursive",))
-        else:
-            letters = _short_letters(arg, values)
-            follows = follows or any(letter in letters for letter in follower.get("short", ""))
-            recursive = recursive or any(
-                letter in letters for letter in follower.get("recursive", ("",))[0]
-            )
-            if program == "diff":
-                recursive = recursive or "r" in letters
-    if program == "diff":
-        if stopped:
-            return None
-        return 0 if recursive else 1
-    if not follows or not (always_recursive or recursive):
-        return None
-    return 0
-
-
-def _follower_operands(program: str, args: list[str]) -> list[int]:
-    """The indexes in `args` of the directories a `LINK_FOLLOWERS` reader reads."""
-    if program == "find":
-        operands = []
-        for index, arg in enumerate(args):
-            if arg in ("-H", "-L", "-P"):
-                continue
-            if arg.startswith(("-", "(", "!")):
-                break
-            operands.append(index)
-        return operands
-    spec = LINK_FOLLOWERS[program].get("spec", {})
-    return [index for index, start in _file_operands(program, args, spec) if not start]
-
-
-def _followed_links(
-    program: str,
-    args: list[str],
-    tokens: list[str],
-    parts: list[tuple[str, str]],
-    bases: list[str],
-    values: dict[str, list[str] | None],
-    *,
-    operands_elsewhere: bool = False,
-) -> list[tuple[str, str]]:
-    """Each link a `LINK_FOLLOWERS` reader follows in its directory operands, and where it leads.
-
-    Each place it leads to is one of its `_resolutions`, and the links the command makes count,
-    `_PLANNED_LINKS`. An operand is each of its `_spellings`, with ``values`` as `_known_values`
-    reads them, and a wildcard the shell expands is each name it matches. An operand, or a
-    working directory, below a value this module didn't read is the residual a recursive read of
-    it is, as `grep -r x "$d"`: not walked. Raises `NotReadOnly` for operands that come from
-    elsewhere, as `xargs grep -R x` takes them, and for a walk past `MAX_WALKED_ENTRIES`.
-
-    The walk reads every entry, ignore files or not, and follows each link into where it leads
-    as the reader does, so a link in a directory outside the project is found too.
-    """
-    depth = _follow_depth(program, args)
-    if depth is None:
-        return []
-    if operands_elsewhere:
-        raise NotReadOnly(f"{program} follows links below directories no word of the command names")
-    indexes = _follower_operands(program, args)
-    directories: list[str] = []
-    for index in indexes:
-        token, text = tokens[index], args[index]
-        whole = PLACEHOLDER.fullmatch(token)
-        if whole is not None and parts[int(whole.group(1))][0] == PROCESS_SUBSTITUTION:
-            continue  # `<(...)`: a pipe, not a directory
-        if token.startswith("~"):
-            text = _tilde_word(text)
-        spellings = _spellings(text, values, bases, before=False)
-        if not _carries_live_glob(token):
-            directories += spellings
-            continue
-        # A wildcard is matched once the shell has put each value in place: `d=a/b; ... "$d"/*`
-        for spelled in spellings:
-            if UNREAD_VALUE in spelled:
-                directories.append(spelled)  # the residual: see the docstring
-                continue
-            if GLOB_FROM_ITS_DIRECTORY.search(spelled) and depth:
-                depth = 0  # the literal directory holds the matches at any depth
-            directories += _glob_matches(spelled, bases)
-    if not indexes and LINK_FOLLOWERS[program].get("default"):
-        directories.append(".")
-    roots: list[str] = []
-    for directory in directories:
-        for base in bases if not directory.startswith("/") else [""]:
-            if UNREAD_VALUE in base or UNREAD_VALUE in directory:
-                continue  # the residual: see the docstring
-            if directory in ("", "."):
-                roots.append(base)
-            else:
-                roots.append(os.path.join(base, directory) if base else directory)
-    return _walk_for_links(roots, depth)
-
-
-# A wildcard `_glob_matches` doesn't match by its parts: `**`, which zsh, and bash with
-# `globstar`, read as any depth, and zsh's `***`, which follows links as it recurses; a collating
-# element, `[[.ch.]]`, which can be several characters; and the operators of bash's `extglob` and
-# zsh's `EXTENDED_GLOB`, which a startup file can set, `[^...]` among them. Such a pattern is
-# walked from the directory its literal part names instead, which holds every name it matches:
-# the walk follows each link below it anyway.
-GLOB_FROM_ITS_DIRECTORY = re.compile(r"\*\*|\[\[\.|[()|#^<>]|(?<!^)~")
-
-# How many bytes of UTF-8 a character can take: in the C locale, `?` and `[...]` match one byte
-MAX_CHARACTER_BYTES = 4
-
-
-def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
-    """Each path a wildcard the shell expands may match, from each of ``bases``: more, never fewer.
-
-    Every reading a startup file can choose is taken at once, so that none is missed: dot files
-    match, as with `dotglob` or zsh's `GLOB_DOTS`; a name matches whatever its case, as with
-    `nocaseglob` or zsh's `NO_CASE_GLOB`, which reads a literal component that way too; and a run
-    of `?` and `[...]`, each a byte in the C locale, matches from a quarter as many characters to
-    as many. A set, `[[:alpha:]]` and `[!x]` included, is any one of them. A pattern
-    `GLOB_FROM_ITS_DIRECTORY` holds is its literal directory instead, which a recursive walk
-    covers. Past `MAX_WALKED_ENTRIES` names, `NotReadOnly`.
-    """
-    if GLOB_FROM_ITS_DIRECTORY.search(pattern):
-        head = PATH_SPECIAL.split(pattern, 1)[0]
-        return [head.rsplit("/", 1)[0] or "/" if "/" in head else "."]
-    components = [component for component in pattern.split("/") if component]
-    starts = ["/"] if pattern.startswith("/") else [b for b in bases if UNREAD_VALUE not in b]
-    matches: list[str] = []
-    for start in starts:
-        current = [start]
-        for index, component in enumerate(components):
-            regex = _glob_component_regex(component)
-            last = index == len(components) - 1
-            found: list[str] = []
-            for directory in current:
-                try:
-                    names = os.listdir(directory)
-                except (OSError, ValueError):
-                    names = []
-                if regex is None:
-                    chosen = [name for name in names if name.casefold() == component.casefold()]
-                    if component in (".", ".."):
-                        chosen.append(component)
-                else:
-                    chosen = [name for name in names if regex.fullmatch(name)]
-                    # bash before 5.2 matches `.` and `..` with a pattern that starts with `.`
-                    if component.startswith("."):
-                        chosen += [name for name in (".", "..") if regex.fullmatch(name)]
-                for name in dict.fromkeys(chosen):
-                    path = os.path.join(directory, name)
-                    if last or os.path.isdir(path):
-                        found.append(path)
-                if len(found) + len(matches) > MAX_WALKED_ENTRIES:
-                    raise NotReadOnly(
-                        f"a wildcard that matches more than {MAX_WALKED_ENTRIES} names"
-                    )
-            current = found
-        matches += current
-    return matches
-
-
-def _glob_component_regex(component: str) -> re.Pattern[str] | None:
-    """The names one component of a wildcard may match, as `_glob_matches` reads them.
-
-    None for a component with no wildcard.
-    """
-    parts: list[str] = []
-    singles = 0
-    wildcard = False
-
-    def flush() -> None:
-        nonlocal singles
-        if singles:
-            parts.append(f".{{{-(-singles // MAX_CHARACTER_BYTES)},{singles}}}")
-            singles = 0
-
-    index = 0
-    while index < len(component):
-        character = component[index]
-        if character == "*":
-            flush()
-            parts.append(".*")
-            wildcard = True
-            index += 1
-        elif character == "?":
-            singles += 1
-            wildcard = True
-            index += 1
-        elif character == "[":
-            end = _bracket_end(component, index)
-            singles += 1  # a set is one character; an unmatched `[` is the character itself
-            wildcard = True
-            index = index + 1 if end is None else end + 1
-        else:
-            flush()
-            parts.append(re.escape(character))
-            index += 1
-    flush()
-    if not wildcard:
-        return None
-    return re.compile("".join(parts), re.DOTALL | re.IGNORECASE)
-
-
-def _bracket_end(text: str, start: int) -> int | None:
-    """The index of the `]` that ends the set opening at ``start``, or None for a literal `[`.
-
-    A `]` right after the `[`, or after its `!` or `^`, is a member, and so is each `[:...:]`
-    and `[=...=]` class whole.
-    """
-    index = start + 1
-    if index < len(text) and text[index] in "!^":
-        index += 1
-    if index < len(text) and text[index] == "]":
-        index += 1
-    while index < len(text):
-        if text[index] == "]":
-            return index
-        if text.startswith(("[:", "[="), index):
-            close = text.find(text[index + 1] + "]", index + 2)
-            if close < 0:
-                return None
-            index = close + 2
-            continue
-        index += 1
-    return None
-
-
-# The walks `_walk_for_links` made for the command being classified, by roots, depth and the
-# links the command makes: Layer B and Layer A each ask, and `_classify` may read a command more
-# than once. Reset by `_classify`.
-_WALKS: dict[tuple, list[tuple[str, str]]] = {}
-
-
-def _walk_for_links(roots: list[str], depth: int) -> list[tuple[str, str]]:
-    """`_followed_links`' walk, from each of ``roots``, to ``depth`` levels, or all with 0.
-
-    A root is each of its `_resolutions`, so one an `ln` in the command makes, or one whose
-    path goes through a link, is walked where it leads, and reported as a link to there.
-    """
-    key = (
-        tuple(roots),
-        depth,
-        tuple(sorted((link, tuple(sorted(targets))) for link, targets in _PLANNED_LINKS.items())),
-    )
-    if key not in _WALKS:
-        _WALKS[key] = _walk_for_links_uncached(roots, depth)
-    return _WALKS[key]
-
-
-def _walk_for_links_uncached(roots: list[str], depth: int) -> list[tuple[str, str]]:
-    """`_walk_for_links`, without the cache.
-
-    Each directory is listed where it resolves, and its entries are named below the path the walk
-    came by, so that a link is reported by a path the read scope places as the shell does: one in
-    a scratchpad under macOS's `/tmp -> /private/tmp` is in the scratchpad. A directory is listed
-    once, by where it resolves.
-    """
-    found: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    count = 0
-    stack: list[tuple[str, int]] = []
-    for root in roots:
-        try:
-            resolutions = _resolutions(root)
-        except (OSError, ValueError):
-            raise NotReadOnly(f"a directory this module can't resolve: {root}") from None
-        found += [
-            (root, resolved) for resolved in resolutions if resolved != os.path.normpath(root)
-        ]
-        stack.append((root, 1))
-    while stack:
-        directory, level = stack.pop()
-        try:
-            reals = _resolutions(directory)
-        except (OSError, ValueError):
-            raise NotReadOnly(f"a directory this module can't resolve: {directory}") from None
-        entries: list[tuple[str, bool, bool]] = []
-        for real in reals:
-            if real in seen or not os.path.isdir(real):
-                continue
-            seen.add(real)
-            try:
-                with os.scandir(real) as listing:
-                    entries += [
-                        (
-                            os.path.join(directory, entry.name),
-                            entry.is_symlink(),
-                            entry.is_dir(follow_symlinks=False),
-                        )
-                        for entry in listing
-                    ]
-            except (OSError, ValueError):
-                continue  # what the walk can't list, the reader can't either
-            entries += [
-                (os.path.join(directory, os.path.basename(key)), True, False)
-                for key in _PLANNED_LINKS
-                if os.path.dirname(key) == real
-            ]
-        count += len(entries)
-        if count > MAX_WALKED_ENTRIES:
-            raise NotReadOnly(
-                f"a read that follows links below more than {MAX_WALKED_ENTRIES} entries"
-            )
-        deeper = depth == 0 or level < depth
-        for path, is_link, is_directory in entries:
-            if is_link:
-                try:
-                    targets = _resolutions(path)
-                except (OSError, ValueError):
-                    raise NotReadOnly(f"a link this module can't resolve: {path}") from None
-                found += [(path, target) for target in targets]
-            if (is_link or is_directory) and deeper:
-                stack.append((path, level + 1))
-    return found
-
-
-def _refuse_followed_credential_links(
-    segments: list[list[str]], parts: list[tuple[str, str]], state: _ShellState
-) -> None:
-    """Layer B, for the links a reader follows while it recurses.
-
-    Refuses the command outright if one leads into a credential store, or to a directory that
-    holds one, as `~` does.
-
-    Every segment, whatever tier approves it: under `Bash(grep *)`, `grep -R x .` reads `~/.ssh`
-    through `k -> ~`, and no word names it. The reader is the program, or any word after one
-    that runs another, `RUNS_ANOTHER_PROGRAM`. A reader behind a program that gives it operands
-    of its own, as `xargs grep -R x` is, is refused: no word names what it reads.
-    """
-    stores = [os.path.realpath(store) for store in _credential_roots()]
-    for segment in segments:
-        start = _command_index(segment, refuse=False)
-        if start is None:
-            continue
-        tokens = segment[start:]
-        words = [_expand(token, parts) for token in tokens]
-        # The program, or any word after one that runs another, as `timeout 5 grep -R` does
-        wrapper = os.path.basename(words[0]) if words else ""
-        runs_another = wrapper in RUNS_ANOTHER_PROGRAM or wrapper in OPERANDS_FROM_ELSEWHERE
-        for index, word in enumerate(words if runs_another else words[:1]):
-            program = os.path.basename(word)
-            if program not in LINK_FOLLOWERS:
-                continue
-            elsewhere = index > 0 and wrapper in OPERANDS_FROM_ELSEWHERE
-            links = _followed_links(
-                program,
-                words[index + 1 :],
-                tokens[index + 1 :],
-                parts,
-                state.shell_bases,
-                state.values,
-                operands_elsewhere=elsewhere,
-            )
-            for link, target in links:
-                if _names_a_credential(target, tilde=False, bases=[], live_glob=False) or any(
-                    _is_under(store, target) for store in stores
-                ):
-                    raise NotReadOnly(
-                        f"{program} follows the link {link} to a credential store: {target}"
-                    )
-
-
-def _scratch_directory() -> str | None:
-    """This session's scratch directory, as a pattern; `None` when there is none.
-
-    The payload's `scratchpad_dir`, exactly: another session's scratchpad is no more in reach
-    than any other directory, since a session that could write into one could rewrite a script
-    that session is about to run. Without a `scratchpad_dir`, or with one `SCRATCH_DIRECTORY`
-    does not match, there is none.
-
-    Built per call rather than at import, from `_SCRATCHPAD_DIR`, which `main` sets per call.
-    `re.compile` caches, so the patterns built from it cost nothing after the first.
-    """
-    directory = _scratch_root()
-    return None if directory is None else re.escape(directory)
-
-
-def _scratch_root() -> str | None:
-    """This session's scratch directory, as the path `_scratch_directory` matches."""
-    if _SCRATCHPAD_DIR is None:
-        return None
-    directory = _SCRATCHPAD_DIR.rstrip("/")
-    if SCRATCH_DIRECTORY.fullmatch(directory) is None:
-        return None
-    # A scratchpad whose own path is a link takes in wherever the link leads, as one an earlier
-    # command replaced with `ln -s ~` would (#79). A link above it, as macOS's `/tmp` is, is not
-    # its own path.
-    try:
-        if S_ISLNK(os.lstat(directory).st_mode):
-            return None
-    except FileNotFoundError:
-        pass
-    except (OSError, ValueError):
-        return None
-    return directory
-
-
-def _scratch_redirect() -> re.Pattern[str] | None:
-    """The redirection shape that writes into this session's scratch directory.
-
-    The group ``target`` is the path written.
-    """
-    directory = _scratch_directory()
-    if directory is None:
-        return None
-    path = directory + SCRATCH_COMPONENT + "+"
-    return re.compile(r"(?<![^\s;|&(])&?>>?\s*(?P<target>" + path + r")(?=[\s;|&)]|$)")
-
-
-def _resolves_into_scratch(path: str) -> bool:
-    """Whether ``path`` is under this session's scratch directory once each link is resolved.
-
-    ``path`` is under it by its text, and a link in the scratch directory leads wherever it
-    points: ``<scratch>/home-link/`` may be the home directory. The scratch directory is
-    resolved too, since its own path may go through a link, as ``/tmp`` does on macOS.
-    ``realpath`` resolves the part of the path that exists, so a file a redirection is about to
-    create is placed by the links in the directories above it. ``path`` is to be given as the
-    program gets it, not normalized: a link resolves before the ``..`` after it.
-    """
-    root = _scratch_root()
-    if root is None:
-        return False
-    try:
-        resolved_root = os.path.realpath(root)
-        return all(_is_under(resolved, resolved_root) for resolved in _resolutions(path))
-    except (OSError, ValueError):
-        return False  # a path that cannot be resolved is not one to vouch for
-
-
-# The links one `ln` makes, and all of a command's, past which it is one this module doesn't
-# read: each is a branch of every path resolved through it
-MAX_PLANNED_LINKS = 32
-
-# The most places one path can lead to through the planned links, and the most links one
-# resolution follows, as the kernel's own limit on a path is 40
-MAX_RESOLUTIONS = 64
-MAX_LINK_HOPS = 40
-
-# `ln`'s options, GNU's and BSD's: those that take nothing, and those that take the next word
-LN_FLAG_LETTERS = frozenset("bdfFhiLnPrsTvw")
-LN_VALUE_LETTERS = frozenset("St")
-LN_LONG_FLAGS = frozenset(
-    {
-        "--backup",
-        "--directory",
-        "--force",
-        "--interactive",
-        "--logical",
-        "--no-dereference",
-        "--no-target-directory",
-        "--physical",
-        "--relative",
-        "--symbolic",
-        "--verbose",
-    }
-)
-LN_LONG_VALUES = frozenset({"--suffix", "--target-directory"})
-
-# Programs that run the program their words name, `ln` among them, where its operands are not
-# words this module reads in order: from the input, as `xargs ln`, or among others, as
-# `find -exec ln`
-RUNS_ANOTHER_PROGRAM = frozenset(
-    {
-        "busybox",
-        "command",
-        "doas",
-        "env",
-        "exec",
-        "find",
-        "nice",
-        "nohup",
-        "setsid",
-        "stdbuf",
-        "sudo",
-        "time",
-        "timeout",
-        "xargs",
-    }
-)
-
-
-def _resolutions(path: str) -> set[str]:
-    """Where ``path`` leads, through the links on disk and those the command makes.
-
-    `os.path.realpath`, when the command makes none. Otherwise each planned link is taken and
-    not taken, since an `ln` may fail and leave what was there, and each target it may have, so
-    a path through one is each place it may be once the command has run. A branch that follows
-    more than `MAX_LINK_HOPS` links is a loop, through which the kernel opens nothing. Raises
-    `OSError` past `MAX_RESOLUTIONS`, which each caller reads as a path it can't place.
-    """
-    if not _PLANNED_LINKS:
-        return {os.path.realpath(path)}
-    if not os.path.isabs(path):
-        path = os.path.join(os.getcwd(), path)
-    found: set[str] = {os.path.realpath(path)}
-    _resolve_planned("/", path.split("/"), 0, found)
-    return found
-
-
-def _resolve_planned(resolved: str, pending: list[str], hops: int, found: set[str]) -> None:
-    """`_resolutions`, from ``resolved``, a directory with no link in it, with ``pending`` left.
-
-    As the kernel resolves: a link before the `..` after it, and a relative target from the
-    directory that holds the link.
-    """
-    while pending:
-        component, pending = pending[0], pending[1:]
-        if component in ("", "."):
-            continue
-        if component == "..":
-            resolved = os.path.dirname(resolved)
-            continue
-        candidate = os.path.join(resolved, component)
-        if hops >= MAX_LINK_HOPS:
-            return  # the kernel's `ELOOP`: no file is opened through it
-        for target in _PLANNED_LINKS.get(candidate, ()):
-            _resolve_planned("/", target.split("/") + pending, hops + 1, found)
-        if os.path.islink(candidate):
-            target = os.readlink(candidate)
-            start = "/" if target.startswith("/") else resolved
-            _resolve_planned(start, target.split("/") + pending, hops + 1, found)
-            return
-        resolved = candidate
-    found.add(resolved)
-    if len(found) > MAX_RESOLUTIONS:
-        raise OSError("too many places one path can lead")
-
-
-def _record_planned_links(
-    segments: list[list[str]], parts: list[tuple[str, str]], bases: list[str]
-) -> None:
-    """Add to `_PLANNED_LINKS` each link an `ln` in these segments makes, from each of ``bases``.
-
-    An `ln` whose operands this module can't place, or one that another program runs, as
-    `xargs ln` does, leaves the command to the user: no rule approves a read through a link it
-    can't see. Other programs make links too, `tar x`, `unzip`, `cp -s` and `git worktree add`
-    among them; they are the gap `AGENTS.md`'s threat model names.
-    """
-    for segment in segments:
-        start = _command_index(segment, refuse=False)
-        if start is None:
-            continue
-        words = segment[start:]
-        if not words:
-            continue
-        program = os.path.basename(_expand(words[0], parts))
-        if program in RUNS_ANOTHER_PROGRAM and any(
-            os.path.basename(_expand(word, parts)) == "ln" for word in words[1:]
-        ):
-            raise NotReadOnly(f"{program} runs ln, which makes a link this module can't place")
-        if program != "ln":
-            continue
-        for key, target in _ln_links(words[1:], parts, bases):
-            _PLANNED_LINKS.setdefault(key, set()).add(target)
-    if sum(len(targets) for targets in _PLANNED_LINKS.values()) > MAX_PLANNED_LINKS:
-        raise NotReadOnly("more links than this module reads")
-
-
-def _ln_links(
-    tokens: list[str], parts: list[tuple[str, str]], bases: list[str]
-) -> list[tuple[str, str]]:
-    """Each link these `ln` arguments make, as the path it will be at and the one it leads to.
-
-    Read from each of ``bases``. Its forms: `ln T` makes `./basename(T)`, `ln T... DIR` and
-    `ln -t DIR T...` make `DIR/basename(T)`, and `ln -T T L` makes `L`. `ln T L` makes `L`, or
-    `L/basename(T)` when `L` is a directory, and both are read. A symbolic link leads where its
-    text does from the directory that holds it, or with `-r` where `T` does from the working
-    directory, as a hard link does. A hard link of a symbolic link is a copy of that link with
-    `-P`, GNU's default, whose text then leads from the new link's directory, and of where it
-    leads with `-L`, BSD's: without either, both are read.
-    """
-    symbolic = relative = no_target_directory = logical = physical = False
-    directory: str | None = None
-    operands: list[str] = []
-    words = [_ln_word(token, parts) for token in tokens]
-    index = 0
-    options = True
-    while index < len(words):
-        word = words[index]
-        index += 1
-        if options and word == "--":
-            options = False
-        elif options and word.startswith("--"):
-            name, equals, value = word.partition("=")
-            if name in LN_LONG_VALUES:
-                if not equals:
-                    if index >= len(words):
-                        raise NotReadOnly(f"ln option without its value: {word}")
-                    value, index = words[index], index + 1
-                if name == "--target-directory":
-                    directory = value
-            elif name == "--backup" or (name in LN_LONG_FLAGS and not equals):
-                symbolic = symbolic or name == "--symbolic"
-                relative = relative or name == "--relative"
-                no_target_directory = no_target_directory or name == "--no-target-directory"
-                logical = logical or name == "--logical"
-                physical = physical or name == "--physical"
-            else:
-                raise NotReadOnly(f"ln option this module doesn't read: {word}")
-        elif options and word.startswith("-") and word != "-":
-            for position, letter in enumerate(word[1:], start=1):
-                if letter in LN_VALUE_LETTERS:
-                    value = word[position + 1 :]
-                    if not value:
-                        if index >= len(words):
-                            raise NotReadOnly(f"ln option without its value: {word}")
-                        value, index = words[index], index + 1
-                    if letter == "t":
-                        directory = value
-                    break
-                if letter not in LN_FLAG_LETTERS:
-                    raise NotReadOnly(f"ln option this module doesn't read: {word}")
-                symbolic = symbolic or letter == "s"
-                relative = relative or letter == "r"
-                no_target_directory = no_target_directory or letter == "T"
-                logical = logical or letter == "L"
-                physical = physical or letter == "P"
-        else:
-            operands.append(word)
-    if not operands:
-        return []
-    places: list[tuple[str, str]] = []  # (where the link goes, what it is made from)
-    if directory is not None:
-        places = [(os.path.join(directory, os.path.basename(t.rstrip("/"))), t) for t in operands]
-    elif len(operands) == 1:
-        places = [(os.path.basename(operands[0].rstrip("/")) or ".", operands[0])]
-    elif len(operands) == 2 and no_target_directory:
-        places = [(operands[1], operands[0])]
-    elif len(operands) == 2:
-        made_from, name = operands
-        places = [
-            (name, made_from),
-            (os.path.join(name, os.path.basename(made_from.rstrip("/"))), made_from),
-        ]
-    else:
-        *sources, last = operands
-        places = [(os.path.join(last, os.path.basename(t.rstrip("/"))), t) for t in sources]
-    links: list[tuple[str, str]] = []
-    for base in bases:
-        for place, made_from in places:
-            parent, name = os.path.split(os.path.join(base, place).rstrip("/"))
-            if name in ("", ".", ".."):
-                continue  # a directory's own entry, which `ln` fails to replace
-            for resolved_parent in _resolutions(parent or "/"):
-                key = os.path.join(resolved_parent, name)
-                if symbolic and not relative:
-                    links.append((key, os.path.join(resolved_parent, made_from)))
-                elif symbolic:
-                    links.append((key, os.path.join(base, made_from)))
-                else:
-                    targets = _hard_link_targets(
-                        os.path.join(base, made_from),
-                        resolved_parent,
-                        logical=logical,
-                        physical=physical,
-                    )
-                    links += [(key, target) for target in targets]
-    if len(links) > MAX_PLANNED_LINKS:
-        raise NotReadOnly("more links than this module reads")
-    return links
-
-
-def _hard_link_targets(source: str, parent: str, *, logical: bool, physical: bool) -> list[str]:
-    """Where a hard link of ``source``, made in ``parent``, leads; see `_ln_links`.
-
-    A source that is a link this command makes is one whose text this module didn't keep, so
-    `NotReadOnly` unless `-L` makes the hard link of where it leads.
-    """
-    directory, name = os.path.split(source)
-    planned = any(
-        os.path.join(resolved, name) in _PLANNED_LINKS for resolved in _resolutions(directory)
-    )
-    if planned and not (logical and not physical):
-        raise NotReadOnly(f"ln hard-links a link this command makes: {source}")
-    targets = []
-    if os.path.islink(source) and not (logical and not physical):
-        text = os.readlink(source)
-        targets.append(text if text.startswith("/") else os.path.join(parent, text))
-    if not os.path.islink(source) or not (physical and not logical):
-        targets.append(source)
-    return targets
-
-
-def _ln_word(token: str, parts: list[tuple[str, str]]) -> str:
-    """An `ln` argument as the program gets it, or `NotReadOnly` for one the shell decides."""
-    if _word_the_shell_builds(token, parts):
-        raise NotReadOnly(f"ln given a word the shell builds: {_expand(token, parts)}")
-    word = _expand(token, parts)
-    if token.startswith("~"):
-        word = _tilde_word(word)
-    if UNREAD_VALUE in word:
-        raise NotReadOnly(f"ln given a directory the shell picks: {token}")
-    return word
-
-
-def _zsh_equals_expansion(token: str, parts: list[tuple[str, str]]) -> bool:
-    """Whether zsh replaces part of this word with the path of a command, `=ls` with `/usr/bin/ls`.
-
-    zsh does so for an unquoted `=` that starts a word and has more after it, and in an
-    assignment's value for one that starts the value or follows a `:`, as in `x==ls` and
-    `x=a:=ls`. With `magic_equal_subst`, which a startup file can set, every word with a `=` is
-    read as an assignment is, as `--file==ls` is. A quoted part or an expansion can supply the
-    `:`, or nothing at all: `x=a':'=ls` and `p=; x=$p=ls` each expand. A `=` on its own, as in
-    `test a = b`, is left as it is. ``token`` is a reduced word, so a quoted `=` is in ``parts``,
-    and expands nothing.
-    """
-    if token.startswith("=") and len(token) > 1:
-        return True
-    _, equals, value = token.partition("=")
-    if not equals:
-        return False
-    for index, char in enumerate(value):
-        if char != "=":
-            continue
-        before = _expand(value[:index], parts).rpartition(":")[2]
-        if not before or "$" in before or SUBSTITUTION_MARKER in before:
-            return True
-    return False
-
-
-def _input_target(target: str, parts: list[tuple[str, str]]) -> str | None:
-    """The file ``< target`` reads, when the operator wrote it out, not the shell; else None.
-
-    The pseudo-device check in ``_classify`` reads literal text, so a target assembled at
-    runtime -- ``"$x$y"``, ``"/dev/"'tcp/h/80'``, a glob -- is exactly what it cannot see.
-    Such a target, a relative one with a ``..``, and one below a directory the shell picks, as
-    ``~-/x``, is left in place for ``_segments`` to refuse as an unaccounted ``<``. Whether
-    the file is in the working directories is `_check_input_targets`'s, once they are known.
-    """
-    if re.search(r"[$*?\[\]{}`\\]", PLACEHOLDER.sub("", target)):
-        return None
-    for index in PLACEHOLDER.findall(target):
-        kind, value = parts[int(index)]
-        if kind == SUBSTITUTION or (kind == DOUBLE_QUOTED and "$" in value):
-            return None
-    expanded = PLACEHOLDER.sub(lambda match: parts[int(match.group(1))][1], target)
-    if NETWORK_DEVICE.search(expanded) is not None:
-        return None
-    if target.startswith("~"):
-        directory = _tilde_expansion(expanded)
-        if directory is None:
-            return None
-        expanded = directory
-    if not expanded.startswith("/") and ".." in Path(expanded).parts:
-        return None
-    return expanded
-
-
-def _check_input_targets(targets: list[str], scope: _ReadScope) -> None:
-    """Refuse the command where a file a ``<`` reads, `_input_target`, is outside ``scope``.
-
-    The read scope applies to ``<`` as it does to an operand: an absolute file is measured as
-    it is, and a relative one from each directory the shell may be in, through the links on
-    disk, so ``sub/out/x`` is outside where ``sub/out`` leads out (#77). A directory below a
-    value this module didn't read is none to place it in. Refused outright, as a target left
-    in place is: an allow rule matches the command with the redirection stripped.
-    """
-    for target in targets:
-        paths = (
-            [target]
-            if target.startswith("/")
-            else [os.path.join(base, target) for base in scope.bases]
-        )
-        for path in paths:
-            if UNREAD_VALUE in path or not _in_scope(path, scope):
-                raise NotReadOnly(f"< reads outside the working directories: {target}")
-
+# --------------------------------------------------------------------------------------
+# Classification: a whole command
+# --------------------------------------------------------------------------------------
 
 # How many times `_classify` reads a command again for the links it found it makes
 MAX_LINK_PASSES = 3
@@ -7239,6 +7463,11 @@ def is_read_only(command: str) -> bool:
     except RecursionError:
         return False
     return True
+
+
+# --------------------------------------------------------------------------------------
+# The hook's entry point
+# --------------------------------------------------------------------------------------
 
 
 def _project_root(cwd: str | None) -> Path | None:
