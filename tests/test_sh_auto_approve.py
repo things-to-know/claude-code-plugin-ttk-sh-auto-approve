@@ -6032,13 +6032,15 @@ class RefusesADotDotAfterALinkOut(Verdicts, unittest.TestCase):
 
     `cd` reads such a target two ways: `cd -L`, the default, drops `l/..` as `normpath` does,
     and `cd -P`, or a startup file's `set -P` or zsh's `chase_dots`, climbs from where `l`
-    leads. A target has to stay in the project under both.
+    leads. A target has to stay in the project under both, from each directory the shell may be
+    in: `_check_cd` measures one from the project root only. A program that changes to a
+    directory, as `git -C` does, does it through the kernel, and reads its operands from there.
 
     A project of its own beside `outside`: `sub/l` leads to `outside/ssl`, beside
-    `outside/hostname`, and `sub/m` to the project's `docs`. Each refusal sits beside the same
-    command through `m`, which stays in the project either way. Under bash 5.2.37 and zsh 5.9,
-    `cat sub/l/../hostname` printed `outside/hostname`, `cd sub/l/..` landed in `sub`, and
-    `cd -P sub/l/..` in `outside`.
+    `outside/hostname`, and `sub/m` and `sub/a/n` to the project's `docs`. Each refusal sits
+    beside the same command through `m` or `n`, which stays in the project either way. Under bash
+    5.2.37 and zsh 5.9, `cat sub/l/../hostname` printed `outside/hostname`, `cd sub/l/..` landed
+    in `sub`, and `cd -P sub/l/..` in `outside`.
     """
 
     @contextlib.contextmanager
@@ -6046,13 +6048,14 @@ class RefusesADotDotAfterALinkOut(Verdicts, unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="readonly_hook_dotdot_") as directory:
             top = Path(os.path.realpath(directory))
             project, outside = top / "project", top / "outside"
-            (project / "sub").mkdir(parents=True)
+            (project / "sub" / "a").mkdir(parents=True)
             (project / "docs").mkdir()
             (project / "README.md").write_text("x\n")
             (outside / "ssl").mkdir(parents=True)
             (outside / "hostname").write_text("x\n")
             (project / "sub" / "l").symlink_to(outside / "ssl")
             (project / "sub" / "m").symlink_to(project / "docs")
+            (project / "sub" / "a" / "n").symlink_to(project / "docs")
             with (
                 unittest.mock.patch.object(hook, "REPO_ROOT", project),
                 unittest.mock.patch.object(hook, "_SESSION_CWD", None),
@@ -6083,6 +6086,31 @@ class RefusesADotDotAfterALinkOut(Verdicts, unittest.TestCase):
                 with self.subTest(refused=refused):
                     self.assert_refused_outright(refused, "lands outside the project")
                     self.assert_allowed(control, "stays inside it")
+
+    def test_a_cd_from_a_working_directory_below_the_project(self):
+        """From `sub`, `./l/..` is `outside` to `cd -P`, but `_check_cd` measures it from the
+        project root, where it stays inside. bash 5.2.37 with `set -P`, and zsh 5.9 (`-f`) with
+        `chase_links` or `chase_dots`, took a plain `cd ./l/..` to `outside` as well."""
+        with (
+            self._project() as project,
+            unittest.mock.patch.object(hook, "_SESSION_CWD", str(project / "sub")),
+        ):
+            for refused, control in (
+                ("cd ./l/.. && ls", "cd ./m/.. && ls"),
+                ("cd -P ./l/.. && grep -r x .", "cd -P ./m/.. && grep -r x ."),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_no_opinion(refused, "may land outside the project")
+                    self.assert_allowed(control, "stays inside it")
+
+    def test_a_directory_a_program_changes_to(self):
+        """`git -C sub/a/n/..` runs in the project, the parent of `docs`, where `n` leads, and
+        reads `../outside/hostname` from there; `normpath` placed it from `sub/a`, inside."""
+        with self._project():
+            self.assert_no_opinion(
+                "git -C sub/a/n/.. diff --no-index ../outside/hostname x", "outside the project"
+            )
+            self.assert_allowed("git -C sub/a/n/.. diff --no-index README.md x", "the control")
 
 
 # ======================================================================================

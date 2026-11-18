@@ -5565,10 +5565,13 @@ def _changed_directories(
     """Each directory a program that changes to ``directory`` may run in, from each of ``bases``.
 
     ``directory`` is read as each of its `_spellings`, as a `cd` target is, so one the shell
-    supplies gives a directory below `UNREAD_VALUE`.
+    supplies gives a directory below `UNREAD_VALUE`. The program changes to it through the
+    kernel, which climbs a `..` after a link from where the link leads: `_joined_physically`.
     """
     return [
-        _joined(base, spelled) for spelled in _spellings(directory, values, bases) for base in bases
+        _joined_physically(base, spelled)
+        for spelled in _spellings(directory, values, bases)
+        for base in bases
     ]
 
 
@@ -5668,6 +5671,9 @@ def _working_directories(
     `_resolve_variables` reads a path, so after `d=src; pushd $d` a relative word is placed in
     `src`, and the credential check reads it from the value the shell had before too.
 
+    A target with a `..` after a link is placed both ways from each base, `_placements`:
+    `_check_cd` reads it both ways too, but only from the project root.
+
     Both shells look a target up in each directory `CDPATH` lists first, unless it starts with
     `/`, `./` or `../`. A startup file the hook can't read sets it, and the credential stores are
     in the home directory, so for the credential check each such target is read from there too.
@@ -5682,13 +5688,12 @@ def _working_directories(
         for target in _directory_targets(segment, parts):
             spellings = _spellings(target, values, shell_bases)
             placed = _spellings(target, values, shell_bases, before=False)
-            bases = list(
-                dict.fromkeys(bases + [_joined(base, path) for path in placed for base in bases])
-            )
+            bases = _and_moved(bases, placed)
             moved = [
-                _joined(base, path)
+                placement
                 for path in spellings
                 for base in shell_bases + ([_home()] if _searches_cdpath(path) else [])
+                for placement in _placements(base, path)
             ]
             added = [base for base in dict.fromkeys(moved) if base not in shell_bases]
             if len(shell_bases) + len(added) > MAX_WORKING_DIRECTORIES:
@@ -5700,6 +5705,24 @@ def _working_directories(
                     raise NotReadOnly(f"cd into a credential store, through CDPATH: {target}")
             shell_bases += added
     return bases, shell_bases
+
+
+def _and_moved(bases: list[str], placed: list[str]) -> list[str]:
+    """``bases``, and each of them joined to each path a `cd` target is placed at, once each."""
+    moved = [
+        placement for path in placed for base in bases for placement in _placements(base, path)
+    ]
+    return list(dict.fromkeys(bases + moved))
+
+
+def _placements(base: str, path: str) -> list[str]:
+    """Where a `cd` to ``path`` from ``base`` may land: both readings of a `..` after a link.
+
+    `cd -L`, the default, drops the link's own name, as `_joined` does. `cd -P`, or a startup
+    file's `set -P` or zsh's `chase_links` or `chase_dots`, climbs from where the link leads, as
+    the kernel does: `_joined_physically`.
+    """
+    return list(dict.fromkeys([_joined(base, path), _joined_physically(base, path)]))
 
 
 def _session_bases() -> list[str]:
@@ -5745,6 +5768,26 @@ def _joined(base: str, path: str) -> str:
     """
     joined = os.path.join(base, path)
     return joined if UNREAD_VALUE in joined else os.path.normpath(joined)
+
+
+def _joined_physically(base: str, path: str) -> str:
+    """``path`` from ``base``, where the kernel lands.
+
+    As `_joined` puts it, unless a `..` there follows a link, which the kernel climbs from where
+    the link leads, as `_resolutions` does. Such a path is left as given, for each reader to
+    resolve as the kernel does: `_in_scope` reads it both ways, and git, given it as ``-C``,
+    lands where the kernel does. Where both readings land in the same place, `_joined`'s
+    spelling is the one kept.
+    """
+    joined = os.path.join(base, path)
+    normal = _joined(base, path)
+    if UNREAD_VALUE in joined or ".." not in joined.split(os.sep):
+        return normal
+    try:
+        apart = _resolutions(joined) != _resolutions(normal)
+    except OSError:
+        apart = True  # more links the command makes than this module follows
+    return joined if apart else normal
 
 
 def _refuse_credential_paths(
