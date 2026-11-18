@@ -27,9 +27,10 @@ A verdict depends on where the session stands, so the context is passed in, neve
   takes no scratchpad from, as it takes none from a payload's of that shape, gets the same
   verdicts, and a warning on stderr
 - ``--settings``: the settings files to read the allow and deny rules,
-  ``additionalDirectories`` and the ``WebFetch`` rules that list the sites for ``curl`` from,
-  instead of the project's own; ``--no-rules`` reads none. The ``WebFetch`` deny and ask rules of
-  the user's and the managed settings, which take sites off that list, are read either way
+  ``additionalDirectories``, the ``Read()`` rules that widen the read scope and the ``WebFetch``
+  rules that list the sites for ``curl`` from, instead of the project's own; ``--no-rules`` reads
+  none. The ``Read()`` and ``WebFetch`` deny and ask rules of the user's and the managed
+  settings, which withhold a read or a site, are read either way
 - ``--setting-sources``: the setting sources the session loaded, as Claude Code's flag of that
   name lists them; by default every one, as in a session started without it. The hook takes
   the allow rules and ``additionalDirectories`` of the project's own files only from the

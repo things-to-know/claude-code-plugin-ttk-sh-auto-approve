@@ -60,8 +60,9 @@ from a command that prompted in a real session.
           RefusesWordsAnExpansionSupplies
      8  Redirection, sockets, and egress
           RefusesDescriptorAndSocketRedirection, RefusesRedirectionAttachedToACompound,
-          RefusesReadsOutsideTheWorkingDirectories, ResolvesThroughALinkTheCommandMakes,
-          RefusesALinkARecursiveReadFollows, RefusesACredentialStoreAWildcardOrABaseReaches,
+          RefusesReadsOutsideTheWorkingDirectories, ReadsWhereAReadRuleAllows,
+          ResolvesThroughALinkTheCommandMakes, RefusesALinkARecursiveReadFollows,
+          RefusesACredentialStoreAWildcardOrABaseReaches,
           ReadsAValueOnlyWhereTheShellHoldsIt, RefusesAScratchPathThroughALinkOut,
           RefusesEgressThroughAnApprovedProgram
      9  Program identity, environment, and session state
@@ -4943,6 +4944,793 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
                 self.assert_allowed(command)
 
 
+def read_rule(path, suffix: str = "") -> str:
+    """A `Read()` rule for the absolute `path`, in its `//<path>` form, with `suffix` after it."""
+    return f"Read(/{path}{suffix})"
+
+
+@contextlib.contextmanager
+def read_layout(*, user=None, managed=None):
+    """A scratch directory laid out for `Read()` rules. Yields its real path.
+
+    - `home/`, which `HOME` names, with `.claude/settings.json` holding `user`, a `permissions`
+      object, when one is given; `CLAUDE_CONFIG_DIR` is unset
+    - `managed/`, where the managed settings are read from, with `managed-settings.json` holding
+      `managed`, a whole document, when one is given
+    - `tmp/other/` and `tmp/sibling/`, each holding `a.txt`, `b.txt` and `repo/`, a linked
+      worktree of the repository `trusted/main`, whose git directory holds its config; and in
+      `tmp/other/`, `foreign/`, a repository whose config is its own
+    - `trusted/`, which a test lists in `additionalDirectories` where git is to trust that config
+
+    Each repository is made of files alone. The rules themselves go in the project's file, with
+    `operator_rules`.
+    """
+    root = Path(os.path.realpath(tempfile.mkdtemp(prefix="readonly_hook_read_rules_")))
+    try:
+        (root / "home" / ".claude").mkdir(parents=True)
+        (root / "managed").mkdir()
+        common = git_directory_at(root / "trusted" / "main" / ".git")
+        for name in ("other", "sibling"):
+            directory = root / "tmp" / name
+            (directory / "repo").mkdir(parents=True)
+            linked = common / "worktrees" / name
+            linked.mkdir(parents=True)
+            (linked / "HEAD").write_text("ref: refs/heads/main\n")
+            (linked / "commondir").write_text("../..\n")
+            (linked / "gitdir").write_text(f"{directory / 'repo' / '.git'}\n")
+            (directory / "repo" / ".git").write_text(f"gitdir: {linked}\n")
+            (directory / "a.txt").write_text("x\n")
+            (directory / "b.txt").write_text("x\n")
+        git_directory_at(root / "tmp" / "other" / "foreign" / ".git")
+        if user is not None:
+            settings = root / "home" / ".claude" / "settings.json"
+            settings.write_text(json.dumps({"permissions": user}))
+        if managed is not None:
+            (root / "managed" / "managed-settings.json").write_text(json.dumps(managed))
+        with (
+            unittest.mock.patch.dict(os.environ, {"HOME": str(root / "home")}),
+            unittest.mock.patch.object(
+                hook, "_managed_settings_dir", return_value=str(root / "managed")
+            ),
+        ):
+            os.environ.pop(hook.CONFIG_DIR_ENV, None)
+            yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+class ReadsWhereAReadRuleAllows(Verdicts, unittest.TestCase):
+    """#114: a `Read()` allow rule of the project's settings files grants Claude Code's own file
+    tools a read, and the hook left the same read through Bash to a prompt: `cat`, `grep` or
+    `git -C` in another session's scratchpad, or under `~/.claude/plugins`.
+
+    `Read(//<dir>/**)` and `Read(~/<dir>/**)` now add the directory to the read scope, as an
+    `additionalDirectories` entry does and with its exclusions, and `Read(//<file>)` that file
+    alone. A `Read()` deny or ask rule from any settings file withholds what it matches, and, from
+    a directory, what it matches below it. git, which runs what its repository's config names, is
+    vouched for under a grant only where that config is in the roots. Each approval sits beside
+    the refusal that shows where it stops, and each setup that grants nothing beside a control it
+    does grant.
+
+    In `read_layout`'s directory: `<tmp>/other` is the directory a rule names, and `<tmp>/sibling`
+    the one beside it; `TRUSTED` the directory listed where git is to run in their `repo`.
+    """
+
+    TRUSTED = "trusted"
+
+    def test_a_rule_over_a_directory(self):
+        with read_layout() as root:
+            tmp = root / "tmp"
+            pairs = (
+                (f"cat {tmp}/other/a.txt", f"cat {tmp}/sibling/a.txt"),
+                (f"grep -r x {tmp}/other", f"grep -r x {tmp}"),
+                (f"git -C {tmp}/other/repo log -1", f"git -C {tmp}/sibling/repo log -1"),
+                (f"ls {tmp}/other", f"cat {tmp}/other/../sibling/a.txt"),
+            )
+            for approved, _ in pairs:
+                with self.subTest(approved=approved, rule=False):
+                    self.assert_no_opinion(approved, "the control: no rule")
+            self.assert_refused(f"wc -l < {tmp}/other/a.txt", "the control: no rule")
+            with operator_rules(
+                allow=[read_rule(tmp / "other", "/**")],
+                additional_directories=[str(root / self.TRUSTED)],
+            ):
+                for approved, refused in pairs:
+                    with self.subTest(approved=approved):
+                        self.assert_allowed(approved, "inside the directory the rule names")
+                        self.assert_no_opinion(refused, "outside it")
+                # A `<` target out of scope is refused outright, as a `cd` out of the project is
+                self.assert_allowed(f"wc -l < {tmp}/other/a.txt", "a `<` inside it")
+                self.assert_refused(f"wc -l < {tmp}/sibling/a.txt", "a `<` outside it")
+                self.assert_refused(f"cd {tmp}/other && cat a.txt", "a `cd` out of the project")
+                self.assert_refused(f"git -C {tmp}/other/repo push", "a write, wherever it points")
+
+    def test_a_rule_from_the_home_directory(self):
+        with read_layout() as root:
+            tool = root / "home" / ".cache" / "tool"
+            tool.mkdir(parents=True)
+            (tool / "x.json").write_text("{}\n")
+            (tool.parent / "y.json").write_text("{}\n")
+            with operator_rules(allow=["Read(~/.cache/tool/**)"]):
+                self.assert_allowed("cat ~/.cache/tool/x.json")
+                self.assert_allowed("ls ~/.cache/tool")
+                self.assert_no_opinion("cat ~/.cache/y.json", "beside the directory")
+                self.assert_no_opinion("ls ~/.cache", "its parent")
+
+    def test_a_rule_written_through_a_link(self):
+        """The directory a rule names and its real path are one directory, as `/tmp` and
+        `/private/tmp` are on macOS. A link inside it that leads out is not covered, as Claude
+        Code applies an allow rule, and neither is a recursive read that follows one."""
+        with read_layout() as root:
+            tmp = root / "tmp"
+            (tmp / "alias").symlink_to(tmp / "other")
+            with operator_rules(allow=[read_rule(tmp / "alias", "/**")]):
+                self.assert_allowed(f"cat {tmp}/alias/a.txt", "the path the rule names")
+                self.assert_allowed(f"cat {tmp}/other/a.txt", "its real path")
+                self.assert_no_opinion(f"cat {tmp}/sibling/a.txt", "the control: beside it")
+                self.assert_allowed(f"grep -R x {tmp}/other", "the control: no link inside")
+                (tmp / "other" / "out").symlink_to(tmp / "sibling")
+                self.assert_no_opinion(f"cat {tmp}/other/out/a.txt", "through a link out")
+                self.assert_no_opinion(f"grep -R x {tmp}/other", "follows the link out")
+                self.assert_allowed(f"grep -r x {tmp}/other", "doesn't follow it")
+
+    def test_a_rule_over_one_file(self):
+        """A rule that names a path with no `/**` covers that file alone: not the files beside
+        it, not the directory, and not a path that is a directory or a link."""
+        with read_layout() as root:
+            other = root / "tmp" / "other"
+            (other / "l").symlink_to(other / "a.txt")
+            (other / "a.txt ").write_text("x\n")
+            with operator_rules(allow=[read_rule(other / "a.txt")]):
+                self.assert_allowed(f"cat {other}/a.txt")
+                self.assert_allowed(f"head -n 1 {other}/a.txt")
+                for command in (
+                    f"cat {other}/b.txt",
+                    f"ls {other}",
+                    f"grep -r x {other}",
+                    f"git -C {other}/repo log -1",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_no_opinion(command, "not the file the rule names")
+            for rule, command in (
+                (read_rule(other), f"grep -r x {other}"),
+                (read_rule(other), f"cat {other}/a.txt"),
+                (read_rule(other / "l"), f"cat {other}/l"),
+                # Claude Code may trim the space, and grant the `a.txt` beside it
+                (read_rule(other / "a.txt "), f"cat '{other}/a.txt '"),
+            ):
+                with self.subTest(rule=rule, command=command), operator_rules(allow=[rule]):
+                    self.assert_no_opinion(command, "a directory, a link, or a space at its end")
+
+    def test_a_rule_this_reads_as_no_grant(self):
+        """Any other wildcard is left to Claude Code, a path relative to the project or the
+        working directory is in scope already, and a path that isn't normal or is spelled with
+        whitespace at an end, a control character, a backslash, a bracket or a brace names
+        nothing here. So does a bare `Read`, a rule for another tool, and one that reaches the
+        whole disk or the home directory."""
+        with read_layout() as root:
+            tmp = root / "tmp"
+            command = f"cat {tmp}/other/a.txt"
+            with operator_rules(allow=[read_rule(tmp / "other", "/**")]):
+                self.assert_allowed(command, "the control: the rule as it should be")
+            for rule in (
+                read_rule(tmp / "other", "/*"),
+                read_rule(tmp, "/*/a.txt"),
+                read_rule(tmp, "/**/a.txt"),
+                read_rule(tmp, "/oth?r/**"),
+                read_rule(tmp, "/other/[ab].txt"),
+                read_rule(tmp, "/{other,sibling}/**"),
+                read_rule(tmp, "/other\\/**"),
+                read_rule(tmp, "/other/../other/**"),
+                read_rule(tmp, "/./other/**"),
+                read_rule(tmp, "//other/**"),
+                read_rule(tmp, "/other/"),
+                read_rule(tmp, "/other /**"),
+                read_rule(tmp, "/other\t/**"),
+                read_rule(tmp, "/other/** "),
+                f"Read( /{tmp}/other/**)",
+                f"Read({tmp}/other/**)",  # one slash: from the project's root
+                f"Read(~/{tmp}/other/**)",  # `~/` and then an absolute path
+                "Read(other/**)",
+                "Read(./other/**)",
+                "Read",
+                "Read(*)",
+                "Read(**)",
+                "Read(//**)",
+                "Read(~/**)",
+                f"Edit(/{tmp}/other/**)",
+                f"read(/{tmp}/other/**)",
+            ):
+                with self.subTest(rule=rule), operator_rules(allow=[rule]):
+                    self.assert_no_opinion(command, "the rule grants nothing here")
+
+    def test_a_deny_or_ask_rule_withholds_what_it_matches(self):
+        """From a granted directory, a deny or ask rule of the project withholds a file it
+        matches, and a directory read that would read it. A negated allow rule, `Read(!...)`,
+        withholds too: Claude Code's docs define the negation only for deny and ask rules, and the
+        hook reads it broadly. Patterns are read broadly: case is ignored, and composition, a
+        trailing `/` dropped, and a rule written through a link withholds the real path."""
+        with read_layout() as root:
+            tmp = root / "tmp"
+            (tmp / "link").symlink_to(tmp / "other")
+            grant = read_rule(tmp / "other", "/**")
+            withholding = (
+                read_rule(tmp, "/other/a.txt"),
+                read_rule(tmp, "/other/a.*"),
+                read_rule(tmp, "/other/a?txt"),
+                read_rule(tmp, "/other/a.txt*"),
+                read_rule(tmp, "/other/a?t*t*"),
+                read_rule(tmp, "/*/a.txt"),
+                read_rule(tmp, "/**/a.txt"),
+                "Read(//**/a.txt)",
+                read_rule(tmp, "/other/a.txt/"),
+                read_rule(str(tmp).upper(), "/OTHER/A.TXT"),
+                read_rule(tmp, "/link/a.txt"),
+                f" Read( /{tmp}/other/a.txt )",
+            )
+            for key in ("deny", "ask"):
+                for rule in withholding:
+                    with (
+                        self.subTest(key=key, rule=rule),
+                        operator_rules(
+                            allow=[grant],
+                            additional_directories=[str(root / self.TRUSTED)],
+                            **{key: [rule]},
+                        ),
+                    ):
+                        self.assert_allowed(f"cat {tmp}/other/b.txt", "the control: beside it")
+                        self.assert_allowed(f"git -C {tmp}/other/repo log -1", "the control")
+                        self.assert_no_opinion(f"cat {tmp}/other/a.txt", "the rule matches it")
+                        self.assert_no_opinion(f"grep -r x {tmp}/other", "it reads a.txt")
+                        self.assert_refused(f"wc -l < {tmp}/other/a.txt", "a `<` of it")
+            with operator_rules(allow=[grant, f"Read(!/{tmp}/other/a.txt)"]):
+                self.assert_allowed(f"cat {tmp}/other/b.txt", "the control")
+                self.assert_no_opinion(f"cat {tmp}/other/a.txt", "a negated allow rule")
+            composed, decomposed = "caf\u00e9.txt", "cafe\u0301.txt"
+            with operator_rules(allow=[grant], deny=[read_rule(tmp, f"/other/{composed}")]):
+                self.assert_allowed(f"cat {tmp}/other/b.txt", "the control")
+                self.assert_no_opinion(f"cat {tmp}/other/{decomposed}", "one file to macOS's APFS")
+
+    def test_a_rule_that_withholds_the_whole_directory_or_nothing_of_it(self):
+        with read_layout() as root:
+            tmp = root / "tmp"
+            grant = read_rule(tmp / "other", "/**")
+            for rule in (
+                read_rule(tmp / "other"),
+                read_rule(tmp / "other", "/**"),
+                read_rule(tmp, "/**"),
+                read_rule(tmp, "/other/[x].txt"),  # a bracket is read as any name
+                read_rule(tmp, "/other/{x,y}.txt"),  # and so is a brace
+                read_rule(tmp, "/other/../x"),
+                "Read",
+                "Read()",
+                "Read(*)",
+                "Read(//)",
+            ):
+                with self.subTest(rule=rule), operator_rules(allow=[grant], deny=[rule]):
+                    self.assert_no_opinion(f"cat {tmp}/other/b.txt", "withheld")
+            for rule in (
+                read_rule(tmp / "sibling", "/**"),
+                read_rule(tmp, "/other/b.txt/x"),
+                "Read(a.txt)",  # below the project or the working directory
+                "Read(./**/a.txt)",
+                "Read(/a.txt)",  # from the project's root
+                "Read(~)",  # the home directory, which holds neither
+                "Edit(//**)",
+                "WebFetch",
+            ):
+                with self.subTest(rule=rule), operator_rules(allow=[grant], deny=[rule]):
+                    self.assert_allowed(f"cat {tmp}/other/a.txt", "the rule matches nothing here")
+
+    def test_a_relative_rule_below_the_working_directory(self):
+        """A relative pattern is read from the session's working directory as well as the
+        project's, at any depth, as Claude Code reads one in a deny rule."""
+        with read_layout() as root:
+            other = root / "tmp" / "other"
+            with operator_rules(allow=[read_rule(other, "/**")], deny=["Read(./a.txt)"]):
+                self.assert_allowed(f"cat {other}/a.txt", "the control: the project's a.txt")
+                with unittest.mock.patch.object(hook, "_SESSION_CWD", str(other)):
+                    self.assert_allowed(f"cat {other}/b.txt", "the control")
+                    self.assert_no_opinion(f"cat {other}/a.txt", "the working directory's")
+                with unittest.mock.patch.object(hook, "_SESSION_CWD", str(root / "tmp")):
+                    self.assert_no_opinion(f"cat {other}/a.txt", "at any depth below it")
+
+    def test_a_deny_rule_that_may_match_below_a_directory(self):
+        """A read of a directory reads what is below it, so the directory is withheld where a
+        rule matches anything there: `Read(//**/.env)`, as the README suggests, withholds a
+        recursive read of a directory holding a `.env`, and not one of a directory that holds
+        none. Read from the disk, as the links below a directory are, with a link an `ln` in the
+        command makes, and past `MAX_WALKED_ENTRIES` entries withheld."""
+        with read_layout() as root:
+            other = root / "tmp" / "other"
+            grant = read_rule(other, "/**")
+            with operator_rules(
+                allow=[grant, "Bash(ln *)"],
+                deny=["Read(//**/.env)"],
+                additional_directories=[str(other.parent.parent / self.TRUSTED)],
+            ):
+                for command in (
+                    f"grep -r x {other}",
+                    f"git -C {other}/repo log -1",
+                    f"ls {other}/repo",
+                    f"ln -s a.txt {other}/c && grep -r x {other}",
+                ):
+                    with self.subTest(command=command, env=False):
+                        self.assert_allowed(command, "no .env below it")
+                self.assert_no_opinion(
+                    f"ln -s a.txt {other}/.env && grep -r x {other}", "the ln makes a .env"
+                )
+                with unittest.mock.patch.object(hook, "MAX_WALKED_ENTRIES", 3):
+                    self.assert_no_opinion(f"grep -r x {other}", "more entries than it walks")
+                (other / "repo" / ".env").write_text("TOKEN=x\n")
+                self.assert_allowed(f"cat {other}/a.txt", "the control: a file beside it")
+                self.assert_allowed(f"ls {other}/repo/.git", "the control: no .env below it")
+                for command in (
+                    f"grep -r x {other}",
+                    f"git -C {other}/repo log -1",
+                    f"ls {other}/repo",
+                    f"cat {other}/repo/.env",
+                ):
+                    with self.subTest(command=command, env=True):
+                        self.assert_no_opinion(command, "it reads the .env")
+                with unittest.mock.patch.object(hook, "_SESSION_CWD", str(other / "repo")):
+                    self.assert_no_opinion("grep -r x .", "from the session's directory")
+
+    def test_a_rule_in_any_settings_file_withholds(self):
+        """Claude Code applies a deny or ask rule from every settings file, so the user's and
+        the managed ones withhold too. A user's `/<path>` is anchored at their config
+        directory."""
+        with read_layout() as root:
+            tmp = root / "tmp"
+            grant = read_rule(tmp / "other", "/**")
+            deny = {"deny": [read_rule(tmp, "/other/a.txt")]}
+            ask = {"ask": [read_rule(tmp, "/other/a.txt")]}
+            for where, user, managed in (
+                ("user deny", deny, None),
+                ("user ask", ask, None),
+                ("managed deny", None, {"permissions": deny}),
+                ("user negation", {"allow": [f"Read(!/{tmp}/other/a.txt)"]}, None),
+            ):
+                user_file = root / "home" / ".claude" / "settings.json"
+                managed_file = root / "managed" / "managed-settings.json"
+                with self.subTest(where=where), operator_rules(allow=[grant]):
+                    try:
+                        if user is not None:
+                            user_file.write_text(json.dumps({"permissions": user}))
+                        if managed is not None:
+                            managed_file.write_text(json.dumps(managed))
+                        self.assert_allowed(f"cat {tmp}/other/b.txt", "the control")
+                        self.assert_no_opinion(f"cat {tmp}/other/a.txt", where)
+                    finally:
+                        user_file.unlink(missing_ok=True)
+                        managed_file.unlink(missing_ok=True)
+            drop_ins = root / "managed" / "managed-settings.d"
+            drop_ins.mkdir()
+            (drop_ins / "x.json").write_text(json.dumps({"permissions": deny}))
+            with operator_rules(allow=[grant]):
+                self.assert_allowed(f"cat {tmp}/other/b.txt", "the control")
+                self.assert_no_opinion(f"cat {tmp}/other/a.txt", "a managed drop-in")
+
+        with read_layout(user={"deny": ["Read(/plugins/secret.json)"]}) as root:
+            plugins = root / "home" / ".claude" / "plugins"
+            plugins.mkdir()
+            for name in ("secret.json", "ok.json"):
+                (plugins / name).write_text("{}\n")
+            with operator_rules(allow=["Read(~/.claude/plugins/**)"]):
+                self.assert_allowed("cat ~/.claude/plugins/ok.json", "the control")
+                self.assert_no_opinion("cat ~/.claude/plugins/secret.json", "anchored at ~/.claude")
+
+    def test_nothing_is_granted_while_a_rule_cant_be_read(self):
+        """What a file that cannot be read would withhold is unknown, so nothing is granted;
+        nor while managed settings make Claude Code ignore the project's rules."""
+        with read_layout() as root:
+            tmp = root / "tmp"
+            command = f"cat {tmp}/other/a.txt"
+            user = root / "home" / ".claude" / "settings.json"
+            managed = root / "managed" / "managed-settings.json"
+            with operator_rules(allow=[read_rule(tmp / "other", "/**")]) as path:
+                self.assert_allowed(command, "the control")
+                for file, content, why in (
+                    (user, "{", "the user's file is no JSON"),
+                    (user, '{"permissions": []}', "its permissions are no object"),
+                    (user, '{"permissions": {"deny": "Read"}}', "its deny list is no list"),
+                    (managed, "{", "the managed file is no JSON"),
+                    (managed, '{"allowManagedPermissionRulesOnly": true}', "managed rules only"),
+                    (
+                        managed,
+                        '{"permissions": {"allowManagedPermissionRulesOnly": true}}',
+                        "managed rules only, in permissions",
+                    ),
+                ):
+                    with self.subTest(why=why):
+                        try:
+                            file.write_text(content)
+                            self.assert_no_opinion(command, why)
+                        finally:
+                            file.unlink(missing_ok=True)
+                self.assert_allowed(command, "the control, once more")
+                unreadable = Path(path).with_name("settings.json")
+                unreadable.write_text("{")
+                with settings_at(f"{path}{os.pathsep}{unreadable}"):
+                    self.assert_no_opinion(command, "a project file that cannot be read")
+
+    def test_no_rule_reaches_a_credential_store(self):
+        """Each rule as an `additionalDirectories` entry is read: none over the home directory,
+        `/proc`, a credential store or the directory holding one. Layer B refuses a word naming
+        a store, but not a word naming its parent, so `grep -r token ~/.config` is refused only
+        because `Read(~/.config/**)` grants nothing. The control shows the rules are read."""
+        with read_layout() as root:
+            home = root / "home"
+            tops = sorted({entry.split("/")[0] for entry in hook.CREDENTIAL_HOME_PATHS})
+            for top in tops:
+                (home / top).mkdir(exist_ok=True)
+            (home / ".config" / "app").mkdir()
+            (home / ".ssh" / "id_rsa").write_text("not a key\n")
+            rules = (
+                [f"Read(~/{top}/**)" for top in tops]
+                + [f"Read(~/{entry})" for entry in hook.CREDENTIAL_HOME_PATHS]
+                + [read_rule(home, "/**"), "Read(//proc/**)", "Read(//proc/self/status)"]
+                + ["Read(//etc/**)", "Read(~/.config/app/**)"]
+            )
+            with operator_rules(allow=rules):
+                self.assert_allowed("cat ~/.config/app/settings.toml", "a rule over no store")
+                for top in tops:
+                    with self.subTest(top=top):
+                        self.assert_refused(f"grep -r token ~/{top}", "reads every store under it")
+                for entry in hook.CREDENTIAL_HOME_PATHS:
+                    with self.subTest(entry=entry):
+                        self.assert_refused(f"cat ~/{entry}", "a credential store")
+                for command in (
+                    "grep -r x ~",
+                    "grep -r x ~/.ssh",
+                    "cat /proc/self/status",
+                    "grep -r x /etc",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_refused(command, "no rule reaches it")
+
+    def test_a_pattern_of_many_stars_costs_little(self):
+        """A pattern is matched by a scan, not a regular expression, which would backtrack
+        through every way its stars can split a long name before it gave up."""
+        with read_layout() as root:
+            other = root / "tmp" / "other"
+            (other / ("a" * 200)).write_text("x\n")
+            rule = read_rule(other, "/" + "*a" * 40 + "b")
+            with operator_rules(allow=[read_rule(other, "/**")], deny=[rule]):
+                started = time.monotonic()
+                self.assert_allowed(f"grep -r x {other}", "no name ends in b")
+                self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_git_only_where_its_config_is_trusted(self):
+        """A grant is a read, and git runs what its repository's config names: `core.fsmonitor`
+        on `status`, `diff.external` on `diff`, `gpg.program` on `log --show-signature`. So a
+        grant vouches for git only where the repository's git directory and common directory are
+        in the roots: `repo`, a worktree of `trusted/main`, once `trusted` is listed. Not a
+        repository whose config is its own, history included, a bare one, one whose `.git` this
+        module can't read, one above the granted directory, one `GIT_DIR` names, nor a directory
+        a `pushd` moves git or `gh` to, which runs git there; `cat` still reads there."""
+        with read_layout() as root:
+            tmp = root / "tmp"
+            (tmp / "other" / "foreign" / "a.txt").write_text("x\n")
+            enclosing = tmp / "enclosing"
+            git_directory_at(enclosing / ".git")
+            (enclosing / "sub").mkdir()
+            (enclosing / "sub" / "x.txt").write_text("x\n")
+            git_directory_at(tmp / "other" / "bare.git")
+            (tmp / "other" / "odd").mkdir()
+            (tmp / "other" / "odd" / ".git").write_text("not a pointer\n")
+            worktrees = root / "trusted" / "main" / ".git" / "worktrees"
+            (worktrees / "broken" / "commondir").mkdir(parents=True)
+            (worktrees / "astray").mkdir()
+            (worktrees / "astray" / "commondir").write_text(f"{tmp}/other/foreign/.git\n")
+            for name in ("broken", "astray"):
+                (tmp / "other" / name).mkdir()
+                (tmp / "other" / name / ".git").write_text(f"gitdir: {worktrees / name}\n")
+            grants = [read_rule(tmp / "other", "/**"), read_rule(enclosing / "sub", "/**")]
+            log = f"git -C {tmp}/other/repo log -1"
+            with operator_rules(allow=grants):
+                self.assert_allowed(f"cat {tmp}/other/a.txt", "the control: the grant reads")
+                self.assert_no_opinion(log, "git's config is in no root")
+            trusted = [str(root / self.TRUSTED)]
+            with operator_rules(allow=[*grants, "Bash(pushd *)"], additional_directories=trusted):
+                for command in (
+                    log,
+                    f"git -C {tmp}/other/repo status",
+                    f"git -C {tmp}/other/repo diff",
+                    f"pushd {tmp}/other/repo && git status",
+                    f"cat {enclosing}/sub/x.txt",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_allowed(command, "git's config is in a root")
+                for command in (
+                    f"pushd {tmp}/other/foreign && cat a.txt",
+                    f"pushd {tmp}/other/foreign && grep -r x .",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_allowed(command, "it runs nothing the config names")
+                for command in (
+                    f"git -C {tmp}/other/foreign status",
+                    f"git -C {tmp}/other/foreign diff",
+                    f"git -C {tmp}/other/foreign log -1 --show-signature",
+                    f"git -C {tmp}/other/foreign show HEAD~1:secret.txt",
+                    f"git -C {tmp}/other/foreign log -p",
+                    f"git -C {tmp}/other/bare.git log -1",
+                    f"git -C {tmp}/other/odd status",
+                    f"git -C {tmp}/other/broken status",
+                    f"git -C {tmp}/other/astray status",
+                    f"git -C {enclosing}/sub status",
+                    f"pushd {tmp}/other/foreign && git status",
+                    f"pushd {tmp}/other/foreign && gh pr view 1",
+                    f"pushd {tmp}/other/foreign && gh api 'repos/{{owner}}/{{repo}}'",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_no_opinion(command, "git's config is the granted repository's")
+                # Nor does the hook run git there itself, to ask where a remote leads
+                url = unittest.mock.Mock(wraps=hook._git_remote_url)
+                with unittest.mock.patch.object(hook, "_git_remote_url", url):
+                    reach = f"pushd {tmp}/other/foreign && git ls-remote origin"
+                    self.assert_no_opinion(reach, "git's config is the granted repository's")
+                self.assertEqual(0, url.call_count, "the hook ran git in the granted repository")
+                with unittest.mock.patch.dict(os.environ, {"GIT_DIR": str(root / "trusted")}):
+                    self.assert_no_opinion(log, "GIT_DIR puts the repository anywhere")
+
+    def test_git_finds_a_repository_where_this_module_might_not(self):
+        """git takes a directory for a git directory by what `HEAD` holds, a link into `refs/`
+        included, and by its common directory's `objects` and `refs`; it resolves a link in a
+        pointer before the `..` after it; and it reads a `.git` an `ln` in the command makes. So
+        any `HEAD` is a git directory to this module, a pointer is resolved as git does, and git
+        is vouched for under a grant only in a command that makes no link. git ran the config's
+        program in the first 5 layouts here."""
+        with read_layout() as root:
+            other, trusted = root / "tmp" / "other", root / self.TRUSTED
+            packed = git_directory_at(other / "packed")
+            (packed / "HEAD").unlink()
+            (packed / "HEAD").symlink_to("refs/heads/main")  # dangling: the refs are packed
+            git_directory_at(other / "common")
+            (other / "linked").mkdir()
+            (other / "linked" / "HEAD").write_text("ref: refs/heads/main\n")
+            (other / "linked" / "commondir").write_text("../common\n")
+            # `trusted/lnk/../evil` is `trusted/evil` to `normpath`, and `other/deep/evil` to git
+            (other / "deep" / "inner").mkdir(parents=True)
+            git_directory_at(other / "deep" / "evil")
+            (trusted / "lnk").symlink_to(other / "deep" / "inner")
+            (other / "spelled").mkdir()
+            (other / "spelled" / ".git").write_text(f"gitdir: {trusted}/lnk/../evil\n")
+            linked = trusted / "main" / ".git" / "worktrees" / "spelled"
+            linked.mkdir()
+            (linked / "HEAD").write_text("ref: refs/heads/main\n")
+            (linked / "commondir").write_text(f"{trusted}/lnk/../evil\n")
+            (other / "common-spelled").mkdir()
+            (other / "common-spelled" / ".git").write_text(f"gitdir: {linked}\n")
+            (other / "plain").mkdir()
+            rules = [read_rule(other, "/**"), "Bash(ln *)"]
+            with operator_rules(allow=rules, additional_directories=[str(trusted)]):
+                log = f"git -C {other}/repo log -1"
+                self.assert_allowed(log, "the control: git's config is in a root")
+                self.assert_allowed(f"ln -s a.txt {other}/c && cat {other}/c", "the control")
+                for command in (
+                    f"git -C {other}/packed diff HEAD~1 HEAD",
+                    f"git -C {other}/linked log -1",
+                    f"git -C {other}/spelled status",
+                    f"git -C {other}/common-spelled status",
+                    f"ln -s {other}/foreign/.git {other}/plain/.git && git -C {other}/plain status",
+                    f"ln -s a.txt {other}/c && {log}",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_no_opinion(command, "git may read a config out of the roots")
+
+    def test_a_deny_rule_through_a_link(self):
+        """A deny rule matches the path as the reader spells it, or where it resolves, so a
+        recursive read below a link matches both: a pattern that names the link with a wildcard,
+        which no real path matches, and a link the command makes, which `grep -R` follows."""
+        with read_layout() as root:
+            tmp = root / "tmp"
+            (tmp / "other" / "sub").mkdir()
+            (tmp / "other" / "sub" / "key.pem").write_text("x\n")
+            (tmp / "alias").symlink_to(tmp / "other")
+            grant, deny = read_rule(tmp / "alias", "/**"), read_rule(tmp, "/al*as/**/*.pem")
+            with operator_rules(allow=[grant], deny=[deny]):
+                self.assert_allowed(f"cat {tmp}/alias/a.txt", "the control")
+                self.assert_allowed(f"grep -r x {tmp}/other", "the control: no link spelled")
+                for command in (
+                    f"cat {tmp}/alias/sub/key.pem",
+                    f"grep -r x {tmp}/alias",
+                    f"grep -r x {tmp}/alias/sub",
+                    f"ls {tmp}/alias/sub",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_no_opinion(command, "it reads alias/sub/key.pem")
+            with operator_rules(allow=[grant], deny=[read_rule(tmp, "/other/sub/key.pem")]):
+                self.assert_allowed(f"cat {tmp}/alias/a.txt", "the control")
+                self.assert_no_opinion(f"grep -r x {tmp}/alias", "it reads other/sub/key.pem")
+            (tmp / "other" / "sub" / "secret").write_text("x\n")
+            grant, deny = read_rule(tmp / "other", "/**"), read_rule(tmp, "/other/l/secret")
+            with operator_rules(allow=[grant, "Bash(ln *)"], deny=[deny]):
+                for reader in (f"grep -r x {tmp}/other/{{}}/", f"grep -R x {tmp}/other"):
+                    with self.subTest(reader=reader):
+                        made = f"ln -s sub {tmp}/other/{{}} && {reader}"
+                        self.assert_allowed(made.format("m", "m"), "the control: another name")
+                        self.assert_no_opinion(made.format("l", "l"), "it reads l/secret")
+
+    def test_a_walk_through_links(self):
+        """The walk below a directory goes through a link as a reader that follows links does,
+        where a rule can still match below it, as for a directory. Under a rule that matches at
+        any depth, a link into a directory a pattern names withholds the directory it is in, for
+        `grep -r` too, which wouldn't follow it. Under `/sub` alone, nothing can match below `x`,
+        so `grep -r` reads it, and `grep -R` stops at the link it follows, whose target is checked
+        on its own. A directory reached again with the same states, as through a link back up, is
+        listed once, so a loop costs nothing."""
+        with read_layout() as root:
+            other = root / "tmp" / "other"
+            (other / "sub").mkdir()
+            for name in ("x", "loop"):
+                (other / name).mkdir()
+            (other / "x" / "l").symlink_to("../sub")
+            (other / "loop" / "up").symlink_to("..")
+            grant, live = read_rule(other, "/**"), "Read(//**/nothing)"
+            with operator_rules(allow=[grant], deny=[live]):
+                for command in (f"grep -r y {other}/x", f"grep -R y {other}/loop"):
+                    with self.subTest(command=command):
+                        self.assert_allowed(command, "the control: no match, a loop")
+            sub = read_rule(other, "/sub")
+            with operator_rules(allow=[grant], deny=[sub]):
+                self.assert_allowed(f"grep -r y {other}/x", "no rule can match below x")
+                self.assert_no_opinion(f"grep -R y {other}/x", "it follows x/l to sub")
+            with operator_rules(allow=[grant], deny=[live, sub]):
+                self.assert_allowed(f"cat {other}/x/../a.txt", "the control: beside it")
+                for command in (f"grep -r y {other}/x", f"grep -R y {other}/x"):
+                    with self.subTest(command=command):
+                        self.assert_no_opinion(command, "x/l leads to sub")
+
+    def test_a_walk_from_a_dot_dot_after_a_link(self):
+        """`<link>/..` is the directory above where the link leads, as the kernel resolves it,
+        not the one `normpath` makes of it, so the walk lists that directory: `grep -r` read
+        `secret/.env` through `x/l/..`."""
+        with read_layout() as root:
+            other = root / "tmp" / "other"
+            (other / "secret" / "inner").mkdir(parents=True)
+            (other / "secret" / ".env").write_text("TOKEN=x\n")
+            (other / "x").mkdir()
+            (other / "x" / "l").symlink_to(other / "secret" / "inner")
+            with operator_rules(allow=[read_rule(other, "/**")], deny=["Read(//**/.env)"]):
+                for command in (
+                    f"ls {other}/x/l",
+                    f"grep -r y {other}/x",
+                    f"cat {other}/x/../a.txt",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_allowed(command, "the control: no .env below it")
+                for command in (
+                    f"grep -r y {other}/x/l/..",
+                    f"ls {other}/x/l/..",
+                    f"grep -r y {other}/secret",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_no_opinion(command, "it reads secret/.env")
+
+    def test_no_walk_where_no_rule_can_match_below(self):
+        """A directory is listed only where a deny or ask rule can match below it: with none,
+        or with one that can't, a directory past `MAX_WALKED_ENTRIES` entries reads as any
+        other, and under `Read(//**/.env)` it is withheld."""
+        with read_layout() as root:
+            other = root / "tmp" / "other"
+            grant = read_rule(other, "/**")
+            with unittest.mock.patch.object(hook, "MAX_WALKED_ENTRIES", 3):
+                for deny in ([], [read_rule(root, "/elsewhere/**")]):
+                    with self.subTest(deny=deny), operator_rules(allow=[grant], deny=deny):
+                        self.assert_allowed(f"ls {other}", "no rule can match below it")
+                with operator_rules(allow=[grant], deny=["Read(//**/.env)"]):
+                    self.assert_no_opinion(f"ls {other}", "the control: past the entries walked")
+
+    def test_a_rule_this_module_cant_resolve(self):
+        """A rule whose path has a NUL or a lone surrogate, which no path can hold: a deny rule
+        that can't be resolved may withhold any path, so nothing is granted, and an allow rule
+        grants nothing itself. Neither costs a read inside the project."""
+        with read_layout() as root:
+            other = root / "tmp" / "other"
+            grant = read_rule(other, "/**")
+            user_file = root / "home" / ".claude" / "settings.json"
+            for where, deny, user in (
+                ("a project deny with a NUL", ["Read(//tmp/\x00x)"], None),
+                ("a project deny with a lone surrogate", ["Read(//tmp/\ud800)"], None),
+                ("a user deny with a NUL", [], {"deny": ["Read(//tmp/\x00x)"]}),
+            ):
+                with self.subTest(where=where), operator_rules(allow=[grant], deny=deny):
+                    try:
+                        if user is not None:
+                            user_file.write_text(json.dumps({"permissions": user}))
+                        self.assert_allowed("ls && cat AGENTS.md", "inside the project")
+                        self.assert_no_opinion(f"cat {other}/a.txt", where)
+                    finally:
+                        user_file.unlink(missing_ok=True)
+            bad = ["Read(//tmp/\ud800/**)", "Read(//tmp/\ud800)"]
+            with operator_rules(allow=[*bad, grant]):
+                self.assert_allowed("ls && cat AGENTS.md", "inside the project")
+                self.assert_allowed(f"cat {other}/a.txt", "the other rule grants all the same")
+
+    def test_rules_on_claude_codes_command_line(self):
+        """`claude --settings <file>` and `--disallowedTools` add rules this module doesn't
+        read, a `Read()` deny among them, so nothing is granted while the command line carries
+        either, or can't be read."""
+        for argv, expected in (
+            (["claude"], False),
+            (["claude", "-p", "x"], False),
+            (["claude", "--settings", "deny.json"], True),
+            (["claude", "--settings={}"], True),
+            (["claude", "--disallowedTools", "Read(//x)"], True),
+            (["claude", "--disallowed-tools=Read(//x)"], True),
+            (["claude", "--settingsx"], False),
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(expected, hook._carries_unseen_rules(argv))
+        with read_layout() as root:
+            command = f"cat {root}/tmp/other/a.txt"
+            with operator_rules(allow=[read_rule(root / "tmp" / "other", "/**")]):
+                self.assert_allowed(command, "the control: none")
+                for argv, why in ((["claude", "--settings", "x"], "--settings"), (None, "none")):
+                    with (
+                        self.subTest(argv=argv),
+                        unittest.mock.patch.object(hook, "_UNSEEN_RULES", None),
+                        unittest.mock.patch.object(hook, "_claude_code_argv", return_value=argv),
+                    ):
+                        self.assert_no_opinion(command, f"a command line with {why} read")
+                with (
+                    unittest.mock.patch.object(hook, "_UNSEEN_RULES", None),
+                    unittest.mock.patch.object(hook, "_claude_code_argv", return_value=["claude"]),
+                ):
+                    self.assert_allowed(command, "the control: a command line with neither")
+
+    def test_settings_are_read_once_per_command_and_only_when_needed(self):
+        """The grants are read once per command, however many substitutions and passes ask, and
+        not at all by a command that reads only inside the roots."""
+        with read_layout() as root:
+            other = root / "tmp" / "other"
+            outside = unittest.mock.Mock(wraps=hook._outside_settings)
+            grants = unittest.mock.Mock(wraps=hook._read_rule_grants)
+            site = "WebFetch(domain:docs.python.org)"
+            with (
+                operator_rules(allow=[read_rule(other, "/**"), "Bash(ln *)", site]),
+                unittest.mock.patch.object(hook, "_outside_settings", outside),
+                unittest.mock.patch.object(hook, "_read_rule_grants", grants),
+                unittest.mock.patch.dict(os.environ, {"CURL_HOME": "", "XDG_CONFIG_HOME": ""}),
+                unittest.mock.patch.object(hook, "_account_home", return_value=str(root / "home")),
+            ):
+                self.assert_allowed("ls && cat AGENTS.md")
+                self.assertEqual(0, outside.call_count, "a read inside the project")
+                self.assertEqual(0, grants.call_count, "a read inside the project")
+                self.assert_allowed(
+                    f'ln -s a.txt {other}/c; echo "$(ls {other})" "$(cat {other}/c)"; '
+                    "curl -s https://docs.python.org/3/"
+                )
+                self.assertEqual(1, grants.call_count, "4 commands, 2 passes")
+                self.assertEqual(1, outside.call_count, "the grants and curl")
+
+    def test_a_walk_costs_the_same_at_any_depth(self):
+        """A walk advances each pattern by one name per entry, so a directory 40 levels deeper
+        costs what a shallow one does; matching each entry's whole path again cost 19 s over
+        48,601 entries with 30 patterns. A ratio, not a wall clock, as in `CostsBoundedTime`."""
+        with read_layout() as root:
+            other = root / "tmp" / "other"
+            deep = other.joinpath("deep", *["d"] * 40)
+            for directory in (other / "shallow", deep):
+                directory.mkdir(parents=True)
+                for index in range(1500):
+                    (directory / f"f{index}").touch()
+            deny = [f"Read(//**/n{index}/**/x)" for index in range(30)]
+
+            def cost(directory: Path) -> float:
+                best = float("inf")
+                for _ in range(3):
+                    started = time.monotonic()
+                    self.assert_allowed(f"grep -r x {directory}")
+                    best = min(best, time.monotonic() - started)
+                return best
+
+            with operator_rules(allow=[read_rule(other, "/**")], deny=deny):
+                ratio = cost(deep) / max(cost(other / "shallow"), 1e-6)
+                self.assertLess(ratio, 2.5, f"40 levels deeper multiplied the cost by {ratio:.1f}")
+
+
 @contextlib.contextmanager
 def a_project_below_home(cwd: str = ""):
     """A home holding `.ssh/id_rsa`, and the project three levels below it, at `~/a/b/proj`,
@@ -8761,6 +9549,33 @@ class AppliesOnlyTheProjectFilesClaudeCodeApplies(Verdicts, unittest.TestCase):
                 )
                 self.assert_no_opinion(command, "an ask rule in the local file it doesn't apply")
 
+    def test_a_read_rule_too(self):
+        """A `Read()` allow rule is an allow rule: it grants a read only where Claude Code
+        applies its file. A file it doesn't apply still withholds with its deny rules.
+
+        No managed settings file is there, and the user's has no rule."""
+        (self.outside / "g.txt").write_text("x\n")
+        (self.repository / ".claude" / "settings.json").write_text(
+            json.dumps({"permissions": {"allow": [f"Read(/{self.outside}/**)"]}})
+        )
+        read, withheld = f"cat {self.outside}/f.txt", f"cat {self.outside}/g.txt"
+        with unittest.mock.patch.object(
+            hook, "_managed_settings_dir", return_value=str(self.tmp / "managed")
+        ):
+            self.assert_no_opinion(read, "no trust record")
+            self.write_trust_records(self.repository)
+            with unittest.mock.patch.object(hook, "_SETTING_SOURCES", frozenset({"local"})):
+                self.assert_no_opinion(read, "--setting-sources local")
+            self.assert_allowed(read, "the control: the file applies")
+            self.assert_allowed(withheld, "the control: no deny rule")
+            only_project = frozenset({"user", "project"})
+            with unittest.mock.patch.object(hook, "_SETTING_SOURCES", only_project):
+                (self.repository / ".claude" / "settings.local.json").write_text(
+                    json.dumps({"permissions": {"deny": [f"Read(/{self.outside}/g.txt)"]}})
+                )
+                self.assert_allowed(read, "--setting-sources user,project")
+                self.assert_no_opinion(withheld, "a deny rule in the local file it doesn't apply")
+
     def test_a_global_config_that_holds_no_record(self):
         """An internal format, read strictly: whatever is not a record of `true` is no trust."""
         config = self.home / ".claude.json"
@@ -8942,6 +9757,44 @@ class AppliesOnlyTheProjectFilesClaudeCodeApplies(Verdicts, unittest.TestCase):
         self.assertEqual("allow", verdict(), "the control: every source")
         self.assertEqual("allow", verdict("--setting-sources=user,local"))
         self.assertEqual("", verdict("--setting-sources", "user,project"))
+        self.assertEqual("", verdict(**{hook.CLAUDE_PID_ENV: "1"}), "another process's")
+
+    @unittest.skipUnless(
+        sys.platform == "linux" or Path("/bin/ps").exists(), "reads the parent's command line"
+    )
+    @unittest.skipIf(
+        Path(hook._managed_settings_dir() or "").exists(), "managed settings on this machine"
+    )
+    def test_the_hook_reads_the_rules_its_parent_adds(self):
+        """End to end: `main` grants a `Read()` rule's directory nothing while its parent's
+        command line adds rules it doesn't read, a deny rule among them, and nothing where it
+        can't read that command line."""
+        self.write_trust_records(self.repository)
+        (self.repository / ".claude" / "settings.json").write_text(
+            json.dumps({"permissions": {"allow": [f"Read(/{self.outside}/**)"]}})
+        )
+        env = dict(os.environ, **{hook.PROJECT_DIR_ENV: str(self.repository)})
+        call = {"cwd": str(self.repository), "tool_name": "Bash"}
+        payload = json.dumps({**call, "tool_input": {"command": f"cat {self.outside}/f.txt"}})
+
+        def verdict(*flags, **extra):
+            argv = [sys.executable, "-c", PARENT_PROCESS, sys.executable, str(MODULE_PATH)]
+            result = subprocess.run(
+                [*argv, *flags],
+                input=payload,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+                env={**env, **extra},
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            out = result.stdout
+            return out and json.loads(out)["hookSpecificOutput"]["permissionDecision"]
+
+        self.assertEqual("allow", verdict(), "the control: no rule on the command line")
+        self.assertEqual("", verdict("--settings", "deny.json"))
+        self.assertEqual("", verdict(f"--disallowedTools=Read(/{self.outside}/f.txt)"))
         self.assertEqual("", verdict(**{hook.CLAUDE_PID_ENV: "1"}), "another process's")
 
 
