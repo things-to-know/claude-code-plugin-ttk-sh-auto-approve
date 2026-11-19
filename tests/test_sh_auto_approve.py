@@ -620,24 +620,29 @@ def git_directory_at(path: Path, config: str | None = None) -> Path:
 
 
 @contextlib.contextmanager
-def remotes_configured(config: str, *, worktree: bool = False, global_config: str = ""):
+def remotes_configured(
+    config: str, *, worktree: bool = False, global_config: str = "", nested: bool = False
+):
     """Point the module at a repository whose `.git/config` is `config`, on branch `main`. With
     `worktree`, the project is a linked worktree, whose `.git` file and `commondir` lead to that
     config. `global_config` is the user's `~/.gitconfig`.
 
     The module asks git, which reads the environment, so the environment is the test's own for
     the duration: `HOME` and `XDG_CONFIG_HOME` in the scratch directory, no system config, and
-    every other `GIT_` variable unset."""
+    every other `GIT_` variable unset. The repository's parent is that home directory, which
+    `_project_root` never takes for a project; with `nested`, it is a directory of the home's,
+    `parent`, which a test can make the project."""
     root = Path(tempfile.mkdtemp(prefix="readonly_hook_remotes_"))
     try:
-        project = root / "main"
+        top = root / "parent" if nested else root
+        project = top / "main"
         common = git_directory_at(project / ".git", config)
         if worktree:
             linked = common / "worktrees" / "w"
             linked.mkdir(parents=True)
             (linked / "HEAD").write_text("ref: refs/heads/main\n")
             (linked / "commondir").write_text("../..\n")
-            project = root / "w"
+            project = top / "w"
             project.mkdir()
             (project / ".git").write_text(f"gitdir: {linked}\n")
         (root / ".gitconfig").write_text(global_config)
@@ -1412,7 +1417,11 @@ class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
             ) as run,
         ):
             self.assert_allowed("git ls-remote origin; git remote show origin", "the control")
-        self.assertEqual(2, run.call_count)
+            self.assertEqual(2, run.call_count)
+            run.reset_mock()
+            # Through `-C`, each call's scope is `_directory_scope`'s, which shares git's answers
+            self.assert_allowed("git -C . ls-remote origin; git -C . remote show origin")
+            self.assertEqual(2, run.call_count)
 
     def test_a_name_no_remote_has_is_a_path(self):
         with remotes_configured(self.ORIGIN):
@@ -1586,19 +1595,135 @@ class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
             (project / ".git" / "config").write_bytes(b"\xff")
             self.assert_refused("git ls-remote origin", "a config git refuses")
 
+    def test_a_project_that_holds_the_repository(self):
+        """#75: git runs in the session's working directory, so it is asked from there, and not
+        from the project as well. Here the project is a plain directory holding the repository,
+        where git takes `origin` for a path: no opinion from there, as the controls show."""
+        with remotes_configured(self.ORIGIN, nested=True) as repository:
+            parent = repository.parent
+            with unittest.mock.patch.object(hook, "REPO_ROOT", parent):
+                for command in ("git ls-remote origin", "git remote show origin"):
+                    with self.subTest(command=command):
+                        with unittest.mock.patch.object(hook, "_SESSION_CWD", str(repository)):
+                            self.assert_allowed(command, "git runs in the repository")
+                        with unittest.mock.patch.object(hook, "_SESSION_CWD", str(parent)):
+                            self.assert_no_opinion(command, "git takes `origin` for a path")
+                        with unittest.mock.patch.object(hook, "_SESSION_CWD", None):
+                            self.assert_no_opinion(command, "no cwd: git runs in the project")
+                with unittest.mock.patch.object(hook, "_SESSION_CWD", str(parent)):
+                    self.assert_allowed(f"git -C {repository} ls-remote origin", "git runs there")
+                    # A `cd` may not move the shell, so git may still run where it was
+                    self.assert_no_opinion(f"cd {repository} && git ls-remote origin")
+                    self.assert_no_opinion("git -C . ls-remote origin", "`.` is the parent")
+                # `-C` is joined to where git runs, not to the project as well
+                with unittest.mock.patch.object(hook, "_SESSION_CWD", str(repository)):
+                    self.assert_allowed("git -C . ls-remote origin", "`.` is the repository")
+                # So is a `$PWD`, which is where the shell is: `cd` refuses a `$`, `pushd` not
+                command = 'pushd "$PWD" && git ls-remote origin'
+                with operator_rules(allow=["Bash(pushd *)"]):
+                    with unittest.mock.patch.object(hook, "_SESSION_CWD", str(repository)):
+                        self.assert_allowed(command, "`$PWD` is the repository")
+                    with unittest.mock.patch.object(hook, "_SESSION_CWD", str(parent)):
+                        self.assert_no_opinion(command, "`$PWD` is the parent")
+
+    def test_a_dot_dot_after_a_link(self):
+        """The kernel climbs a `..` after a link from where the link leads, so git, given
+        `-C ./lnk/..`, runs in `a/a`, a repository whose `origin` is a path, where `lnk` leads to
+        `a/a/inner`: git 2.48.1 printed that path. So does a shell after `cd -P ./lnk/..`, or a
+        plain `cd` under bash's `set -P` or zsh's `chase_links`. Each control climbs no link."""
+        with remotes_configured(self.ORIGIN) as project:
+            nested = project / "a" / "a"
+            git_directory_at(nested / ".git", '[remote "origin"]\n\turl = /mnt/backup/x.git\n')
+            (nested / "inner").mkdir()
+            (project / "lnk").symlink_to(nested / "inner")
+            for refused, control in (
+                ("git -C ./lnk/.. ls-remote origin", "git -C ./a/.. ls-remote origin"),
+                ("git -C lnk/.. remote show origin", "git -C a/.. remote show origin"),
+                ("cd ./lnk/.. && git ls-remote origin", "cd ./a/.. && git ls-remote origin"),
+                ("cd -P ./lnk/.. && git ls-remote origin", "cd -P ./a/.. && git ls-remote origin"),
+            ):
+                with self.subTest(refused=refused):
+                    with self.assertRaisesRegex(hook.NoOpinion, "git reaches /mnt/backup/x.git"):
+                        hook._classify(refused)
+                    self.assert_allowed(control, "the project, by a path with no link")
+
+    def test_a_directory_spelled_from_home(self):
+        """The shell expands the `~` of `git -C ~/<dir>`, so git runs in the home directory's
+        `<dir>`, where it is asked, as the read scope reads it. Quoted, `'~/<dir>'` is the
+        directory `~` below the working directory, where git is asked instead: here a repository
+        whose `origin` is a path. The home directory itself is outside the read roots."""
+        with remotes_configured(self.ORIGIN) as project:
+            # `remotes_configured` makes the project's parent the home directory
+            config = '[remote "origin"]\n\turl = /mnt/backup/x.git\n'
+            git_directory_at(project / "~" / project.name / ".git", config)
+            self.assert_allowed(f"git -C ~/{project.name} ls-remote origin", "the project")
+            with self.assertRaisesRegex(hook.NoOpinion, "git reaches /mnt/backup/x.git"):
+                hook._classify(f"git -C '~/{project.name}' ls-remote origin")
+            self.assert_no_opinion("git -C ~ ls-remote origin", "outside the read roots")
+
+    def test_a_cd_that_cdpath_may_redirect(self):
+        """`CDPATH`, from a startup file this module can't read, may take `cd sub` anywhere,
+        before the current directory's `sub`, as bash 5.2.37 did. In layout 1 the project holds
+        a repository `sub` whose `origin` is the session's repository, by path; in layout 2 the
+        project is the repository. In both, `cd sub && git ls-remote origin` is no opinion, and
+        `cd ./sub`, never looked up in `CDPATH`, is the control. A `cd` counts wherever it
+        stands, after git too, as it does for the read scope. The read scope doesn't place such a
+        target, so `cd sub && git log -1` is approved: the gap #118 records."""
+        with remotes_configured(self.ORIGIN, nested=True) as repository:
+            (repository / "sub").mkdir()
+            parent = repository.parent
+            git_directory_at(parent / "sub" / ".git", f'[remote "origin"]\n\turl = {repository}\n')
+            for project in (parent, repository):
+                with (
+                    self.subTest(project=project.name),
+                    unittest.mock.patch.object(hook, "REPO_ROOT", project),
+                    unittest.mock.patch.object(hook, "_SESSION_CWD", str(repository)),
+                ):
+                    with unittest.mock.patch.object(
+                        hook, "_run_git_uncached", wraps=hook._run_git_uncached
+                    ) as run:
+                        # The reason names `CDPATH`, and the spelling it never redirects
+                        with self.assertRaisesRegex(
+                            hook.NoOpinion, r"CDPATH.*: \$CDPATH/sub; .* \./<dir> "
+                        ):
+                            hook._classify("cd sub && git ls-remote origin")
+                        # A value the module didn't read is `$`, as `_unvouched_directory` says
+                        with (
+                            operator_rules(allow=["Bash(pushd *)"]),
+                            self.assertRaisesRegex(hook.NoOpinion, r": \$CDPATH/sub\$; "),
+                        ):
+                            hook._classify('pushd "sub$x" && git ls-remote origin')
+                        run.assert_not_called()  # decided before git runs in `sub`, or anywhere
+                    self.assert_no_opinion("cd sub && git remote show origin", "the same")
+                    self.assert_allowed("cd ./sub && git ls-remote origin", "the control")
+                    self.assert_no_opinion("git ls-remote origin && cd sub && ls", "after git")
+                    self.assert_allowed("git ls-remote origin && cd ./sub && ls", "its control")
+                    self.assert_allowed("cd sub && git log -1", "the gap #118 records")
+                    # Through `-C .` too: its run bases keep the `CDPATH` entry for the remote
+                    # check, and the read scope, as without `-C`, doesn't place it
+                    self.assert_allowed("cd sub && git -C . log -1", "as without -C: #118")
+                    self.assert_no_opinion("cd sub && git -C . ls-remote origin", "as without -C")
+
     def test_a_directory_outside_the_read_roots_is_not_asked(self):
         """git runs what a repository's config names, so it is asked only where the read
-        scope allows `-C`, which is checked first."""
+        scope allows `-C`, which is checked first, and each `cd` target: one after git too,
+        since a loop can run git again after it."""
         with (
-            remotes_configured(self.ORIGIN),
+            remotes_configured(self.ORIGIN) as project,
             unittest.mock.patch.object(
                 hook, "_run_git_uncached", wraps=hook._run_git_uncached
             ) as run,
         ):
+            (project / "docs").mkdir()
             self.assert_allowed("git -C . ls-remote origin", "the control")
             self.assertTrue(run.called)
             run.reset_mock()
             self.assert_refused("git -C /etc ls-remote origin", "outside the read roots")
+            run.assert_not_called()
+            self.assert_allowed("git ls-remote origin && cd ./docs && ls", "the control")
+            self.assertTrue(run.called)
+            run.reset_mock()
+            self.assert_no_opinion("git ls-remote origin && cd /etc && ls", "the same, by cd")
             run.assert_not_called()
 
     def test_where_git_cannot_answer(self):
@@ -6032,13 +6157,15 @@ class RefusesADotDotAfterALinkOut(Verdicts, unittest.TestCase):
 
     `cd` reads such a target two ways: `cd -L`, the default, drops `l/..` as `normpath` does,
     and `cd -P`, or a startup file's `set -P` or zsh's `chase_dots`, climbs from where `l`
-    leads. A target has to stay in the project under both.
+    leads. A target has to stay in the project under both, from each directory the shell may be
+    in: `_check_cd` measures one from the project root only. A program that changes to a
+    directory, as `git -C` does, does it through the kernel, and reads its operands from there.
 
     A project of its own beside `outside`: `sub/l` leads to `outside/ssl`, beside
-    `outside/hostname`, and `sub/m` to the project's `docs`. Each refusal sits beside the same
-    command through `m`, which stays in the project either way. Under bash 5.2.37 and zsh 5.9,
-    `cat sub/l/../hostname` printed `outside/hostname`, `cd sub/l/..` landed in `sub`, and
-    `cd -P sub/l/..` in `outside`.
+    `outside/hostname`, and `sub/m` and `sub/a/n` to the project's `docs`. Each refusal sits
+    beside the same command through `m` or `n`, which stays in the project either way. Under bash
+    5.2.37 and zsh 5.9, `cat sub/l/../hostname` printed `outside/hostname`, `cd sub/l/..` landed
+    in `sub`, and `cd -P sub/l/..` in `outside`.
     """
 
     @contextlib.contextmanager
@@ -6046,13 +6173,14 @@ class RefusesADotDotAfterALinkOut(Verdicts, unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="readonly_hook_dotdot_") as directory:
             top = Path(os.path.realpath(directory))
             project, outside = top / "project", top / "outside"
-            (project / "sub").mkdir(parents=True)
+            (project / "sub" / "a").mkdir(parents=True)
             (project / "docs").mkdir()
             (project / "README.md").write_text("x\n")
             (outside / "ssl").mkdir(parents=True)
             (outside / "hostname").write_text("x\n")
             (project / "sub" / "l").symlink_to(outside / "ssl")
             (project / "sub" / "m").symlink_to(project / "docs")
+            (project / "sub" / "a" / "n").symlink_to(project / "docs")
             with (
                 unittest.mock.patch.object(hook, "REPO_ROOT", project),
                 unittest.mock.patch.object(hook, "_SESSION_CWD", None),
@@ -6083,6 +6211,31 @@ class RefusesADotDotAfterALinkOut(Verdicts, unittest.TestCase):
                 with self.subTest(refused=refused):
                     self.assert_refused_outright(refused, "lands outside the project")
                     self.assert_allowed(control, "stays inside it")
+
+    def test_a_cd_from_a_working_directory_below_the_project(self):
+        """From `sub`, `./l/..` is `outside` to `cd -P`, but `_check_cd` measures it from the
+        project root, where it stays inside. bash 5.2.37 with `set -P`, and zsh 5.9 (`-f`) with
+        `chase_links` or `chase_dots`, took a plain `cd ./l/..` to `outside` as well."""
+        with (
+            self._project() as project,
+            unittest.mock.patch.object(hook, "_SESSION_CWD", str(project / "sub")),
+        ):
+            for refused, control in (
+                ("cd ./l/.. && ls", "cd ./m/.. && ls"),
+                ("cd -P ./l/.. && grep -r x .", "cd -P ./m/.. && grep -r x ."),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_no_opinion(refused, "may land outside the project")
+                    self.assert_allowed(control, "stays inside it")
+
+    def test_a_directory_a_program_changes_to(self):
+        """`git -C sub/a/n/..` runs in the project, the parent of `docs`, where `n` leads, and
+        reads `../outside/hostname` from there; `normpath` placed it from `sub/a`, inside."""
+        with self._project():
+            self.assert_no_opinion(
+                "git -C sub/a/n/.. diff --no-index ../outside/hostname x", "outside the project"
+            )
+            self.assert_allowed("git -C sub/a/n/.. diff --no-index README.md x", "the control")
 
 
 # ======================================================================================
@@ -7409,8 +7562,11 @@ class RefusesGitReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         the read scope clears both, and a path joined to one would be measured from a directory
         the shell had not chosen yet. It refuses a variable too, which it reads as the
         credential check does, `_changed_directories`: as each value the command sets, and as
-        the value the shell had before. The control: a directory spelled out."""
-        scope = hook._ReadScope([str(hook.REPO_ROOT)], [str(hook.REPO_ROOT)], {}, {})
+        the value the shell had before. The control: a directory spelled out, joined to each base
+        for the read scope, and to the session's working directory alone for where git runs."""
+        root = str(hook.REPO_ROOT)
+        cwd = str(hook.REPO_ROOT / "tests")
+        scope = hook._ReadScope([root], [root, cwd], {}, {}, run_bases=[cwd])
         for command in ("git -C <(echo docs) diff a b", "git -C doc* diff a b"):
             with self.subTest(command=command):
                 self.assert_refused(command, "the shell finishes the directory")
@@ -7421,7 +7577,8 @@ class RefusesGitReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         with self.assertRaises(hook.NoOpinion):
             hook._directory_scope("x$d", [], {"d": ["docs"]}, scope)
         joined = hook._directory_scope("docs", [], {}, scope)
-        self.assertEqual([str(hook.REPO_ROOT / "docs")], joined.bases)
+        self.assertEqual([str(hook.REPO_ROOT / "docs"), f"{cwd}/docs"], joined.bases)
+        self.assertEqual([f"{cwd}/docs"], joined.run_bases, "not from the project too (#75)")
 
 
 class RefusesGitPathsInAnEnclosingRepository(Verdicts, unittest.TestCase):
