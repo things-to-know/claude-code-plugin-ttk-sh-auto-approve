@@ -63,8 +63,8 @@ from a command that prompted in a real session.
           RefusesReadsOutsideTheWorkingDirectories, ReadsWhereAReadRuleAllows,
           ResolvesThroughALinkTheCommandMakes, RefusesALinkARecursiveReadFollows,
           RefusesACredentialStoreAWildcardOrABaseReaches,
-          ReadsAValueOnlyWhereTheShellHoldsIt, RefusesAScratchPathThroughALinkOut,
-          RefusesEgressThroughAnApprovedProgram
+          ReadsAValueOnlyWhereTheShellHoldsIt, ReadsATildeAsEachShellExpandsIt,
+          RefusesAScratchPathThroughALinkOut, RefusesEgressThroughAnApprovedProgram
      9  Program identity, environment, and session state
           RefusesControlOfTheEnvironmentAndTheProgram, StripsTheWrapperTheHostStrips,
           RefusesBuiltinsThatRunAProgram, RefusesSessionScopedEnvironmentHandover,
@@ -6414,6 +6414,117 @@ class ReadsAValueOnlyWhereTheShellHoldsIt(Verdicts, unittest.TestCase):
             )
 
 
+@contextlib.contextmanager
+def a_project_with_tilde_traps():
+    """`a_project_below_home`, at `~/a/b/proj`, whose project also holds the directory `~`, with
+    `a/b/proj/t` a link to `~/.ssh` and the file `q/README.md`, and the directories `a:` and
+    `x=a:`, each with a link from the first component of the home directory's path to that
+    directory at the root, so that `a:<home>` and `x=a:<home>` are the home directory.
+    `~/a/b/proj/t/id_rsa` is then in the project to a reader of the home directory, and the key to
+    one of `./~`."""
+    with a_project_below_home() as project:
+        home = Path(os.environ["HOME"])
+        (project / "~" / "q").mkdir(parents=True)
+        (project / "~" / "q" / "README.md").write_text("one\n")
+        (project / "~" / "a" / "b" / "proj").mkdir(parents=True)
+        (project / "~" / "a" / "b" / "proj" / "t").symlink_to(home / ".ssh")
+        top = home.parts[1]
+        for directory in ("a:", "x=a:"):
+            (project / directory).mkdir()
+            (project / directory / top).symlink_to(f"/{top}")
+        yield project
+
+
+class ReadsATildeAsEachShellExpandsIt(Verdicts, unittest.TestCase):
+    """bash and zsh expand a `~` that starts a word, and in an assignment's value one that starts it
+    or follows a `:`; bash also in a word shaped like an assignment, and zsh in any word with an `=`
+    under `magic_equal_subst`. They differ on quoting: bash expands only where no character of the
+    tilde-prefix is quoted, so `~"/x"` is the relative path `~/x` to bash and the home directory's
+    `x` to zsh. The hook reads each word as each shell does, `_tilde_readings`.
+
+    In `a_project_with_tilde_traps`, each refusal below printed the fake key under bash 5.2, or,
+    for the `grep -f` forms, read it as grep's patterns, unless its own docstring says otherwise.
+    """
+
+    def test_a_quoted_tilde_prefix_is_a_relative_path_to_bash(self):
+        with a_project_with_tilde_traps():
+            self.assert_allowed("cat '~/q/README.md'", "the control: the directory `~`")
+            self.assert_allowed("cat ~/a/b/proj/README.md", "the control: the home directory")
+            for command in (
+                'cat ~"/a/b/proj/t/id_rsa"',
+                "cat ~\\/a/b/proj/t/id_rsa",
+                "cat ~'/a/b/proj/t/id_rsa'",
+                'cat ~""/a/b/proj/t/id_rsa',
+                'grep -rh PRIVATE ~"/a/b/proj/t"',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command)
+
+    def test_a_quoted_tilde_prefix_is_the_home_directory_to_zsh(self):
+        """zsh reads `~"/q/README.md"` in the home directory, out of the project, where bash read
+        the project's `~/q/README.md`."""
+        with a_project_with_tilde_traps():
+            self.assert_allowed("cat '~/q/README.md'", "the control")
+            self.assert_refused('cat ~"/q/README.md"')
+
+    def test_an_assignment_the_shells_store_differently_is_not_read(self):
+        with a_project_with_tilde_traps():
+            self.assert_allowed('f=~/a/b/proj/README.md; cat "$f"', "the control")
+            self.assert_allowed("f=~/a/b/proj/README.md; sed -n 1p $f", "the control")
+            for command in (
+                'f=~"/a/b/proj/t/id_rsa"; cat "$f"',
+                'f=~"/a/b/proj/t/id_rsa"; sed -n 1p $f',
+                "f=~'/a/b/proj/t/id_rsa'; cat $f",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command)
+
+    def test_a_loop_word_holds_each_reading(self):
+        with a_project_with_tilde_traps():
+            self.assert_allowed('for f in ~/a/b/proj/README.md; do cat "$f"; done', "the control")
+            self.assert_refused('for f in ~"/a/b/proj/t/id_rsa"; do cat "$f"; done')
+
+    def test_a_word_an_unquoted_expansion_splits_off_keeps_its_tilde(self):
+        """Neither shell expands a tilde in a value an unquoted `$p` splices in, by default; zsh
+        does under `glob_subst`. Such a value is not spliced, `LITERAL_TILDE`."""
+        with a_project_with_tilde_traps():
+            self.assert_allowed("p='-n 1p README.md'; sed $p", "the control")
+            self.assert_refused("p='-n 1p ~/a/b/proj/t/id_rsa'; sed $p")
+            self.assert_refused("p='~/a/b/proj/t/id_rsa'; cat $p", "zsh 5.9 printed it too")
+
+    def test_a_path_attached_to_its_flag_keeps_its_tilde(self):
+        """The `~` doesn't start the word, so bash keeps it, and `--file=` names no identifier;
+        zsh keeps both but under `magic_equal_subst`, which expands the second."""
+        with a_project_with_tilde_traps():
+            self.assert_allowed("grep -h --file=README.md README.md", "the control")
+            self.assert_allowed("grep -h -fREADME.md README.md", "the control")
+            self.assert_refused("grep -h --file=~/a/b/proj/t/id_rsa README.md")
+            self.assert_refused("grep -h -f~/a/b/proj/t/id_rsa README.md")
+
+    def test_a_tilde_after_a_colon_in_an_assignment(self):
+        """`f=a:~/x` holds `a:<home>/x`, a relative path through the directory `a:`. zsh expands
+        one after a quoted `:`, or with a quoted prefix, where bash keeps it: such a value is not
+        read, though here both readings are in the project."""
+        with a_project_with_tilde_traps():
+            self.assert_allowed('f=a:~/a/b/proj/README.md; cat "$f"', "the control: in the project")
+            for command in (
+                'f=a:~/.ssh/id_rsa; cat "$f"',
+                "f=a:~/.ssh/id_rsa; sed -n 1p $f",
+                'f=a:~"/a/b/proj/README.md"; cat "$f"',  # bash keeps it
+                "f=a':'~/a/b/proj/README.md; cat \"$f\"",  # bash keeps it
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command)
+
+    def test_a_tilde_in_a_word_shaped_like_an_assignment(self):
+        """bash expands a `~` after the `=` of `x=...`, and after each `:` that follows, in an
+        argument and in a `for` list; zsh does under `magic_equal_subst`. zsh 5.9 kept both."""
+        with a_project_with_tilde_traps():
+            self.assert_allowed("cat x=a:~/a/b/proj/README.md", "the control: in the project")
+            self.assert_refused("cat x=a:~/.ssh/id_rsa")
+            self.assert_refused('for f in x=a:~/.ssh/id_rsa; do cat "$f"; done')
+
+
 class RefusesAScratchPathThroughALinkOut(Verdicts, unittest.TestCase):
     """The scratch directory was matched by its text alone, so a link inside it led a read or a
     write wherever it pointed: with `out -> /etc` there, `cat <scratch>/out/hostname` and
@@ -8430,6 +8541,24 @@ class RefusesGitPathsInAnEnclosingRepository(Verdicts, unittest.TestCase):
                 with self.subTest(refused=refused):
                     self.assert_no_opinion(refused, "git reads the sibling, or from the root")
                     self.assert_allowed(control, "stays in the project")
+
+    def test_a_path_under_a_tilde(self):
+        """Both shells hand git the home directory for a `~` that starts a word, and zsh for one
+        whose prefix is quoted: each reading is measured. The repository's root is the home
+        directory, as for a dotfiles repository."""
+        with (
+            self._repository() as project,
+            unittest.mock.patch.dict(os.environ, {"HOME": str(project.parent)}),
+        ):
+            self.assert_allowed("git log -p -- ~/project/a.txt", "the control: in the project")
+            for command in (
+                "git log -p -- ~/sibling/data",
+                'git log -p -- ~"/sibling/data"',
+                "git log -L 1,1:../sibling/data",
+                "git log -p -- ~-/a.txt",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command)
 
     def test_nothing_changes_where_the_root_is_the_project(self):
         """git stops at its root, `test_git_refuses_a_pathspec_above_its_repository`."""
