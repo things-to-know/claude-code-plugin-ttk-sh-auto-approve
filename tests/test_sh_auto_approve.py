@@ -6601,6 +6601,53 @@ class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
             self.assert_no_opinion("for f in 'd*'; do cat $f/f; done", "d/f leads out")
             self.assert_refused_outright("for f in 'k*'; do grep -R PRIVATE $f; done")
 
+    def test_a_loop_over_a_wildcard_or_a_listing(self):
+        """A `for` list's wildcard, or a `$(ls)`, gives the variable each path it matches or each
+        name it lists. The read scope placed one name in the list's directory, by its text, and
+        the credential check read the variable as unread, so `for f in $(ls); do cat $f/id_rsa;
+        done` was approved, and `for f in d1*; do cat $f/k/id_rsa; done` under `Bash(cat *)`."""
+        with self._project() as (project, home):
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            for command in (
+                "for f in src*; do cat $f/lib/x.txt; done",
+                "for f in $(ls src); do cat src/$f/x.txt; done",
+                'for d in src*; do grep -r PRIVATE "$d"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: reads through no link out")
+            for command in (
+                "for f in $(ls); do cat $f/id_rsa; done",
+                'for f in $(ls); do cat "$f"/id_rsa; done',
+                "for f in $(ls src); do cat src/$f/id_rsa; done",
+                "for f in d1*; do cat $f/k/id_rsa; done",
+                'for d in src*; do grep -R PRIVATE "$d"; done',
+                'for d in $(ls); do grep -R PRIVATE "$d"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through a link")
+            for command in ("for f in d*; do cat $f/f; done", "for f in $(ls); do cat $f/f; done"):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "d/f leads out of the project")
+            with operator_rules(allow=["Bash(cat *)"]):
+                self.assert_allowed("for f in d*; do cat $f/f; done", "the rule approves it")
+                self.assert_refused("for f in d1*; do cat $f/k/id_rsa; done", "the rule says yes")
+
+    def test_a_word_spelled_around_two_values_this_module_didnt_read(self):
+        """`PICKED` shared its byte with `UNREAD_VALUE`, so `${a}picked$b` read as the mark, and
+        Layer B took both values out with it, to read `/.ssh/id_rsa` alone. bash splits the first
+        command's word into `picked` and `~/.ssh/id_rsa`. A command can't spell the mark."""
+        with self._project(), operator_rules(allow=["Bash(cat *)"]):
+            self.assert_allowed("cat ${a}picked$b/README.md", "the control: the rule approves this")
+            for command in (
+                'b=" $HOME"; cat ${a}picked$b/.ssh/id_rsa',
+                "cat ${a}picked${b}/.ssh/id_rsa",
+                "cat $(pwd)picked$(pwd)/.ssh/id_rsa",
+                f"cat {hook.PICKED}README.md",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh, or spells the mark")
+
     def test_a_link_the_command_makes(self):
         """#79's links count: `j` isn't there when the hook runs, as a name the wildcard matches
         or as the one it spells, which bash leaves where the wildcard matches nothing."""
