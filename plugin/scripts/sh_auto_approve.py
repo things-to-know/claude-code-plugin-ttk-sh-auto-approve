@@ -1552,9 +1552,11 @@ def _picked_values(loop_values: dict[str, list[str]]) -> dict[str, list[str]]:
     }
 
 
-# A command substitution whose output is bare directory-entry names: `ls`, or `ls` with
-# relative directory operands and only the flags that change layout, never `-a`.
-LISTING_BODY = re.compile(r"^\s*ls(?:\s+-1)?(?:\s+[A-Za-z0-9_./-]+)*\s*$")
+# A command substitution whose output is bare directory-entry names: `ls` or `ls -1`, with at most
+# one operand, `.group(1)`. Any other flag prints something else: `-a` prints `..`, `-l`
+# a link's target, and `-d` the operand; and with two operands, `ls` prints a header for each. An
+# operand that is no directory prints itself, which `_loop_value_shapes` reads too.
+LISTING_BODY = re.compile(r"^\s*ls(?:\s+-1)?(?:\s+(?!-)([A-Za-z0-9_./-]+))?\s*$")
 
 
 def _glob_may_climb(path: str, *, dot_components: bool = True) -> bool:
@@ -1634,17 +1636,18 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
     """What one `for`-list word contributes to the variable, for the read scope.
 
     A literal word is itself. An unquoted glob is each path it matches, and a `$(ls ...)` each
-    name it lists: `PICKED`, with the pattern, and `*` for the listing. Anything else -- a
-    substitution with another body, a parameter expansion, a glob that could match `.` or `..`
-    -- is None: unresolvable.
+    name it lists: `PICKED`, with the pattern, and `*` for the listing, with its operand too,
+    which `ls` prints where it is no directory. Anything else -- a substitution with another body,
+    a parameter expansion, a glob that could match `.` or `..` -- is None: unresolvable.
     """
     expanded = _expand(token, parts)
     whole = PLACEHOLDER.fullmatch(token)
     if whole is not None and parts[int(whole.group(1))][0] == SUBSTITUTION:
         body = parts[int(whole.group(1))][1]
-        if LISTING_BODY.match(body) and not re.search(r"\s-[A-Za-z]*a", body) and ".." not in body:
-            return [PICKED + "*"]
-        return None
+        listing = LISTING_BODY.match(body)
+        if listing is None or ".." in body:
+            return None
+        return [PICKED + "*"] + ([listing.group(1)] if listing.group(1) else [])
     if _carries_substitution(token, parts) or _has_bare_variable(token, parts):
         return None
     if _carries_brace_expansion(token):

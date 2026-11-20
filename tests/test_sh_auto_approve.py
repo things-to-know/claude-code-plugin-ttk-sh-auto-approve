@@ -6633,6 +6633,33 @@ class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
                 self.assert_allowed("for f in d*; do cat $f/f; done", "the rule approves it")
                 self.assert_refused("for f in d1*; do cat $f/k/id_rsa; done", "the rule says yes")
 
+    def test_a_listing_that_prints_more_than_names(self):
+        """`$(ls ...)` was read as the names of a directory's entries whatever flags and operands
+        it had. `ls -l` prints a link's target, `ls -d` and `ls FILE` the operand, and `ls a b` a
+        header for each: these are no listing now, and a single operand is a value too. The
+        project's `k` is gone, which any name `$(ls)` gives at the top could be."""
+        with self._project() as (project, home):
+            (project / "k").unlink()
+            (project / "a" / "b").mkdir(parents=True)
+            (project / "a" / "b" / "k").symlink_to(home / ".ssh")
+            (project / "a" / "b" / "key").symlink_to(home / ".ssh" / "id_rsa")
+            for command in (
+                "for f in $(ls src); do cat src/$f/x.txt; done",
+                "for f in $(ls -1 src); do cat src/$f/x.txt; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: the names of src/")
+            for command in (
+                "for f in $(ls -l src); do cat $f/id_rsa; done",
+                "for f in $(ls -d a/b); do cat $f/k/id_rsa; done",
+                "for f in $(ls a/b src); do cat $f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "prints more than names")
+            self.assert_refused_outright(
+                "for f in $(ls a/b/key); do cat $f; done", "prints a/b/key, the key"
+            )
+
     def test_a_word_spelled_around_two_values_this_module_didnt_read(self):
         """`PICKED` shared its byte with `UNREAD_VALUE`, so `${a}picked$b` read as the mark, and
         Layer B took both values out with it, to read `/.ssh/id_rsa` alone. bash splits the first
