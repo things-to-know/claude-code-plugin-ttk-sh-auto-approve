@@ -79,6 +79,11 @@ insists on its own filename, symlink to this file rather than copying it.
         text it adds
       - A copy, `g=$f`, and the value an append adds to are values the hook doesn't read: the
         residual of `cat $g/id_rsa` under `Bash(cat *)`
+    - And a word that spells an operator of zsh's `EXTENDED_GLOB` unquoted, `^`, `#` or a `~`
+      after its start (`ZSH_GLOB_OPERATOR`), for the path checks alone
+      - The flag checks read `HEAD~1` as bash does, and as zsh may, the text in front of the
+        operator followed by any other (`_zsh_glob_prefix`): a loop over `HEAD~1` gives no flag
+        - Not `^x` nor `a#-o`, which zsh 5.9 matched against a file `-o`
     - One it can't bound, `**` or a group, reaches each link below its literal directory, walked
       as for a reader that follows links (`GLOB_AT_ANY_DEPTH`)
       - zsh's `***` matches through a link; bash's `**` with `globstar`, and zsh's `**` and

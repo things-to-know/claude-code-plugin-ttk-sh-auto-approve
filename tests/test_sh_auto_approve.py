@@ -6708,6 +6708,80 @@ class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
                 with self.subTest(command=command):
                     self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
 
+    def test_an_operator_of_zshs_extended_glob(self):
+        """With `EXTENDED_GLOB`, which a startup file can set, zsh reads an unquoted `^x` as any
+        name but `x` and `x#` as any run of `x`: `cat g/^x/id_rsa` reads `g/k/id_rsa`. Neither
+        layer read a word with no `*`, `?` or `[` as a wildcard, and both approved it with no
+        rule. A word that spells one is matched now, in the path checks alone."""
+        with self._project() as (project, home):
+            (project / "g").mkdir()
+            (project / "g" / "k").symlink_to(home / ".ssh")
+            for command in (
+                "cat src/^x/x.txt",
+                "cat src/lib#/x.txt",
+                "cat 'g/^x/id_rsa'",
+                "echo a#b c^d e~f",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: matches no link out")
+            for command in ("cat g/^x/id_rsa", "cat g/k#/id_rsa", "cat src/^x/id_rsa"):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through a link")
+
+    def test_an_operator_of_zshs_extended_glob_in_a_loop(self):
+        """zsh binds `f=d/y` in `for f in d/^x`, but the list word was a literal value, so a
+        quoted `"$f"` read `d/^x/k/id_rsa` as a path in the project. It is a glob now, as `d/*`
+        is. Here `d/y/k -> ~/.ssh`."""
+        with self._project() as (project, home):
+            (project / "d").unlink()
+            (project / "d" / "y").mkdir(parents=True)
+            (project / "d" / "y" / "k").symlink_to(home / ".ssh")
+            for command in (
+                'for f in e/^x; do cat "$f"; done',
+                'for r in HEAD~1 HEAD~2; do echo "$r"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: matches no link out")
+            for command in (
+                'for f in d/^x; do cat "$f"/k/id_rsa; done',
+                'for f in d/y#; do cat "$f"/k/id_rsa; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "zsh binds d/y, and d/y/k is ~/.ssh")
+            # A name such a list gives is one the shell splits, as a `*` list's is
+            (project / "n").mkdir()
+            (project / "n" / "x ..").write_text("one\n")
+            self.assert_allowed(
+                'for f in n/^z; do grep -r one "$f"; done', "the control: quoted, it is the name"
+            )
+            self.assert_refused_outright(
+                "for f in n/^z; do grep -r one $f; done", "zsh with SH_WORD_SPLIT reads .."
+            )
+
+    def test_a_loop_over_revisions_zsh_alone_globs(self):
+        """The flag checks read `HEAD~1` and `HEAD^` as bash does, but a list word with one
+        dropped its name from the values they read, so `main`'s approvals of these were refused.
+        Each is read as bash reads it, and as zsh may, the text before the operator followed by
+        any other: no flag. A `#` lets the character before it match nothing, as zsh 5.9 matched
+        `a#-o` against a file `-o`, and `^x` matches any name."""
+        with self._project():
+            for command in (
+                "for r in HEAD~1 HEAD~2; do git diff $r..HEAD; done",
+                'for r in HEAD~1 HEAD~2; do git diff "$r..HEAD"; done',
+                "for r in HEAD~1 HEAD~2; do git show $r:README.md; done",
+                "for r in HEAD^ HEAD^^; do git show $r:README.md; done",
+                'for r in HEAD~1; do echo "$(git show $r:README.md)"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "no match of HEAD~1 or HEAD^ is a flag")
+            for command in (
+                "for r in a#-o; do git diff $r..HEAD; done",
+                "for r in ^x; do git diff $r..HEAD; done",
+                "for r in -x^y; do git diff $r..HEAD; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "a match can be a flag")
+
     def test_an_assignment_that_holds_a_wildcard(self):
         """bash globs the value of an unquoted `$f`, so `f='k*'; cat $f/id_rsa` reads
         `k/id_rsa`. `_literal_assignments` reads no value with a wildcard, so `$f` was unread,
