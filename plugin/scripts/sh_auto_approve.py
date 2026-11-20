@@ -4746,7 +4746,9 @@ GIT_PATH_FLAG_VALUES = {
     # `range-diff` stops at its usage message on the options of `log` it doesn't take
     "range-diff": GIT_REVISION_VALUES | {"--creation-factor"},
     "rev-list": GIT_REVISION_VALUES,
-    "shortlog": GIT_REVISION_VALUES,
+    # `shortlog`'s own `-n` (`--numbered`) and `--committer` (`-c`) take no value: the next word
+    # is an operand, as git 2.48.1 read it
+    "shortlog": GIT_REVISION_VALUES - {"-n", "--committer"},
     "show": GIT_REVISION_VALUES,
     "stash": GIT_REVISION_VALUES,
 }
