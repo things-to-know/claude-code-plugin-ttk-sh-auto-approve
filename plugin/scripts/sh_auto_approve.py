@@ -1547,9 +1547,10 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
         return None
     # Both shells expand a `~` that starts a word of the list, and bash one in a word shaped like
     # an assignment: `for p in ~` binds the home directory, which the text `~` would place in the
-    # project. Each reading is one value the name may hold, `_tilde_readings`
+    # project. Each reading is one value the name may hold, `_tilde_readings`. One that keeps a
+    # tilde, as `for p in '~'` binds, is none to read: `LITERAL_TILDE`
     readings = _tilde_readings(token, parts)
-    if any(UNREAD_VALUE in reading for reading in readings):
+    if any(UNREAD_VALUE in reading or LITERAL_TILDE.search(reading) for reading in readings):
         return None
     return readings
 
@@ -1687,8 +1688,9 @@ def _assigned_value(value_token: str, parts: list[tuple[str, str]]) -> str | Non
 
 # A `~` in a value that filename expansion reads in each word the value splits into: one that
 # starts it, and under zsh's `magic_equal_subst` one after an `=` or a `:`. bash keeps it where an
-# unquoted `$x` splices the value in, and zsh expands it under `glob_subst`, which a startup file
-# can set: such a value, as in `x='a ~/b'`, has no one list of words to splice.
+# unquoted `$x` uses the value, and zsh expands it under `glob_subst`, which a startup file can
+# set: such a value, as `x='a ~/b'` and `for x in '~'` hold, has no one reading there. It is not
+# spliced, and a `for` value is not read at all.
 LITERAL_TILDE = re.compile(r"(?:^|[\s=:])~")
 
 

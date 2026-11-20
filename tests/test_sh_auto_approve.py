@@ -4587,19 +4587,21 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         """Both shells expand a `~` that starts a word of a `for` list, so `p` holds the home
         directory, which the text `~` placed in the project. `~-` is `$OLDPWD`, which the shell
         holds. bash 5.2 and zsh 5.9 each grepped a key from the home directory for `~`, `~/` and
-        `src ~`, and so did bash for `~-`, and for `pushd ~-`, with `OLDPWD` there."""
+        `src ~`, and so did bash for `~-`, and for `pushd ~-`, with `OLDPWD` there.
+
+        A quoted `'~'` binds the text `~`, a directory in the project, where an unquoted `$p` uses
+        it in bash and zsh by default; zsh 5.9 with `glob_subst` grepped the key from the home
+        directory for it. A `"$p"` reads the text in either shell, but a `for` value that keeps a
+        tilde is not read at all: `LITERAL_TILDE`."""
         with a_project_below_home():
-            for command in (
-                'for p in src; do grep -rl PRIVATE "$p"; done',
-                "for p in '~'; do grep -rl PRIVATE \"$p\"; done",  # a directory named `~`
-            ):
-                with self.subTest(command=command):
-                    self.assert_allowed(command, "the control")
+            self.assert_allowed('for p in src; do grep -rl PRIVATE "$p"; done', "the control")
             for command in (
                 "for p in ~; do grep -r -A30 'PRIVATE KEY' \"$p\"; done",
                 'for p in ~/; do grep -rl PRIVATE "$p"; done',
                 'for p in src ~; do grep -rl PRIVATE "$p"; done',
                 'for p in ~-; do grep -rl PRIVATE "$p"; done',
+                "for p in '~'; do grep -rl PRIVATE $p; done",
+                "for p in '~'; do grep -rl PRIVATE \"$p\"; done",
             ):
                 with self.subTest(command=command):
                     self.assert_no_opinion(command)
@@ -6500,7 +6502,9 @@ class ReadsATildeAsEachShellExpandsIt(Verdicts, unittest.TestCase):
                 with self.subTest(command=command):
                     self.assert_refused(command)
 
-    def test_a_loop_word_holds_each_reading(self):
+    def test_a_loop_word_the_shells_read_differently(self):
+        """bash's reading of `~"/x"` keeps the tilde, so the value is not read, `LITERAL_TILDE`;
+        the store is refused in the list."""
         with a_project_with_tilde_traps():
             self.assert_allowed('for f in ~/a/b/proj/README.md; do cat "$f"; done', "the control")
             self.assert_refused('for f in ~"/a/b/proj/t/id_rsa"; do cat "$f"; done')
