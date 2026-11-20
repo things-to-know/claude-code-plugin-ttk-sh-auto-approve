@@ -68,8 +68,17 @@ insists on its own filename, symlink to this file rather than copying it.
       after `for f in 'k*'` (`_globbed`)
     - So is a variable a `for` list binds to a wildcard's matches or to a `$(ls)`, read as each
       path the list can give it (`PICKED`), in a substitution's body too
+      - The credential check reads each list wherever its header stands, however often the
+        name is bound, as for an assignment below (`_wildcard_loop_values`)
     - So is a wildcard in front of a value the hook didn't read, as in `d1*/k/$g`, where a match
       leads into a store or to a directory that holds one
+    - An assignment's value that holds a wildcard, as in `f='k*'`, only the credential check
+      reads (`_wildcard_assignments`)
+      - The read scope and the flag check read `$f` as unread
+      - Wherever the structure puts it, as after `do` or `!`, and an append, `f+='k*'`, as the
+        text it adds
+      - A copy, `g=$f`, and the value an append adds to are values the hook doesn't read: the
+        residual of `cat $g/id_rsa` under `Bash(cat *)`
     - One it can't bound, `**` or a group, reaches each link below its literal directory, walked
       as for a reader that follows links (`GLOB_AT_ANY_DEPTH`)
       - zsh's `***` matches through a link; bash's `**` with `globstar`, and zsh's `**` and
