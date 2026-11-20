@@ -6660,6 +6660,65 @@ class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
                 "for f in $(ls a/b/key); do cat $f; done", "prints a/b/key, the key"
             )
 
+    def test_a_name_the_shell_splits(self):
+        """bash splits an unquoted `$f`, and a `$(ls)` in the list, at a blank: with a file `x k`,
+        `for f in x*; do cat $f/id_rsa; done` runs `cat x k/id_rsa`. A name the list gives that
+        the shell splits, or matches again, refuses the command, where the shell splits it."""
+        with self._project() as (project, _):
+            (project / "x k").write_text("one\n")
+            (project / "g").mkdir()
+            (project / "g" / "c").write_text("one\n")
+            for command in (
+                'for f in x*; do cat "$f"; done',
+                "for f in $(ls g); do cat g/$f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: reads each name whole")
+            for command in (
+                "for f in x*; do cat $f/id_rsa; done",
+                'for f in x*; do echo "$(cat $f/id_rsa)"; done',
+                # Wherever the header stands, however often the name is bound
+                "{ for f in x*; do cat $f/id_rsa; done; }",
+                "f=x; for f in x*; do cat $f/id_rsa; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads k/id_rsa")
+            (project / "g" / "a b").write_text("one\n")
+            self.assert_refused_outright('for f in $(ls g); do cat "g/$f"; done', "reads g/a, g/b")
+
+    def test_the_names_a_pattern_gives_from_the_root(self):
+        """A relative match is the text after its base and a `/`, which a base of `/` ends with:
+        from `/`, `*` gave `tc` for `/etc`, which the split check read in its place."""
+        names = hook._names_a_pattern_gives("*", ["/"])
+        self.assertTrue(names, "/ holds entries")
+        self.assertLessEqual(set(names), {entry.name for entry in Path("/").iterdir()})
+
+    def test_a_name_the_shell_rewrites_below_any_depth(self):
+        """A `**` list gives a name from any depth, as `x ..`, which `grep -r one $f` splits into
+        a recursive read of `..`; and zsh with `GLOB_SUBST` reads a file `~` as the home
+        directory. Here the project holds no link out, so only the names decide."""
+        with self._project() as (project, _):
+            for link in ("k", "d", "src/lib2"):
+                (project / link).unlink()
+            for command in (
+                "for f in **; do grep -r one $f; done",
+                "for f in *; do grep -r PRIVATE $f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: no name the shell rewrites")
+            (project / "src" / "lib" / "x ..").write_text("one\n")
+            self.assert_refused_outright("for f in **; do grep -r one $f; done", "reads ..")
+            self.assert_allowed('for f in **; do grep -r one "$f"; done', "quoted, it is the name")
+            (project / "src" / "lib" / "x ..").unlink()
+            (project / "~").write_text("one\n")
+            for command in (
+                "for f in *; do grep -r PRIVATE $f; done",
+                "for f in $(ls); do grep -r PRIVATE $f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "zsh's GLOB_SUBST reads ~ as home")
+            self.assert_allowed('for f in *; do grep -r PRIVATE "$f"; done', "quoted, ~ is a name")
+
     def test_a_word_spelled_around_two_values_this_module_didnt_read(self):
         """`PICKED` shared its byte with `UNREAD_VALUE`, so `${a}picked$b` read as the mark, and
         Layer B took both values out with it, to read `/.ssh/id_rsa` alone. bash splits the first

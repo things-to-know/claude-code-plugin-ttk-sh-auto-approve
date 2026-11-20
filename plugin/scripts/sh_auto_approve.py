@@ -2008,11 +2008,14 @@ def _bindings(segments: list[list[str]], parts: list[tuple[str, str]]) -> dict[s
     return counts
 
 
-def _command_index(words: list[str], *, refuse: bool) -> int | None:
+def _command_index(
+    words: list[str], *, refuse: bool, headers: list[int] | None = None
+) -> int | None:
     """The index of the command in this segment, past the structure in front of it, or None.
 
     The one walk to it, so that `_strip_structure`, which checks the command there, and
-    `_bindings`, which reads the builtin there, agree on where it starts. With ``refuse``, it
+    `_bindings`, which reads the builtin there, agree on where it starts, and `_loop_headers`,
+    which reads the index of each `for` it steps past, into ``headers``. With ``refuse``, it
     refuses what `_strip_structure` does on the way: `case` and `select`, a binding of a name
     `_refuse_binding` refuses, by an assignment or a `for` header, and an assignment that
     prefixes a command.
@@ -2025,6 +2028,8 @@ def _command_index(words: list[str], *, refuse: bool) -> int | None:
                 raise NotReadOnly(f"unsupported shell control structure: {word}")
             return index
         if word in WORD_LIST_HEADS:
+            if headers is not None:
+                headers.append(index)
             # The values a header binds are data, and its names are bindings, held to the
             # check an assignment gets: `for PATH in .` is `PATH=.`. A body after its `do` in
             # this segment is a command, as in `for p do touch x`.
@@ -2053,6 +2058,23 @@ def _command_index(words: list[str], *, refuse: bool) -> int | None:
             continue
         return index
     return None
+
+
+def _loop_headers(segment: list[str]) -> list[tuple[list[str], list[str]]]:
+    """Each `for` header with an `in` in this segment: the names it binds, and its list's words.
+
+    Wherever the walk to the segment's command steps past it, `_command_index`: at the start,
+    and after `do`, `then`, `{` or `!` too.
+    """
+    starts: list[int] = []
+    _command_index(segment, refuse=False, headers=starts)
+    found: list[tuple[list[str], list[str]]] = []
+    for start in starts:
+        names, _ = _header(segment, start)
+        end = start + 1 + len(names)
+        if segment[end : end + 1] == ["in"]:
+            found.append((names, segment[end + 1 :]))
+    return found
 
 
 def _program_index(words: list[str]) -> int | None:
@@ -6917,6 +6939,117 @@ def _refuse_a_wildcard_before_an_unread_value(
             )
 
 
+# What the shell splits an unquoted value at, with the default `IFS`, and then matches against the
+# directory: a name that holds one is more than one path, or another one. With the wildcards,
+# bash's `extglob` groups, and what zsh rewrites in a value with `GLOB_SUBST`, which a startup
+# file can set: a `~`, the operators of `EXTENDED_GLOB`, and a `\` that quotes the next character.
+SPLIT_OR_GLOBBED = frozenset(" \t\n*?[(|^#<>~\\")
+
+
+def _refuse_picks_the_shell_splits(
+    segments: list[list[str]], parts: list[tuple[str, str]], state: _ShellState
+) -> None:
+    """Layer B, for a name a glob or `$(ls)` list gives that the shell reads as another path.
+
+    bash splits an unquoted `$(ls)` in the list, and an unquoted `$f` where it is used, at a
+    blank, and matches each piece that holds a wildcard against the directory: with a file `x k`,
+    `for f in x*; do cat $f/id_rsa; done` reads `k/id_rsa`; and zsh with `GLOB_SUBST` reads a
+    file `~` as the home directory. `PICKED` reads each name whole, so a name that holds such a
+    character, `SPLIT_OR_GLOBBED`, refuses the command outright: one a `$(ls)` lists, and one a
+    glob matches where the command uses the name unquoted, in a substitution's body included. A
+    glob that can match at any depth, as `**` can, gives each name below its literal directory,
+    `_names_a_pattern_gives`.
+
+    Each such word of each header is read, wherever the header stands, `_loop_headers`, and
+    however many times its name is bound, since the check only adds a name to refuse.
+    """
+    unquoted: set[str] | None = None
+    bases = [base for base in state.shell_bases if UNREAD_VALUE not in base]
+    for segment in segments:
+        for header_names, words in _loop_headers(segment):
+            bound = [_expand(token, parts) for token in header_names]
+            for word in words:
+                shapes = _loop_value_shapes(word, parts)
+                if shapes is None or not any(PICKED in shape for shape in shapes):
+                    continue  # no glob or listing, or one the read scope doesn't resolve
+                whole = PLACEHOLDER.fullmatch(word)
+                names: list[str] = []
+                if whole is not None and parts[int(whole.group(1))][0] == SUBSTITUTION:
+                    listing = LISTING_BODY.match(parts[int(whole.group(1))][1])
+                    directory = (listing.group(1) if listing else None) or "."
+                    for base in bases if listing else []:
+                        names += _directory_names(os.path.join(base, directory))
+                else:
+                    if unquoted is None:
+                        unquoted = _names_used_unquoted(segments, parts)
+                    if not unquoted.intersection(bound):
+                        continue
+                    names += _names_a_pattern_gives(_glob_word(word, parts), bases)
+                for entry in names:
+                    if SPLIT_OR_GLOBBED & set(entry):
+                        raise NotReadOnly(
+                            f"the shell splits or matches again a name ${bound[-1]} takes: {entry}"
+                        )
+
+
+def _names_a_pattern_gives(pattern: str, bases: list[str]) -> list[str]:
+    """The text each path ``pattern`` matches puts in a word, from each of ``bases``.
+
+    A relative match is the part after its base and the `/` that follows it, which a base of `/`
+    ends with; an absolute one is whole. A pattern `GLOB_AT_ANY_DEPTH` holds is its literal
+    directory and each entry name below it, at any depth, which a walk finds as for a reader that
+    follows links: `**` gives `x ..` from a file of that name anywhere below. Raises
+    `NotReadOnly` past `MAX_WALKED_ENTRIES`.
+    """
+    if not GLOB_AT_ANY_DEPTH.search(pattern):
+        return [
+            match if pattern.startswith("/") else match[len(base.rstrip("/")) + 1 :]
+            for base in (["/"] if pattern.startswith("/") else bases)
+            for match in _glob_matches(pattern, [base])
+        ]
+    directory = _literal_directory(pattern)
+    if directory.startswith("/"):
+        roots = [directory]
+    else:
+        roots = [base if directory == "." else os.path.join(base, directory) for base in bases]
+    names = [directory]
+    seen: set[str] = set()
+
+    def visit(_directory: str, real: str) -> bool:
+        if real in seen:
+            return False
+        seen.add(real)
+        return True
+
+    try:
+        for _, _, entries in _walk_directories(roots, 0, visit, lambda _: True):
+            names += [name for name, _, _ in entries]
+    except _WalkTooLargeError:
+        raise NotReadOnly(
+            f"a wildcard that matches below more than {MAX_WALKED_ENTRIES} entries"
+        ) from None
+    except _WalkUnresolvableError as error:
+        raise NotReadOnly(str(error)) from None
+    return names
+
+
+def _names_used_unquoted(segments: list[list[str]], parts: list[tuple[str, str]]) -> set[str]:
+    """Each name an unquoted expansion in these segments uses, or one in a substitution's body.
+
+    A body is read whole, its quoted expansions included, which errs toward more names.
+    """
+    names = {
+        match.group(1)
+        for segment in segments
+        for word in segment
+        for match in UNQUOTED_EXPANSION.finditer(PLACEHOLDER.sub("", word))
+    }
+    for kind, value in parts:
+        if kind in RUNS_A_COMMAND:
+            names |= {match.group(1) for match in UNQUOTED_EXPANSION.finditer(value)}
+    return names
+
+
 class _ReadScope:
     """Where a reader may read from, and what is known about the command's variables."""
 
@@ -8924,6 +9057,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # whatever tier would otherwise approve it, nor may a link a reader follows lead to one.
     _refuse_credential_paths(reduced, parts, state)
     _refuse_followed_credential_links(segments, parts, state)
+    _refuse_picks_the_shell_splits(segments, parts, state)
 
     # Where readers may read. A relative path must be in scope from each working directory: a
     # `cd` inside a pipeline does not move the shell that runs the next command, so the module
