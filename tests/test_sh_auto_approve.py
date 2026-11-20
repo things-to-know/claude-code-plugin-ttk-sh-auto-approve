@@ -7213,6 +7213,14 @@ class RefusesFindWritingPredicates(Verdicts, unittest.TestCase):
                 command = f"find . -name AGENTS.md {predicate}"
                 self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
 
+    def test_the_delete_bfs_spells_rm(self):
+        """In Claude Code's Bash tool `find` is a function that runs the bfs embedded in Claude
+        Code, whose `-rm` deletes as `-delete` does: bfs 4.1.1's `--help` lists them together.
+        GNU find stops at it as an unknown predicate. Both were approved."""
+        self.assert_refused_outright("find . -name AGENTS.md -rm", "bfs deletes AGENTS.md")
+        self.assert_refused_outright("find -rm", "bfs deletes everything below .")
+        self.assert_refused_outright("find . '-rm'", "the quotes go before bfs reads it")
+
 
 class RefusesOutputThatIsNotInert(Verdicts, unittest.TestCase):
     """What a program that only reads still does by printing: a field wide enough to fill

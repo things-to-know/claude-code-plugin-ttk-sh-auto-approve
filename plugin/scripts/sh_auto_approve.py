@@ -4019,6 +4019,9 @@ def _may_exist(path: str) -> bool:
 def _check_find(args: list[str]) -> None:
     """Validate find: prevent root traversal, execution, deletion, and file writing.
 
+    In Claude Code's Bash tool `find` is a function that runs the bfs embedded in Claude Code,
+    which deletes with `-rm` as with `-delete`: bfs 4.1.1's `--help` lists them together.
+
     A wildcard inside `-name '*.md'` is an argument find matches for itself and the shell
     never touches. Refusing it cost every `-name` and `-path` pattern and bought nothing, so
     only a wildcard the shell will expand is refused, in `_check_command`.
@@ -4030,6 +4033,8 @@ def _check_find(args: list[str]) -> None:
             ("-exec", "-delete", "-ok", "-fprint", "-fprintf", "-fls")
         ):
             raise NotReadOnly(f"find writing flag: {arg}")
+        if arg == "-rm":
+            raise NotReadOnly("find writing flag: -rm, which bfs reads as -delete")
         if arg == "-printf" and _exceeds_width_cap(args[index + 1 : index + 2]):
             raise NotReadOnly(f"find -printf field wider than {PRINTF_WIDTH_CAP}")
 
