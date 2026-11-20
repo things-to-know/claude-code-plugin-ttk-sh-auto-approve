@@ -27,6 +27,9 @@ insists on its own filename, symlink to this file rather than copying it.
   transcript, every value replaced; its docstring says what it keeps
 - `tools/verdict_diff.py` lists the commands the hook's tests ask whose verdict differs between
   an earlier hook and the working copy's, each asked in its test's context
+- `tools/tests_against.py` runs chosen tests against the working copy's hook and against another,
+  a revision's or a file, and prints each result, such as a finding's test failing on the hook a
+  review read
 - `pyproject.toml` and `uv.lock` pin the dev tools (`coverage`, `ruff`), which `uv` installs
   into `.venv`; neither ships
 - `docs/` holds the guides that would grow `README.md` too long: installing from a clone, and
