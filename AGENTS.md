@@ -39,6 +39,8 @@ insists on its own filename, symlink to this file rather than copying it.
   - Known gap: a read-only command can still print a secret
     - The hook approves reading a `.env` file inside the project, an `additionalDirectories`
       entry or the session's scratchpad, `grep -r` included
+    - And one a project's `Read()` allow rule names, unless a `Read()` deny or ask rule matches
+      it; see `Read()` below
     - README § "Secrets inside your project" tells users what still stops it
   - Known gap: a link a command makes before it reads through it
     - Both layers resolve a path through the links on disk, and through each link an `ln` in
@@ -108,6 +110,55 @@ insists on its own filename, symlink to this file rather than copying it.
     - That includes `-L`, a word spliced in from a variable, a command with a job behind `&`
       (in its substitutions too), a process substitution, and any curlrc unless the command
       starts with `curl -q`
+- **`Read()`**
+  - The read scope takes in what the project's `Read()` allow rules name (`_read_rule_grants`)
+    - `Read(//<dir>/**)` or `Read(~/<dir>/**)`: the directory, as an `additionalDirectories`
+      entry, with its exclusions (`_reaches_a_secret`)
+    - `Read(//<file>)` or `Read(~/<file>)`: that file alone, not a directory or a link
+    - No other form: a relative one names a path in scope already, and any other wildcard is
+      left to Claude Code
+    - From the 2 files the Bash rules come from, only where Claude Code applies them
+  - A grant is a read, and git runs what its repository's config names: under a grant, git is
+    vouched for only where the repository's git directory and common directory are in the roots
+    (`_git_config_trusted`)
+    - So in a worktree of the project's repository, in another session's scratchpad
+    - Not in a repository whose config is its own, unpacked in a granted directory
+    - Any directory holding a `HEAD` is a git directory to the hook (`_git_dir_at`): git may
+      take one for it by what `HEAD` holds, a link into `refs/` included
+    - Not in a command that makes a link (`_PLANNED_LINKS`): it may be the `.git` git reads,
+      which isn't on the disk yet
+    - For `-C`, from which git finds the repository, and for a directory a `pushd` moves git or
+      `gh` to (`_check_where_git_runs`)
+      - `gh` runs git there to find its repository
+      - Nor does the hook run git there itself, to ask where a remote leads
+        (`_check_git_remote_reach`)
+      - Any other program reads there under the grant alone
+    - Known gap: a deny rule doesn't stop git printing a path from history, in objects the
+      project's git already reads
+  - A `Read()` deny or ask rule withholds what it matches, read broadly (`_withheld_patterns`)
+    - A negated allow rule, `Read(!...)`, withholds too, though Claude Code's docs define the
+      negation only for deny and ask rules
+    - From the project's settings, the user's and the managed ones, as for `curl`
+    - From those grants only: not from the project, its `additionalDirectories` or the
+      scratchpad, which README § "Secrets inside your project" covers
+    - A directory is withheld where a rule matches anything below it, read from the disk
+      (`_withheld_below`)
+      - Past `MAX_WALKED_ENTRIES` entries, it is withheld
+      - Through the walk a reader that follows links walks (`_walk_directories`)
+        - Below a link, as below a directory, only where a rule can still match there
+        - There for every reader, wherever the link leads: under a rule such as `Read(//**/.env)`,
+          a link to a large tree withholds the directory, a cost the README's "`Read()` rules"
+          section names
+      - From where the path leads, a link before the `..` after it
+      - Not at all where no rule can match below the directory
+  - Nothing is granted while a settings file the hook reads can't be read
+    - Nor while managed settings set `allowManagedPermissionRulesOnly`
+    - Nor while Claude Code's command line carries `--settings` or `--disallowedTools`, which add
+      rules the hook doesn't read, or can't be read
+  - Out of the hook's view: managed settings from the server or a macOS configuration profile,
+    as for `curl`
+  - Open: the user's own `Read()` allow rules, such as `Read(~/.claude/CLAUDE.md)`, which the hook
+    leaves to Claude Code, as it does their Bash rules (#114)
 - **Widening**: a change that approves more records where it stops, as
   `TheWideningsHaveAnEdge` does for the loop and splice widenings
   - Each new approval comes with its paired refusals
@@ -257,6 +308,9 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   - The hook reads allow and deny rules, and `additionalDirectories`, only from the project's
     `.claude/settings.json` and `.claude/settings.local.json`; Claude Code alone applies a rule
     from any other settings file
+    - Except the `WebFetch` and `Read()` deny and ask rules, and the negated `Read(!...)` allow
+      rules, which the hook reads from the user's and the managed settings too, to withhold a
+      site or a read
   - It takes a file's allow rules and `additionalDirectories` only where Claude Code applies the
     file: in a workspace with a trust record in Claude Code's global config, from a setting
     source the session loaded
@@ -265,12 +319,15 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
     - The hook reads `--setting-sources` from Claude Code's command line, its parent process's
     - `tools/explain.py` reads this machine's trust records; `--setting-sources user` explains a
       session started with `--setting-sources user`
-  - `--no-rules` and `--settings <file>` replace those 2 files, `additionalDirectories` included
+    - It explains a session started without `--settings` or `--disallowedTools`, under either of
+      which the hook grants no `Read()` rule
+  - `--no-rules` and `--settings <file>` replace those 2 files, `additionalDirectories` and
+    `Read()` rules included
   - `--no-rules`: whether the hook approves the rule's command without the rule
     - If it does, the rule is redundant wherever the hook runs. It stays silent below
       `MINIMUM_PYTHON`, outside Linux and macOS, and on any error, and there the rule decides
-    - For a command that reads an `additionalDirectories` entry, use `--settings` instead, with a
-      file that holds only the entries
+    - For a command that reads an `additionalDirectories` entry, or a path a `Read()` allow rule
+      names, use `--settings` instead, with a file that holds only the entries or those rules
   - `--settings <file>`: what else the rule approves
     - First a command the rule matches and `--no-rules` doesn't approve. It has to come back
       `allow`: a file that doesn't exist reads as no rules, without a word

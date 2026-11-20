@@ -28,7 +28,8 @@ A [Claude Code](https://code.claude.com/docs) plugin with 2 hooks:
 > [!WARNING]
 > The hook approves reads anywhere inside the project, its `additionalDirectories` and the
 > session's scratchpad, and a secret kept there is a file like any other: `cat .env` and
-> `grep -r PASSWORD .` are approved.
+> `grep -r PASSWORD .` are approved. So are reads of what a project's `Read()` allow rule names,
+> as [`Read()` rules](#read-rules) below says.
 >
 > The hook refuses a command that names a credential store under your home directory, such as
 > `~/.aws` or `~/.ssh`, but refusing only leaves the call to Claude Code. Claude Code runs a
@@ -57,6 +58,58 @@ A [Claude Code](https://code.claude.com/docs) plugin with 2 hooks:
 > trusted, from a setting source the session loaded. It drops an entry that is or contains your
 > home directory, or that is, contains or sits inside a credential store; each entry it keeps
 > widens what it may read.
+
+## `Read()` rules
+
+A `Read()` allow rule lets Claude Code's own file tools read a path without asking, and the hook
+approves a Bash read of the same path, such as `cat`, `grep -r` or `git -C`. It reads the rules
+from the project's `.claude/settings.json` and `.claude/settings.local.json`, and only where
+Claude Code applies them, as for `additionalDirectories` above:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read(~/.claude/plugins/**)",
+      "Read(//tmp/claude-1000/-home-me-src-app/**)",
+      "Read(~/.claude/CLAUDE.md)"
+    ]
+  }
+}
+```
+
+- `Read(//<dir>/**)` or `Read(~/<dir>/**)` adds the directory, as an `additionalDirectories`
+  entry does, and the hook drops it for the same reasons: a directory that is or contains your
+  home directory, or that is, contains or sits inside a credential store or `/proc`
+- `Read(//<file>)` or `Read(~/<file>)`, with no `/**`, adds that file alone: not where it is a
+  directory or a link
+- No other form adds anything: one relative to the project, such as `Read(/src/**)` or
+  `Read(src/**)`, names a path the hook reads already, and the hook leaves any other wildcard,
+  such as `Read(//tmp/*.log)`, to Claude Code
+- git runs the programs its repository's config names, such as `core.fsmonitor` on
+  `git status`, and a rule grants a read. So in a directory a rule adds, the hook approves git
+  only in a repository whose git directory is in the project or an `additionalDirectories`
+  entry, such as a worktree of the project's repository in another session's scratchpad, and
+  not in a repository you unpacked there, nor in a command that makes a link with `ln`. The same
+  holds where `cd` or `pushd` moves git, or `gh`, which runs git there to find its repository
+- A `Read()` deny or ask rule withholds what it matches from these rules, and so does a negated
+  allow rule such as `Read(!//tmp/x/secret)`. A directory is withheld where a rule matches
+  anything below it: with `Read(//**/.env)`, `grep -r x <dir>` prompts once `<dir>` holds a
+  `.env`, while `cat <dir>/a.txt` doesn't. The hook reads these rules from the project's files,
+  your user settings and the managed settings, as for [`curl`](#the-list)
+- To find such a match, the hook looks below each link in the directory where a rule could match
+  below it, wherever the link leads, for every reader. So with a rule such as `Read(//**/.env)`,
+  which matches at any depth, a directory holding a link to a large tree, such as `/usr`, prompts
+  for `ls` and `grep -r` too, once the hook has looked at 50,000 entries
+- A deny rule doesn't stop git printing a file from a repository's history, such as with
+  `git show HEAD~1:<file>`: in a worktree of the project's repository, those are objects the hook
+  already lets git read for the project
+- Nothing is added while one of those files exists and can't be read, nor while managed
+  settings set `allowManagedPermissionRulesOnly`
+- Nor while Claude Code runs with `--settings` or `--disallowedTools`, whose rules the hook
+  doesn't read. Managed settings from the server or a macOS configuration profile are out of its
+  view
+- An allow rule in your user settings lets Claude Code's file tools read the path, and not Bash
 
 ## `curl`
 

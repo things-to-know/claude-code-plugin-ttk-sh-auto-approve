@@ -112,6 +112,7 @@ tool call. Test it by hand from the repository root with the payload Claude Code
 from __future__ import annotations
 
 import copy
+import functools
 import itertools
 import json
 import math
@@ -119,7 +120,8 @@ import os
 import re
 import shlex
 import sys
-from collections.abc import Callable
+import unicodedata
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import NoReturn
@@ -366,10 +368,11 @@ SCRATCH_DIRECTORY = re.compile(SCRATCH_COMPONENT + "+")
 #
 # Layer A is the boundary, for the readers this module knows: a file operand must resolve
 # inside the project, an `additionalDirectories` entry of the project's settings files
-# (`_read_roots`), or this session's scratch directory. The same roots bound where `git -C`
-# may point, and the files a git read subcommand opens (`_git_file_operands`). Anything else,
-# and anything the module cannot resolve, is not this module's to approve and falls through
-# to the operator's own rules.
+# (`_read_roots`), a directory or file one of their `Read()` allow rules names and no `Read()`
+# deny or ask rule withholds (`_read_rule_grants`), or this session's scratch directory. The same
+# roots bound where `git -C` may point, and the files a git read subcommand opens
+# (`_git_file_operands`). Anything else, and anything the module cannot resolve, is not this
+# module's to approve and falls through to the operator's own rules.
 # --------------------------------------------------------------------------------------
 
 # Relative to the home directory. Each is a directory or file whose contents are a secret or
@@ -389,7 +392,9 @@ SCRATCH_DIRECTORY = re.compile(SCRATCH_COMPONENT + "+")
 #   * or flipping this module's allow-or-silent invariant so layer B emits `deny`, which
 #     the tests currently forbid
 # TODO(option): read the operator's own `Read()` deny rules from all four settings files and
-# refuse any operand that matches them, instead of keeping a second list here.
+# refuse any operand that matches them, instead of keeping a second list here. They are read
+# already, from the project's, the user's and the managed settings, but only to withhold what a
+# `Read()` allow rule grants (`_read_rule_grants`), not as Layer B.
 # TODO(verify): which programs Claude Code's native Read-deny matcher recognizes beyond the
 # documented cat/head/tail/sed/tee. Probe: deny `Read(~/deny-probe/**)`, place a junk file
 # there, and ask Claude to read it with jq, sort, diff, wc and grep.
@@ -2962,7 +2967,7 @@ def _check_git_remote_reach(args: list[str], scope: _ReadScope | None) -> None:
             f"git may run where CDPATH takes a cd, which this module can't read: {place}; "
             "a cd target spelled ./<dir> is never looked up in CDPATH"
         )
-    _check_where_it_runs(_unvouched_directory(scope.run_bases, scope))
+    _check_where_it_runs(_unvouched_directory(scope.run_bases, _for_git(scope)))
     for cwd in scope.run_bases:
         for name in names or [None]:
             url = _git_remote_url(cwd, name, scope)
@@ -3817,7 +3822,7 @@ def _outside_settings() -> tuple[list[object], list[object], bool]:
     value is then false, and so it is for a ``CLAUDE_CONFIG_DIR`` or home directory that is not
     absolute, or a ``managed-settings.d/`` that cannot be listed.
     """
-    config = os.environ.get(CONFIG_DIR_ENV) or os.path.join(_home(), ".claude")
+    config = _config_dir()
     if not os.path.isabs(config):
         return [], [], False
     groups: tuple[list[Path], list[Path]] = ([Path(config, "settings.json")], [])
@@ -3844,6 +3849,19 @@ def _outside_settings() -> tuple[list[object], list[object], bool]:
     return documents[0], documents[1], True
 
 
+# What `_outside_settings` read for the command being classified: the `Read()` grants and `curl`
+# each ask. Reset by `_classify`.
+_OUTSIDE_SETTINGS: tuple[list[object], list[object], bool] | None = None
+
+
+def _outside_settings_once() -> tuple[list[object], list[object], bool]:
+    """`_outside_settings`, read once per command."""
+    global _OUTSIDE_SETTINGS  # noqa: PLW0603 - per command, as `_WALKS` is
+    if _OUTSIDE_SETTINGS is None:
+        _OUTSIDE_SETTINGS = _outside_settings()
+    return _OUTSIDE_SETTINGS
+
+
 def _check_curl(
     args: list[str], rewritten: list[bool], spliced: list[bool], scope: _ReadScope | None
 ) -> None:
@@ -3865,7 +3883,7 @@ def _check_curl(
     * no curlrc, unless the command starts with ``curl -q``
     """
     sites = (
-        _curl_sites(scope.settings, _outside_settings())
+        _curl_sites(scope.settings, _outside_settings_once())
         if scope is not None and scope.settings is not None
         else frozenset()
     )
@@ -4473,6 +4491,7 @@ def _check_command(
         # through a rule. A native `Bash(gh issue view *)` rule still lets Claude Code run it
         # without asking; only a native deny rule stops that.
         _check_gh_read(args, _rewritten_words(arg_tokens, live_globs, parts))
+        _check_where_git_runs(scope)
         return
 
     # `curl` returns here for the same reason: an operator's `Bash(curl ...)` rule granted it
@@ -4600,13 +4619,16 @@ def _check_command(
     # can name a program git runs: `core.fsmonitor` on `status`, `gpg.program` on a `log`
     # that shows signatures. That is `--git-dir` under another name, so a directory
     # outside the read roots is not this module's to approve. Read before the early return
-    # below, and before `_check_git_remote_reach`, which runs git in that directory.
+    # below, and before `_check_git_remote_reach`, which runs git in that directory. A
+    # `Read()` grant is a read, so `-C` is measured in git's scope, which vouches for one only
+    # where git's config is in the roots (`_for_git`). The files git reads from there are reads.
     if program == "git":
         index, directories = _git_global_options(args)
         if len(directories) > 1:
             raise NoOpinion("git -C given more than once, each relative to the last")
-        for position in directories if scope is not None else []:
-            problem = _read_scope_problem(arg_tokens[position], args[position], parts, scope)
+        git_scope = _for_git(scope) if scope is not None else None
+        for position in directories if git_scope is not None else []:
+            problem = _read_scope_problem(arg_tokens[position], args[position], parts, git_scope)
             if problem is not None:
                 raise NoOpinion(f"git -C points at {problem}")
         # Layer A, below, for the files git opens, which it resolves from the `-C` directory,
@@ -4640,6 +4662,11 @@ def _check_command(
         for link, _ in links:
             if not _in_scope(link, scope):
                 raise NoOpinion(f"{program} follows the link {link} out of the working directories")
+    # Last, as the check of where every program runs comes after its own (`_classify_with`): a
+    # directory a `cd` or `pushd` moves git to, and `gh api`, which runs git there to fill in
+    # `{owner}` and `{repo}`, measured in git's scope
+    if program in ("git", "gh"):
+        _check_where_git_runs(scope)
 
 
 # The read subcommands whose operands include paths git resolves in its repository: pathspecs,
@@ -5170,7 +5197,7 @@ def _workspace_trusted() -> bool:
         or (config_dir is not None and not os.path.isabs(config_dir))
     ):
         return False
-    legacy_dirs = {config_dir or os.path.join(_home(), ".claude"), os.path.join(_home(), ".claude")}
+    legacy_dirs = set(_config_dirs())
     if any(os.path.lexists(os.path.join(d, ".config.json")) for d in legacy_dirs):
         return False
     path = Path(config_dir or _home(), ".claude.json")
@@ -5288,13 +5315,14 @@ def _read_roots(settings: tuple[list[dict], bool] | None = None) -> list[str]:
       that names a store, and a store's parent is not one: with ``~/.config`` as a root,
       ``grep -r token ~/.config`` reads ``~/.config/gh/hosts.yml`` and names nothing Layer B
       knows
+
+    The ``Read()`` allow rules of the same files widen the scope too: `_read_rule_grants`.
     """
     roots = [os.path.realpath(REPO_ROOT)]
     found, usable = settings or _settings_permissions()
     if not usable:
         return roots
-    home = os.path.realpath(_home())
-    stores = [os.path.realpath(store) for store in _credential_roots()] + ["/proc"]
+    bounds = _secret_bounds()
     for permissions in found:
         entries = permissions.get("additionalDirectories")
         for entry in entries if isinstance(entries, list) else []:
@@ -5303,16 +5331,547 @@ def _read_roots(settings: tuple[list[dict], bool] | None = None) -> list[str]:
             try:
                 path = os.path.expanduser(entry) if entry.startswith("~") else entry
                 path = os.path.realpath(os.path.join(str(REPO_ROOT), path))
-                if (
-                    _is_under(home, path)
-                    or any(_is_under(store, path) or _is_under(path, store) for store in stores)
-                    or not os.path.isdir(path)
-                ):
+                if _reaches_a_secret(path, bounds) or not os.path.isdir(path):
                     continue
             except (OSError, ValueError):
                 continue
             roots.append(path)
     return roots
+
+
+def _secret_bounds() -> tuple[str, list[str]]:
+    """What `_reaches_a_secret` measures a root against, resolved once per caller.
+
+    The real path of the home directory, and of each credential store and ``/proc``.
+    """
+    stores = [os.path.realpath(store) for store in _credential_roots()] + ["/proc"]
+    return os.path.realpath(_home()), stores
+
+
+def _reaches_a_secret(path: str, bounds: tuple[str, list[str]]) -> bool:
+    """Whether a read root at ``path``, a real path, would take in a secret: `_read_roots`.
+
+    It is or contains the home directory, or it is, contains or sits inside a credential store
+    or ``/proc``, as ``bounds`` (`_secret_bounds`) names them.
+    """
+    home, stores = bounds
+    return _is_under(home, path) or any(
+        _is_under(store, path) or _is_under(path, store) for store in stores
+    )
+
+
+# A `Read` permission rule, bare or with a specifier: how a deny or ask rule is read, broadly
+READ_RULE = re.compile(r"Read(?:\((.*)\))?", re.DOTALL)
+# What an allow rule grants, read as written: an absolute path, `//<path>`, or one from the home
+# directory, `~/<path>`, with no wildcard but a last `/**`, which takes in the whole directory.
+# No control character, backslash, bracket or brace in the path, and no whitespace at its end,
+# which Claude Code may trim (`_read_rule_grants`): a rule this reads as no grant only costs a
+# prompt.
+READ_ALLOW_RULE = re.compile(r"Read\(((?://|~/)[^\x00-\x1f\x7f*?\[\]{}\\]*?)(/\*\*)?\)")
+# A character that makes a component of a deny or ask rule a pattern rather than a name. A
+# bracket, a backslash and a brace each make it match every name (`_compiled`): Claude Code's
+# docs name gitignore's syntax, which has the first two, and say nothing of braces either way.
+READ_PATTERN_SPECIAL = re.compile(r"[*?\[\\{]")
+
+# Claude Code's options that add permission rules from the command line, which the hook doesn't
+# read: a deny or ask rule among them may withhold what a `Read()` allow rule grants
+UNSEEN_RULE_FLAGS = ("--settings", "--disallowedTools", "--disallowed-tools")
+
+# Whether the session's command line carries `UNSEEN_RULE_FLAGS`. `main()` sets it to None, so the
+# first call that needs it reads Claude Code's command line (`_session_has_unseen_rules`). In
+# process, as `tools/explain.py` runs the module, it is false, as in a session started without them.
+_UNSEEN_RULES: bool | None = False
+
+# The `Read()` grants of the command being classified, read from the settings the first time a
+# path outside the roots is asked about, and once per command however many times it is read
+# (`_scope_grants`). Reset by `_classify`.
+_READ_GRANTS: _ReadGrants | None = None
+
+# A pattern's component, compiled: `**`, any name, a name, a name with one `*` and no `?`, or
+# another with `*` or `?` in it
+ANY_DEPTH, ANY_NAME, NAME, AFFIXES, WILDCARD = "**", "any", "name", "affixes", "wildcard"
+
+
+class _ReadGrants:
+    """What the project's ``Read()`` allow rules add to the read scope, and what holds it back.
+
+    ``directories`` and ``files`` are pairs of the path a rule names and its real path, as
+    `_read_rule_grants` builds them. ``withheld`` is every pattern of a ``Read()`` deny or ask
+    rule, as `_withheld_patterns` builds them: the components of an absolute path, each a name or
+    a pattern, and ``**`` for any number of them. Each is matched by the states it can be in
+    after a path's components, one set of indexes into it per pattern, so that a walk advances
+    them by one name per entry rather than matching each entry's whole path again.
+    """
+
+    __slots__ = ("directories", "files", "patterns", "plans", "start", "walks")
+
+    def __init__(
+        self,
+        directories: list[tuple[str, str]],
+        files: list[tuple[str, str]],
+        withheld: list[tuple[str, ...]],
+    ) -> None:
+        self.directories = directories
+        self.files = files
+        self.patterns = tuple(dict.fromkeys(_compiled(pattern) for pattern in withheld))
+        self.start = tuple(_star_closure({0}, pattern) for pattern in self.patterns)
+        # What one more name does to each set of states a walk reaches: `_plan`
+        self.plans: dict[tuple[frozenset[int], ...], tuple] = {}
+        # What `_withheld_below` found, by the directory as spelled and the links the command
+        # makes, for the command being classified
+        self.walks: dict[tuple, bool] = {}
+
+    def cover(self, absolute: str, resolved: str) -> bool:
+        """Whether a rule grants the read of ``absolute``, which leads to ``resolved``.
+
+        ``absolute`` is the path as the program gets it. As Claude Code applies an allow rule, it,
+        normalized, and ``resolved`` both have to match it: a link in a granted directory that
+        leads out of it is not covered. The path a rule names, and its real path, are both the
+        directory or file it grants, as ``/tmp`` and ``/private/tmp`` are on macOS. As Claude Code
+        applies a deny rule, no deny or ask rule may match either, nor a directory above them,
+        nor, where ``resolved`` is a directory, anything below it: `_withheld_below`.
+        """
+        normal = os.path.normpath(absolute)
+        if UNREAD_VALUE in normal or UNREAD_VALUE in resolved:
+            return False
+        if not any(
+            (_is_under(normal, named) or _is_under(normal, real)) and _is_under(resolved, real)
+            for named, real in self.directories
+        ) and not any(normal in (named, real) and resolved == real for named, real in self.files):
+            return False
+        if any(self._run(_path_components(path))[1] for path in (normal, resolved)):
+            return False
+        return not (os.path.isdir(resolved) and self._withheld_below(absolute))
+
+    def _run(
+        self, components: Iterable[str], states: tuple[frozenset[int], ...] | None = None
+    ) -> tuple[tuple[frozenset[int], ...], bool]:
+        """The states after ``components``, from ``states`` or the start, and whether one matched.
+
+        A match on the way counts: the path, or a directory above it, which takes in what it
+        holds.
+        """
+        states = self.start if states is None else states
+        for name in components:
+            if self._matched(states):
+                return states, True
+            states = self._step(states, _fold(name))[0]
+        return states, self._matched(states)
+
+    def _step(
+        self, states: tuple[frozenset[int], ...], folded: str
+    ) -> tuple[tuple[frozenset[int], ...], bool, bool]:
+        """The states after one more name, with whether they match and whether any can still.
+
+        ``folded`` is the name after `_fold`, and ``states`` are short of a match. A name moves
+        only the components `_plan` lists for it, a lookup for a plain name, and every other
+        pattern stays where its ``**`` keeps it.
+        """
+        stay, matched, alive, by_name, others = self._plan(states)
+        moves = [
+            *by_name.get(folded, ()),
+            *(
+                (index, target)
+                for index, kind, text, target in others
+                if _component_matches(kind, text, folded)
+            ),
+        ]
+        if not moves:
+            return stay, matched, alive
+        following = list(stay)
+        for index, target in moves:
+            following[index] = following[index] | _star_closure({target}, self.patterns[index])
+        result = tuple(following)
+        return result, self._matched(result), any(result)
+
+    def _plan(self, states: tuple[frozenset[int], ...]) -> tuple:
+        """What one more name does to ``states``, worked out once for each.
+
+        Where each pattern stays whatever the name, through its ``**``, with whether that
+        matches and whether any can still; the components a plain name moves, by the name; and
+        every other component, which is matched against each name.
+        """
+        if states not in self.plans:
+            stay: list[frozenset[int]] = []
+            by_name: dict[str, list[tuple[int, int]]] = {}
+            others: list[tuple[int, str, object, int]] = []
+            for index, (pattern, current) in enumerate(zip(self.patterns, states, strict=True)):
+                kept = {position for position in current if pattern[position][0] == ANY_DEPTH}
+                stay.append(_star_closure(kept, pattern))
+                for position in current:  # each short of the end: a match ends the walk
+                    kind, text = pattern[position]
+                    if kind == NAME:
+                        by_name.setdefault(text, []).append((index, position + 1))
+                    elif kind != ANY_DEPTH:
+                        others.append((index, kind, text, position + 1))
+            kept_states = tuple(stay)
+            alive = any(kept_states)
+            self.plans[states] = kept_states, self._matched(kept_states), alive, by_name, others
+        return self.plans[states]
+
+    def _matched(self, states: tuple[frozenset[int], ...]) -> bool:
+        return any(
+            len(pattern) in current for pattern, current in zip(self.patterns, states, strict=True)
+        )
+
+    def _withheld_below(self, absolute: str) -> bool:
+        """Whether a deny or ask rule matches anything below ``absolute``, a directory.
+
+        A read of the directory may read it: `grep -r`, `git -C`, `ls`. Read from the disk by
+        `_walk_directories`, which a reader that follows links walks too, with the links the
+        command makes, from where ``absolute`` leads: a link before the `..` after it, as the
+        kernel resolves it. Each entry is matched as the reader spells it, below ``absolute``
+        normalized, and where it resolves, as Claude Code applies a deny rule to either. A
+        directory is listed again only where it is reached with other states, and not at all
+        where no pattern can match below it. Raises `OSError` past `MAX_WALKED_ENTRIES` entries,
+        which `_in_scope` reads as out of scope.
+        """
+        key = (absolute, _planned_links_key())
+        if key not in self.walks:
+            self.walks[key] = self._withheld_below_uncached(absolute)
+        return self.walks[key]
+
+    def _withheld_below_uncached(self, absolute: str) -> bool:
+        start = self._run(_path_components(os.path.normpath(absolute)))[0]
+        if not any(start) and not any(
+            any(self._run(_path_components(real))[0]) for real in _resolutions(absolute)
+        ):
+            return False  # no pattern can match below it, as spelled or where it leads
+        # The states each directory is reached with, by the path the walk came by and by its own
+        spelled = {absolute: start}
+        real_states: dict[str, tuple[frozenset[int], ...]] = {}
+        seen: set[tuple] = set()
+
+        def visit(directory: str, real: str) -> bool:
+            key = (real, spelled[directory])
+            if key in seen:
+                return False
+            seen.add(key)
+            return True
+
+        def descend(path: str) -> bool:
+            return path in spelled
+
+        for directory, real, entries in _walk_directories([absolute], 0, visit, descend):
+            if real not in real_states:
+                states, matched = self._run(_path_components(real))
+                if matched:
+                    return True  # a link the walk came by leads to a directory a pattern names
+                real_states[real] = states
+            above, real_above = spelled[directory], real_states[real]
+            # The one spelling, where no link is on the way
+            same = above == real_above
+            for name, is_link, is_directory in entries:
+                folded = _fold(name)
+                below, matched, alive = self._step(above, folded)
+                real_below, real_matched, real_alive = (
+                    (below, matched, alive) if same else self._step(real_above, folded)
+                )
+                if matched or real_matched:
+                    return True
+                if (is_link or is_directory) and (alive or real_alive):
+                    spelled[os.path.join(directory, name)] = below
+                    if not is_link:
+                        real_states[os.path.join(real, name)] = real_below
+        return False
+
+
+NO_READ_GRANTS = _ReadGrants([], [], [])
+
+
+def _scope_grants(scope: _ReadScope) -> _ReadGrants:
+    """``scope``'s grants: its own, or, where it has none of its own, the project's.
+
+    The project's are read once per command (`_READ_GRANTS`), and only once a path outside the
+    roots is asked about, so that a command that reads inside them reads no other settings file.
+    """
+    global _READ_GRANTS  # noqa: PLW0603 - per command, as `_WALKS` is
+    if scope.grants is not None:
+        return scope.grants
+    if _READ_GRANTS is None:
+        _READ_GRANTS = _read_rule_grants(scope.settings)
+    return _READ_GRANTS
+
+
+def _read_rule_grants(settings: tuple[list[dict], bool] | None = None) -> _ReadGrants:
+    """What the ``Read()`` allow rules of the project's settings files add to the read scope.
+
+    From the same two files as ``additionalDirectories``, and only from a file Claude Code
+    applies (``_settings_permissions``): a rule there is a read the operator already granted
+    Claude Code's own file tools. Claude Code also reads the user's own settings file, which this
+    module leaves alone as it does for the Bash rules. A rule grants:
+
+    - ``Read(//<dir>/**)`` or ``Read(~/<dir>/**)``: the directory and everything below it, as an
+      ``additionalDirectories`` entry does, and with the same exclusions (`_reaches_a_secret`)
+    - ``Read(//<file>)`` or ``Read(~/<file>)``: that path alone, and not where it is a directory
+      or a link, nor where it sits inside a credential store or ``/proc``
+    - no other rule anything: one relative to the project or the working directory names a path
+      already in scope, and one with any other wildcard is left to Claude Code
+
+    A path the rule names has to be normal, with no ``.``, ``..`` or empty component, and the
+    directories above it are resolved, so that it names what the read scope compares: real paths.
+    One that can't be resolved, as with a lone surrogate, grants nothing.
+
+    A ``Read()`` deny or ask rule withholds what it matches from these grants, from the project's
+    files, whether or not Claude Code applies them, the user's, and the managed ones, as for
+    `_curl_sites`; and so does a negated allow rule, ``Read(!...)``, read broadly though Claude
+    Code's docs define the negation only for deny and ask rules. Nothing is granted:
+
+    - while a file cannot be read, or a list in one
+    - while a rule withholds every path (`_withheld_patterns`)
+    - while managed settings set ``MANAGED_RULES_ONLY``
+    - while Claude Code's command line carries rules this module doesn't read, or can't be read
+      (`_session_has_unseen_rules`)
+
+    The user's and the managed files (`_outside_settings`) are read only where an allow rule
+    grants something. Managed settings that are no file on disk, from the server or a macOS
+    configuration profile, are out of this module's view, as for `curl`.
+    """
+    found, usable = settings or _settings_permissions()
+    if not usable:
+        return NO_READ_GRANTS
+    bounds = _secret_bounds()
+    directories: list[tuple[str, str]] = []
+    files: list[tuple[str, str]] = []
+    for permissions in found:
+        rules = permissions.get("allow")
+        for rule in rules if isinstance(rules, list) else []:
+            match = READ_ALLOW_RULE.fullmatch(rule) if isinstance(rule, str) else None
+            if match is None:
+                continue
+            spec, whole = match.group(1), bool(match.group(2))
+            if spec != spec.strip():
+                continue
+            # Joined as text, so that `~//etc` is the `//` it spells, and not normal
+            path = spec[1:] if spec.startswith("//") else f"{_home().rstrip('/')}/{spec[2:]}"
+            if os.path.normpath(path) != path or not os.path.isabs(path):
+                continue
+            try:
+                if whole:
+                    real = os.path.realpath(path)
+                    if not _reaches_a_secret(real, bounds) and os.path.isdir(real):
+                        directories.append((path, real))
+                    continue
+                # A link is granted nothing: it resolves elsewhere, and `cover` wants both
+                parent = os.path.realpath(os.path.dirname(path))
+                real = os.path.join(parent, os.path.basename(path))
+                if not (_reaches_a_secret(real, bounds) or os.path.isdir(real)):
+                    files.append((path, real))
+            except (OSError, ValueError):
+                continue  # a path this module can't resolve, as with a lone surrogate
+    if not directories and not files:
+        return NO_READ_GRANTS
+    if _session_has_unseen_rules():
+        return NO_READ_GRANTS
+    user, managed, readable = _outside_settings_once()
+    if not readable or any(_managed_rules_only(document) for document in managed):
+        return NO_READ_GRANTS
+    project_anchors = [str(REPO_ROOT)] + ([_SESSION_CWD] if _SESSION_CWD else [])
+    config_dirs = _config_dirs()
+    managed_dir = _managed_settings_dir()
+    sources = (
+        [(permissions, project_anchors) for permissions in found]
+        + [(_permissions_of(document), config_dirs) for document in user]
+        + [
+            (_permissions_of(document), project_anchors + config_dirs + [managed_dir or "/"])
+            for document in managed
+        ]
+    )
+    withheld: list[tuple[str, ...]] = []
+    for permissions, anchors in sources:
+        if permissions is None:
+            return NO_READ_GRANTS
+        for key in ("deny", "ask", "allow"):
+            rules = permissions.get(key, [])
+            if not isinstance(rules, list):
+                return NO_READ_GRANTS  # a list that cannot be read may withhold any path
+            for rule in rules:
+                negated = key == "allow"
+                patterns = _withheld_patterns(rule, anchors, project_anchors, negated=negated)
+                if patterns is None:
+                    return NO_READ_GRANTS
+                withheld += patterns
+    return _ReadGrants(directories, files, withheld)
+
+
+def _session_has_unseen_rules() -> bool:
+    """Whether the session's command line carries rules this module doesn't read.
+
+    Read once, from Claude Code's command line, as `_session_setting_sources` reads it. One that
+    can't be read may carry any.
+    """
+    global _UNSEEN_RULES  # noqa: PLW0603 - one process per call
+    if _UNSEEN_RULES is None:
+        argv = _claude_code_argv()
+        _UNSEEN_RULES = argv is None or _carries_unseen_rules(argv)
+    return _UNSEEN_RULES
+
+
+def _carries_unseen_rules(argv: list[str]) -> bool:
+    """Whether a Claude Code command line holds one of `UNSEEN_RULE_FLAGS`, alone or with ``=``.
+
+    A word anywhere counts, a prompt's included: a mistake costs a prompt.
+    """
+    return any(
+        word == flag or word.startswith(flag + "=") for word in argv for flag in UNSEEN_RULE_FLAGS
+    )
+
+
+def _config_dir() -> str:
+    """Claude Code's config directory: the one `CONFIG_DIR_ENV` names, or else ``~/.claude``."""
+    return os.environ.get(CONFIG_DIR_ENV) or os.path.join(_home(), ".claude")
+
+
+def _config_dirs() -> list[str]:
+    """Where a ``/<path>`` of the user's settings is anchored: their config directory.
+
+    And ``~/.claude`` too, broadly.
+    """
+    return list(dict.fromkeys([_config_dir(), os.path.join(_home(), ".claude")]))
+
+
+def _withheld_patterns(
+    rule: object, anchors: list[str], relative_anchors: list[str], *, negated: bool
+) -> list[tuple[str, ...]] | None:
+    """The patterns a ``Read()`` rule withholds from `_read_rule_grants`, ``None`` for every path.
+
+    A deny or ask rule's pattern, or an allow rule's negated one, ``Read(!<pattern>)``: with
+    ``negated``, only that. Each is read broadly, since a mistake costs a prompt, from the forms
+    of Claude Code's permissions docs:
+
+    - ``//<path>`` from ``/``, and ``~/<path>`` from the home directory
+    - ``/<path>`` from each of ``anchors``, where the settings file anchors it: the session's
+      primary working directory for the project's files, the config directory for the user's
+    - any other, ``./<path>`` included, from each of ``relative_anchors``, the project and the
+      session's working directory, at any depth below it, as for a deny rule
+    - a trailing ``/`` is dropped, and a ``!`` in a deny or ask rule too
+    - a bare ``Read``, an empty, ``*`` or ``**`` pattern, one with a ``.``, ``..`` or empty
+      component, and one whose literal start can't be resolved, as with a NUL, withhold every
+      path
+
+    Each is matched as written and with the directories its literal start names resolved, so
+    that a rule written through a link withholds the real path it names.
+    """
+    match = READ_RULE.fullmatch(rule.strip()) if isinstance(rule, str) else None
+    if match is None:
+        return []
+    spec = (match.group(1) or "").strip()
+    if spec.startswith("!"):
+        spec = spec[1:].strip()
+    elif negated:
+        return []
+    if spec in ("", "*", "**"):
+        return None
+    if spec.startswith("//"):
+        bases, rest = ["/"], spec[2:]
+    elif spec == "~" or spec.startswith("~/"):
+        bases, rest = [_home()], spec[2:]
+    elif spec.startswith("/"):
+        bases, rest = anchors, spec[1:]
+    else:
+        bases, rest = relative_anchors, "**/" + spec.removeprefix("./")
+    components = tuple(rest.rstrip("/").split("/")) if rest.rstrip("/") else ()
+    if any(component in ("", ".", "..") for component in components):
+        return None
+    patterns: list[tuple[str, ...]] = []
+    for base in bases:
+        pattern = _path_components(base) + components
+        literal = 0
+        while literal < len(pattern) and not READ_PATTERN_SPECIAL.search(pattern[literal]):
+            literal += 1
+        try:
+            real = _path_components(os.path.realpath("/" + "/".join(pattern[:literal])))
+        except (OSError, ValueError):
+            return None  # a path the rule can't name, as with a NUL: any path
+        patterns += list(dict.fromkeys([pattern, real + pattern[literal:]]))
+    return patterns
+
+
+def _path_components(path: str) -> tuple[str, ...]:
+    """The names an absolute path is made of, from ``/``."""
+    return tuple(component for component in path.split("/") if component)
+
+
+@functools.cache
+def _fold(name: str) -> str:
+    """A name as a pattern's component is compared with it: composed and with case folded.
+
+    Read broadly: macOS's APFS takes an NFC and an NFD spelling for one file, and Claude Code
+    may ignore case.
+    """
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold())
+
+
+def _compiled(pattern: tuple[str, ...]) -> tuple[tuple[str, object], ...]:
+    """A ``Read()`` pattern's components as `_component_matches` matches them: a kind and a text.
+
+    gitignore's grammar, read broadly: ``**`` matches any number of components, none included, a
+    component with a bracket, a backslash or a brace matches every name, one with a single ``*``
+    and no ``?`` matches by its start and its end, and any other with either as a wildcard
+    (`_wildcard_matches`), all after `_fold`.
+    """
+    compiled: list[tuple[str, object]] = []
+    for component in pattern:
+        folded = _fold(component)
+        if component == "**":
+            compiled.append((ANY_DEPTH, ""))
+        elif any(character in component for character in "[\\{"):
+            compiled.append((ANY_NAME, ""))
+        elif folded.count("*") == 1 and "?" not in folded:
+            compiled.append((AFFIXES, tuple(folded.split("*"))))
+        elif "*" in folded or "?" in folded:
+            compiled.append((WILDCARD, folded))
+        else:
+            compiled.append((NAME, folded))
+    return tuple(compiled)
+
+
+def _component_matches(kind: str, text: object, folded: str) -> bool:
+    """Whether a component `_compiled` made, other than a name or ``**``, matches ``folded``."""
+    if kind == AFFIXES:
+        start, end = text
+        return (
+            len(folded) >= len(start) + len(end)
+            and folded.startswith(start)
+            and folded.endswith(end)
+        )
+    return kind == ANY_NAME or _wildcard_matches(text, folded)
+
+
+def _star_closure(states: set[int], pattern: tuple[tuple[str, object], ...]) -> frozenset[int]:
+    """``states``, and each a ``**`` matching no component leads to."""
+    closed = set(states)
+    pending = list(states)
+    while pending:
+        index = pending.pop()
+        if index < len(pattern) and pattern[index][0] == ANY_DEPTH and index + 1 not in closed:
+            closed.add(index + 1)
+            pending.append(index + 1)
+    return frozenset(closed)
+
+
+def _wildcard_matches(pattern: str, text: str) -> bool:
+    """Whether ``pattern`` matches the whole of ``text``.
+
+    ``*`` matches any run of characters and ``?`` one. The greedy scan with one point to go back to,
+    the last ``*``, in time proportional to the product of the two lengths: a regular expression of
+    many stars backtracks for much longer, as `_GlobRule` explains for the Bash rules.
+    """
+    p = t = 0
+    star, mark = -1, 0
+    while t < len(text):
+        if p < len(pattern) and pattern[p] == "*":
+            star, mark, p = p, t, p + 1
+        elif p < len(pattern) and pattern[p] in ("?", text[t]):
+            p, t = p + 1, t + 1
+        elif star >= 0:
+            p, mark = star + 1, mark + 1
+            t = mark
+        else:
+            return False
+    while p < len(pattern) and pattern[p] == "*":
+        p += 1
+    return p == len(pattern)
 
 
 def _home() -> str:
@@ -5814,6 +6373,16 @@ def _check_where_it_runs(unvouched: str | None) -> None:
         raise NoOpinion(f"runs in a directory this module can't vouch for: {unvouched}")
 
 
+def _check_where_git_runs(scope: _ReadScope | None) -> None:
+    """`_check_where_it_runs` for git, and for `gh`, which runs git there to find its repository.
+
+    In git's scope (`_for_git`): git runs what the config of the repository it stands in names,
+    which a grant vouches for only where that config is in the roots.
+    """
+    if scope is not None:
+        _check_where_it_runs(_unvouched_directory(scope.bases, _for_git(scope)))
+
+
 def _searches_cdpath(target: str) -> bool:
     """Whether `cd` looks ``target`` up in `CDPATH`: unless it starts with `/`, `./` or `../`."""
     return not target.startswith(("/", "./", "../", UNREAD_VALUE)) and target not in (".", "..")
@@ -5894,7 +6463,9 @@ class _ReadScope:
     __slots__ = (
         "backgrounds",
         "bases",
+        "git",
         "git_runs",
+        "grants",
         "loop_values",
         "roots",
         "run_bases",
@@ -5914,8 +6485,15 @@ class _ReadScope:
         spells_escape: bool = False,
         settings: tuple[list[dict], bool] | None = None,
         backgrounds: bool = False,
+        grants: _ReadGrants | None = NO_READ_GRANTS,
     ) -> None:
         self.roots = roots
+        # What `Read()` allow rules add to ``roots``, and None for the project's, which
+        # `_scope_grants` reads only once a path outside the roots is asked about
+        self.grants = grants
+        # Whether the scope is git's, under which a grant vouches only for a path whose
+        # repository's config the scope holds without it: `_for_git`
+        self.git = False
         self.bases = bases
         # The directories a program may run in: the session's working directory and each `cd`
         # target from it, and a directory below `UNREAD_VALUE` for a target `CDPATH` may
@@ -5967,8 +6545,78 @@ def _in_scope_unguarded(absolute: str, scope: _ReadScope) -> bool:
     resolutions = _resolutions(absolute)
     return all(
         any(_is_under(normal, root) and _is_under(resolved, root) for root in scope.roots)
+        or (
+            (not scope.git or _git_config_trusted(resolved, scope))
+            and _scope_grants(scope).cover(absolute, resolved)
+        )
         for resolved in resolutions
     )
+
+
+def _for_git(scope: _ReadScope) -> _ReadScope:
+    """``scope``, as git's: a grant vouches only where `_git_config_trusted` says."""
+    git = copy.copy(scope)
+    git.git = True
+    return git
+
+
+def _git_config_trusted(path: str, scope: _ReadScope) -> bool:
+    """Whether git, in ``path`` or reading it, takes its config only from the scope's roots.
+
+    That is ``scope`` without its ``Read()`` grants. A grant is a read, and git runs what its
+    repository's config names: `core.fsmonitor` on `status`, `diff.external` on `diff`,
+    `gpg.program` on a `log` that shows signatures. So under a grant git is vouched for only in a
+    repository whose git directory and common directory, where that config is, are in the scope
+    without grants: a worktree of the project's own repository in another session's scratchpad is, a
+    repository unpacked in a granted directory isn't. Its objects are then ones git already reads
+    for the project, so that a deny rule's path in its history is no new read.
+
+    The repository is the one git finds from ``path`` up (`_git_dir_at`); none is no config to
+    read. `GIT_DIR` or `GIT_WORK_TREE` in the environment puts it anywhere, and so is not trusted.
+    Nor is git in a command that makes a link (`_PLANNED_LINKS`): it may be the `.git`, `HEAD` or
+    `commondir` git reads, which isn't on the disk yet for this module to read. A pointer is
+    placed as git places it, a link before the `..` after it, which `_in_scope` resolves.
+    """
+    if os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE") or _PLANNED_LINKS:
+        return False
+    directory = path if os.path.isdir(path) else os.path.dirname(path)
+    while (git_dir := _git_dir_at(directory)) is None:
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return True
+        directory = parent
+    if not git_dir:
+        return False
+    common = git_dir
+    if os.path.lexists(os.path.join(git_dir, "commondir")):
+        line = _git_pointer(Path(git_dir, "commondir"))
+        if line is None:
+            return False
+        common = os.path.join(git_dir, line)
+    trusted = copy.copy(scope)
+    trusted.grants, trusted.git = NO_READ_GRANTS, False
+    return _in_scope(git_dir, trusted) and _in_scope(common, trusted)
+
+
+def _git_dir_at(directory: str) -> str | None:
+    """The git directory git may find in ``directory``, None for none, and "" for one it can't read.
+
+    Its `.git` directory, the one its `.git` file names, or ``directory`` itself where it holds a
+    `HEAD`, as a bare repository or a worktree's git directory does. git decides by what `HEAD`
+    holds, a link into `refs/` included, and by the `objects` and `refs` of the common directory
+    `commondir` names: any `HEAD` is one here, which only costs a prompt where git disagrees.
+    """
+    dot_git = os.path.join(directory, ".git")
+    if os.path.isdir(dot_git):
+        return dot_git
+    if os.path.lexists(dot_git):
+        line = _git_pointer(Path(dot_git))
+        if line is None or not line.startswith("gitdir:"):
+            return ""
+        return os.path.join(directory, line[len("gitdir:") :].strip())
+    if os.path.lexists(os.path.join(directory, "HEAD")):
+        return directory
+    return None
 
 
 VARIABLE_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -6758,14 +7406,15 @@ def _walk_for_links(roots: list[str], depth: int) -> list[tuple[str, str]]:
     A root is each of its `_resolutions`, so one an `ln` in the command makes, or one whose
     path goes through a link, is walked where it leads, and reported as a link to there.
     """
-    key = (
-        tuple(roots),
-        depth,
-        tuple(sorted((link, tuple(sorted(targets))) for link, targets in _PLANNED_LINKS.items())),
-    )
+    key = (tuple(roots), depth, _planned_links_key())
     if key not in _WALKS:
         _WALKS[key] = _walk_for_links_uncached(roots, depth)
     return _WALKS[key]
+
+
+def _planned_links_key() -> tuple:
+    """`_PLANNED_LINKS`, as a key for a cache of what a walk found under them."""
+    return tuple(sorted((link, tuple(sorted(targets))) for link, targets in _PLANNED_LINKS.items()))
 
 
 def _walk_for_links_uncached(roots: list[str], depth: int) -> list[tuple[str, str]]:
@@ -6777,9 +7426,6 @@ def _walk_for_links_uncached(roots: list[str], depth: int) -> list[tuple[str, st
     once, by where it resolves.
     """
     found: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    count = 0
-    stack: list[tuple[str, int]] = []
     for root in roots:
         try:
             resolutions = _resolutions(root)
@@ -6788,51 +7434,104 @@ def _walk_for_links_uncached(roots: list[str], depth: int) -> list[tuple[str, st
         found += [
             (root, resolved) for resolved in resolutions if resolved != os.path.normpath(root)
         ]
-        stack.append((root, 1))
-    while stack:
-        directory, level = stack.pop()
-        try:
-            reals = _resolutions(directory)
-        except (OSError, ValueError):
-            raise NotReadOnly(f"a directory this module can't resolve: {directory}") from None
-        entries: list[tuple[str, bool, bool]] = []
-        for real in reals:
-            if real in seen or not os.path.isdir(real):
-                continue
-            seen.add(real)
-            try:
-                with os.scandir(real) as listing:
-                    entries += [
-                        (
-                            os.path.join(directory, entry.name),
-                            entry.is_symlink(),
-                            entry.is_dir(follow_symlinks=False),
-                        )
-                        for entry in listing
-                    ]
-            except (OSError, ValueError):
-                continue  # what the walk can't list, the reader can't either
-            entries += [
-                (os.path.join(directory, os.path.basename(key)), True, False)
-                for key in _PLANNED_LINKS
-                if os.path.dirname(key) == real
-            ]
-        count += len(entries)
-        if count > MAX_WALKED_ENTRIES:
-            raise NotReadOnly(
-                f"a read that follows links below more than {MAX_WALKED_ENTRIES} entries"
-            )
-        deeper = depth == 0 or level < depth
-        for path, is_link, is_directory in entries:
-            if is_link:
+    seen: set[str] = set()
+
+    def visit(_directory: str, real: str) -> bool:
+        if real in seen:
+            return False
+        seen.add(real)
+        return True
+
+    try:
+        for directory, _, entries in _walk_directories(roots, depth, visit, lambda _: True):
+            for name, is_link, _ in entries:
+                if not is_link:
+                    continue
+                path = os.path.join(directory, name)
                 try:
                     targets = _resolutions(path)
                 except (OSError, ValueError):
                     raise NotReadOnly(f"a link this module can't resolve: {path}") from None
                 found += [(path, target) for target in targets]
-            if (is_link or is_directory) and deeper:
-                stack.append((path, level + 1))
+    except _WalkTooLargeError:
+        raise NotReadOnly(
+            f"a read that follows links below more than {MAX_WALKED_ENTRIES} entries"
+        ) from None
+    except _WalkUnresolvableError as error:
+        raise NotReadOnly(str(error)) from None
     return found
+
+
+class _WalkTooLargeError(OSError):
+    """A walk past `MAX_WALKED_ENTRIES` entries: `_walk_directories`."""
+
+
+class _WalkUnresolvableError(OSError):
+    """A directory whose `_resolutions` a walk can't tell: `_walk_directories`."""
+
+
+def _walk_directories(
+    roots: list[str],
+    depth: int,
+    visit: Callable[[str, str], bool],
+    descend: Callable[[str], bool],
+) -> Iterator[tuple[str, str, list[tuple[str, bool, bool]]]]:
+    """Each directory a reader that follows links lists below ``roots``.
+
+    To ``depth`` levels, or all with 0, each as the path the walk came by, where it resolves, and
+    its entries. The one walk both checks that read below a directory make: the links a reader
+    follows (`_walk_for_links`), and what a ``Read()`` deny rule matches
+    (`_ReadGrants._withheld_below`).
+
+    - A directory is listed where it resolves, at each of its `_resolutions`, where
+      ``visit(directory, real)`` says
+    - An entry is its name, whether it is a link, and whether a directory, with each link the
+      command makes there (`_PLANNED_LINKS`)
+    - A link or a directory below is walked by the path the walk came by, where
+      ``descend(path)`` says, asked once the caller has read the entries
+    - What can't be listed is skipped: the reader can't list it either
+
+    Raises `_WalkTooLargeError` past `MAX_WALKED_ENTRIES` entries, and `_WalkUnresolvableError` for
+    a directory whose resolutions it can't tell, each an `OSError`.
+    """
+    count = 0
+    stack = [(root, 1) for root in roots]
+    while stack:
+        directory, level = stack.pop()
+        try:
+            reals = _resolutions(directory)
+        except (OSError, ValueError):
+            raise _WalkUnresolvableError(
+                f"a directory this module can't resolve: {directory}"
+            ) from None
+        for real in sorted(reals):
+            if not os.path.isdir(real) or not visit(directory, real):
+                continue
+            try:
+                with os.scandir(real) as listing:
+                    entries = [
+                        (entry.name, entry.is_symlink(), entry.is_dir(follow_symlinks=False))
+                        for entry in listing
+                    ]
+            except (OSError, ValueError):
+                continue  # what the walk can't list, the reader can't either
+            entries += [
+                (os.path.basename(link), True, False)
+                for link in _PLANNED_LINKS
+                if os.path.dirname(link) == real
+            ]
+            count += len(entries)
+            if count > MAX_WALKED_ENTRIES:
+                raise _WalkTooLargeError(
+                    f"more than {MAX_WALKED_ENTRIES} entries below {directory}"
+                )
+            yield directory, real, entries
+            if depth and level >= depth:
+                continue
+            for name, is_link, is_directory in entries:
+                path = os.path.join(directory, name)
+                if (is_link or is_directory) and descend(path):
+                    stack.append((path, level + 1))
 
 
 def _refuse_followed_credential_links(
@@ -7298,8 +7997,9 @@ def _classify(command: str, depth: int = 0) -> None:
     a word the link leads through, as in a substitution's body, read last. So the command is
     read again with the links the last pass found, until a pass finds no new one.
     """
-    global _PLANNED_LINKS  # noqa: PLW0603 - per command, as `_SESSION_CWD` is per call
+    global _PLANNED_LINKS, _READ_GRANTS, _OUTSIDE_SETTINGS  # noqa: PLW0603 - per command
     _PLANNED_LINKS = {}
+    _READ_GRANTS = _OUTSIDE_SETTINGS = None
     _WALKS.clear()
     try:
         for _ in range(MAX_LINK_PASSES):
@@ -7310,6 +8010,7 @@ def _classify(command: str, depth: int = 0) -> None:
         raise NotReadOnly("links that make further links, past what this module reads")
     finally:
         _PLANNED_LINKS = {}
+        _READ_GRANTS = _OUTSIDE_SETTINGS = None
         _WALKS.clear()
 
 
@@ -7503,6 +8204,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         settings=settings,
         backgrounds=backgrounds,
         run_bases=state.run_bases,
+        grants=None,
     )
     _check_input_targets(input_targets, scope)
 
@@ -7520,7 +8222,8 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
 
     # A move to a directory the read scope doesn't vouch for leaves every program to the rules,
     # wherever it stands, since a program reads where it runs (#72). What a validator refuses
-    # stays refused: the check comes after it.
+    # stays refused: the check comes after it. git and `gh` are held to git's scope as well, at
+    # the end of `_check_command`: `_check_where_git_runs`.
     unvouched = _unvouched_directory(state.bases, scope)
 
     # A substitution body is work that was inspected, so `x=$(grep -c . AGENTS.md)` has
@@ -7602,9 +8305,10 @@ def main() -> int:
         # Claude Code's shell keeps its working directory between calls, so a relative path
         # is read from wherever the session last stood. The payload says where that is.
         # The session's, set once: there is one process per call
-        global _SESSION_CWD, _SCRATCHPAD_DIR, _SETTING_SOURCES, REPO_ROOT  # noqa: PLW0603
+        global _SESSION_CWD, _SCRATCHPAD_DIR, REPO_ROOT  # noqa: PLW0603
+        global _SETTING_SOURCES, _UNSEEN_RULES  # noqa: PLW0603
         # Read from Claude Code's command line when a project file needs them
-        _SETTING_SOURCES = None
+        _SETTING_SOURCES = _UNSEEN_RULES = None
         cwd = payload.get("cwd")
         _SESSION_CWD = os.path.realpath(cwd) if isinstance(cwd, str) and cwd else None
         # This session's scratchpad; see `_scratch_directory`
