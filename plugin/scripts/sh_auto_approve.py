@@ -6607,6 +6607,45 @@ def _refuse_credential_paths(
                 for spelled in _spellings(reading, state.values, state.shell_bases):
                     if _names_a_credential(spelled, tilde=tilde, bases=bases, live_glob=live_glob):
                         raise NotReadOnly(f"names a credential store: {word}")
+                    # And a path glued to an option or after an `@`, which no word spells alone
+                    for glued in _glued_paths(REDIRECTION_PREFIX.sub("", spelled)):
+                        if _names_a_credential(
+                            glued, tilde=False, bases=bases, live_glob=live_glob
+                        ):
+                            raise NotReadOnly(f"names a credential store: {word}")
+
+
+# The letters and digits of a short-option cluster that starts a word, as `-hf` in `-hf/x`
+SHORT_OPTION_CLUSTER = re.compile(r"-[A-Za-z0-9]*")
+
+# The longest cluster `_glued_paths` reads: past it, a word is refused rather than read at each
+# of its letters
+MAX_GLUED_CLUSTER = 64
+
+
+def _glued_paths(text: str) -> list[str]:
+    """The paths a program may open from ``text``, a word, other than the word itself.
+
+    A short option's value attached to it, which can start after any letter of the cluster, as
+    `-T<path>` and `-hf<path>` do; and a file a leading `@` names, as curl reads it for `-d`,
+    `--data-binary` and `-F`: `@<path>`, `-d@<path>` and `name=@<path>`. A path after a long
+    option's `=` is read by `_names_a_credential`.
+    """
+    paths: list[str] = []
+    if text.startswith("@"):
+        paths.append(text[1:])
+    _, equals, value = text.partition("=")
+    if equals and value.startswith("@"):
+        paths.append(value[1:])
+    if text.startswith("-") and not text.startswith("--"):
+        end = SHORT_OPTION_CLUSTER.match(text).end()
+        if end > MAX_GLUED_CLUSTER:
+            raise NotReadOnly(f"a short-option cluster too long to read: {text[:end]}")
+        for start in range(2, min(end, len(text) - 1) + 1):
+            paths.append(text[start:])
+            if text[start] == "@":
+                paths.append(text[start + 1 :])
+    return [path for path in paths if path]
 
 
 class _ReadScope:
