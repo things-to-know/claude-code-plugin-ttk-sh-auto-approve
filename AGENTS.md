@@ -67,7 +67,7 @@ insists on its own filename, symlink to this file rather than copying it.
     - So is a wildcard an unquoted expansion puts in a word from a value the hook reads, as `$f`
       after `for f in 'k*'` (`_globbed`)
     - So is a variable a `for` list binds to a wildcard's matches or to a `$(ls)`, read as each
-      path the list can give it (`PICKED`)
+      path the list can give it (`PICKED`), in a substitution's body too
     - So is a wildcard in front of a value the hook didn't read, as in `d1*/k/$g`, where a match
       leads into a store or to a directory that holds one
     - One it can't bound, `**` or a group, reaches each link below its literal directory, walked

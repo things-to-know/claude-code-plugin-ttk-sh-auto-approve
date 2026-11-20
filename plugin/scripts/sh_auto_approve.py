@@ -6539,8 +6539,9 @@ class _ShellState:
     may not wait for it, which ``curl`` reads: it runs a job behind `&`, or sits in a process
     substitution or in a command that does. A substitution's body runs in the shell around it,
     so it is read against that one's. ``picked`` holds the `PICKED` values of each name a `for`
-    list of this command's own binds to the paths a glob or `$(ls)` gives, `_picked_values`,
-    which ``values`` holds as unread: only the credential check reads them.
+    list binds to the paths a glob or `$(ls)` gives, `_picked_values`, this command's and those
+    of the command around it for a name this one doesn't bind, which ``values`` holds as unread:
+    only the path checks read them.
     """
 
     __slots__ = (
@@ -9039,6 +9040,14 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # Where a relative word may be resolved from, worked out once for the credential check, the
     # read scope and each substitution's body
     bases, shell_bases, run_bases = _working_directories(segments, parts, inherited, known_values)
+    # The paths a glob or `$(ls)` list gives a name, its own, and those of the command around it
+    # for a name this one doesn't bind: that one counts a use in a body, so each is settled there
+    picked = {
+        name: values
+        for name, values in (inherited.picked if inherited else {}).items()
+        if name not in own_bindings
+    }
+    picked.update(_picked_values(loop_values))
     state = _ShellState(
         bases,
         shell_bases,
@@ -9046,7 +9055,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         bindings,
         backgrounds=backgrounds,
         run_bases=run_bases,
-        picked=_picked_values(loop_values),
+        picked=picked,
     )
 
     # The links an `ln` here makes, which every path below is resolved through as if they were
@@ -9066,7 +9075,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         roots=roots,
         bases=state.bases,
         splice_vars=splice_vars,
-        loop_values=loop_values,
+        loop_values={**picked, **loop_values},
         spells_escape=bool(TERMINAL_CONTROL_SPELLED.search(command)),
         settings=settings,
         backgrounds=backgrounds,
@@ -9081,7 +9090,13 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # opinion, so a body's refusal still comes first. The shell runs a process substitution
     # without waiting for it, as it runs a job behind `&`: `true <(curl x)` returns at once.
     detached = _ShellState(
-        bases, shell_bases, known_values, bindings, backgrounds=True, run_bases=run_bases
+        bases,
+        shell_bases,
+        known_values,
+        bindings,
+        backgrounds=True,
+        run_bases=run_bases,
+        picked=picked,
     )
     for kind, value in parts:
         if kind in RUNS_A_COMMAND:

@@ -6660,6 +6660,53 @@ class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
                 "for f in $(ls a/b/key); do cat $f; done", "prints a/b/key, the key"
             )
 
+    def test_a_loop_variable_in_a_substitution(self):
+        """A substitution's body runs in the loop's shell, where `$f` holds what the list gives,
+        but neither it nor a process substitution read that: under `Bash(cat *)`, `for f in d1*;
+        do echo "$(cat $f/k/id_rsa)"; done` was approved. A name the body binds is its own."""
+        with self._project() as (project, home):
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            with operator_rules(allow=["Bash(cat *)", "Bash(diff *)"]):
+                self.assert_allowed(
+                    'for f in s*; do echo "$(cat $f/lib/x.txt)"; done', "the control: in src"
+                )
+                for command in (
+                    'for f in d1*; do echo "$(cat $f/k/id_rsa)"; done',
+                    "for f in d1*; do diff <(cat $f/k/id_rsa) README.md; done",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
+            for command in (
+                'for f in d*; do echo "$(cat $f/f)"; done',
+                'for f in s*; do echo "$(f=d; cat $f/f)"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "d/f leads out of the project")
+
+    def test_the_loop_reads_a_substitution_widens(self):
+        """The body read `$f` as unread, so `main` left each of these to the rules: they are
+        approved with no rule now, each beside its refusals, a recursive read of the directory
+        holding a store among them. Here `h -> ~` and `d1/k -> ~/.ssh`."""
+        with self._project() as (project, home):
+            (project / "h").symlink_to(home)
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            for command in (
+                'for f in s*; do echo "$(cat $f/lib/x.txt)"; done',
+                'for f in $(ls src); do echo "$(cat src/$f/x.txt)"; done',
+                "for f in s*; do diff <(cat $f/lib/x.txt) src/lib/x.txt; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "reads src/lib/x.txt")
+            self.assert_no_opinion('for f in h*; do echo "$(grep -r PRIVATE $f)"; done', "reads ~")
+            for command in (
+                'for f in d1*; do echo "$(grep -r PRIVATE $f/k)"; done',
+                "for f in d1*; do diff <(cat $f/k/id_rsa) README.md; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through d1/k")
+
     def test_a_name_the_shell_splits(self):
         """bash splits an unquoted `$f`, and a `$(ls)` in the list, at a blank: with a file `x k`,
         `for f in x*; do cat $f/id_rsa; done` runs `cat x k/id_rsa`. A name the list gives that
