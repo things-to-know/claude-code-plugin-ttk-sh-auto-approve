@@ -2454,6 +2454,24 @@ class ObservedCommandsStayApproved(Verdicts, unittest.TestCase):
         self.assert_allowed("echo aGkK | base64 -d", "decodes stdin to stdout")
         self.assert_allowed("base64 -w0 AGENTS.md | head -c 40", "encodes a file in scope")
 
+    def test_the_system_grep_and_find_by_path_or_through_command(self):
+        """`non-bare program path: /usr/bin/grep`, and `command other than ...` for `command grep`.
+        In Claude Code's Bash tool `grep` and `find` are functions that run the ugrep and bfs
+        embedded in Claude Code, and ugrep refuses a bounded repeat such as `.{0,200}`, which GNU
+        grep runs, so an operator's instructions may ask for the system's `grep` by its path."""
+        for command in (
+            "/usr/bin/grep -n -E 'a.{0,200}b' AGENTS.md",
+            "/bin/grep -c x AGENTS.md",
+            "command grep -rn x tests",
+            "git log -1 | /usr/bin/grep -c x",
+            "git log -1 | command grep -c x",
+            "/usr/bin/find . -maxdepth 1 -name '*.md'",
+            "/bin/find tests -name '*.py'",
+            "command find . -maxdepth 1 -name AGENTS.md",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "the bare name is approved")
+
 
 class AllowsALoopVariableBoundToLiterals(Verdicts, unittest.TestCase):
     """`for f in 'a.json' 'b.json'; do jq -r '.x' "$f"; done` and the edge of the
@@ -2776,6 +2794,39 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
         self.assert_refused("sed -n 'w /tmp/out' AGENTS.md")
         self.assert_refused("sed -n 's/a/b/w /tmp/out' AGENTS.md")
         self.assert_refused("sed -n '1e touch PWNED' AGENTS.md")
+
+    def test_the_system_grep_and_find_stop_where_the_bare_names_stop(self):
+        """`ObservedCommandsStayApproved` reads their paths and `command grep|find` as `grep` and
+        `find`, so each refusal of the bare name holds for them, and the read scope too. No other
+        path is read, nor any other form of `command`."""
+        self.assert_allowed("/usr/bin/grep -c x AGENTS.md", "the control")
+        self.assert_allowed("command find . -name AGENTS.md", "the control")
+        for refused in (
+            "/usr/bin/find . -name AGENTS.md -delete",
+            "/bin/find . -name AGENTS.md -exec touch PWNED ;",
+            "command find . -name AGENTS.md -fprint PWNED",
+            "command find . -name AGENTS.md -rm",
+            'command find . -name AGENTS.md "$(echo -delete)"',
+            "/usr/bin/grep --filter='md:touch PWNED' x AGENTS.md",
+            "command grep --save-config=PWNED x AGENTS.md",
+            "command -p grep x AGENTS.md",
+            "command 'grep' x AGENTS.md",
+            "command -- grep x AGENTS.md",
+            "command egrep x AGENTS.md",
+        ):
+            with self.subTest(refused=refused):
+                self.assert_refused_outright(refused)
+        for no_opinion in (
+            "/usr/bin/grep -r PRIVATE ~",
+            "command grep -r PRIVATE ~",
+            "/usr/bin/grep x /etc/hostname",
+            "/usr/local/bin/grep x AGENTS.md",
+            "/usr/bin/egrep x AGENTS.md",
+            "./grep x AGENTS.md",
+            "/usr/bin/sort AGENTS.md",
+        ):
+            with self.subTest(no_opinion=no_opinion):
+                self.assert_no_opinion(no_opinion, "outside the read roots, or another path")
 
     def test_a_writing_flag_bundled_behind_another_short_flag(self):
         """The cost of letting sed take operands, paid up front. Before it did, `sed -ni
@@ -5921,6 +5972,10 @@ class RefusesALinkARecursiveReadFollows(Verdicts, unittest.TestCase):
         ("diff -N src d1", "diff -N d1 src/lib"),
         ("find -L . -name id_rsa", "find . -name id_rsa"),
         ("find . -follow -name id_rsa", "find -L d1 -name id_rsa"),
+        ("/usr/bin/grep -R PRIVATE .", "/usr/bin/grep -r PRIVATE ."),
+        ("command grep -R PRIVATE .", "command grep -r PRIVATE ."),
+        ("/usr/bin/find -L . -name id_rsa", "/usr/bin/find . -name id_rsa"),
+        ("command find -L . -name id_rsa", "command find . -name id_rsa"),
         ("ls -RL", "ls -R"),
         ("ls -R --dereference src", "ls -RL d1"),
         ("du -L", "du"),
@@ -6723,7 +6778,8 @@ class RefusesBuiltinsThatRunAProgram(Verdicts, unittest.TestCase):
 
     def test_command_only_looks_up(self):
         """`command -v` is read; every other form runs its operand or prints a function's
-        body, and an operand the shell supplies could be either."""
+        body, and an operand the shell supplies could be either. `command grep` and `command find`
+        are read as `grep` and `find`, in `ObservedCommandsStayApproved`."""
         for command in (
             "command ls",
             "command -p ls",

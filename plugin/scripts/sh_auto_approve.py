@@ -69,8 +69,8 @@ Hardened against:
 - Command substitution whose body or position cannot be vouched for, and every other
     spelling of it: backticks, process substitution, the Bash 5.3 ``${ ...; }`` forms
 - Dynamic linker/environment variable injection (LD_PRELOAD, PATH, BASH_ENV, etc.)
-- Program path spoofing: a non-bare executable, and a program name that is quoted,
-    escaped or expanded rather than written
+- Program path spoofing: a non-bare executable other than the system's ``grep`` and ``find``,
+    and a program name that is quoted, escaped or expanded rather than written
 - Embedded DSL exploits in ``sed``, ``awk``, ``gawk``, including ``@include`` inside the program
 - Parameter-shifting bypasses and mutating subcommands in ``git``, ``aws``, and ``gcloud``, plus the
     flags that move where a call goes or who it goes as (``--endpoint-url``, ``--git-dir``,
@@ -187,7 +187,8 @@ GIT_POINTER_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 # How long `ps` may take to print Claude Code's command line on macOS, where there is no /proc
 PARENT_COMMAND_LINE_TIMEOUT = 5.0
 
-# Base programs that only ever read. Must be invoked by bare name (no slashes).
+# Base programs that only ever read. Must be invoked by bare name (no slashes), except the system's
+# `grep` by its path (`SYSTEM_PROGRAM_PATHS`).
 READ_ONLY = {
     "basename",
     "cat",
@@ -1647,7 +1648,8 @@ def _refuse_binding(name: str) -> None:
 
 
 # The words in front of a builtin that still run it as one: `builtin read p` reads into `p`.
-# `command` is one too, which `_check_command_builtin` refuses outright.
+# `command` is one too, which `_check_command_builtin` refuses outright, except before `grep` or
+# `find` (`COMMAND_RUNS`).
 PRECOMMANDS = frozenset({"builtin", "noglob", "nocorrect"})
 
 # The builtins of bash and zsh that bind the names their operands give, as `read p`,
@@ -4312,7 +4314,8 @@ def _check_command_builtin(args: list[str]) -> None:
     """Validate the ``command`` builtin: ``command -v NAME...`` and nothing else.
 
     ``-v`` prints how each name resolves, as ``which`` does. Without it ``command`` runs its
-    operand with functions bypassed, so ``command rm -rf build/`` is ``rm``.
+    operand with functions bypassed, so ``command rm -rf build/`` is ``rm``. ``command grep`` and
+    ``command find`` never reach this: ``_check_command`` reads them as ``grep`` and ``find``.
     zsh reads ``command -v`` as ``whence``, which tells no more than zsh's own ``which``.
 
     ``-V`` is left out because it **prints a function's whole body**.
@@ -4424,6 +4427,18 @@ WRAPPERS = {
 # `timeout timeout timeout ...` parses; it just has nothing to say.
 MAX_WRAPPER_DEPTH = 4
 
+# The system's own `grep` and `find`, by the paths Linux and macOS install them at, read as the bare
+# names. In Claude Code's Bash tool `grep` and `find` are functions that run the ugrep and bfs
+# embedded in Claude Code, so a path, or `command`, is how a command reaches the system's. Any
+# other program path stays the operator's rules' to grant.
+SYSTEM_PROGRAM_PATHS = {
+    f"{directory}/{name}": name for directory in ("/usr/bin", "/bin") for name in ("grep", "find")
+}
+
+# What `command NAME ...` may run, read as `NAME ...`: `command` skips the shell's functions, and so
+# reaches the system's program as its path does
+COMMAND_RUNS = frozenset({"grep", "find"})
+
 # Explicit dispatch table mapping programs to their dedicated validator functions
 PROGRAM_VALIDATORS = {
     "aws": _check_aws,
@@ -4516,6 +4531,8 @@ def _check_command(
             spliced.append(False)
 
     # Path spoofing check: program must be a bare command name (e.g. 'ls', not './ls' or '/tmp/ls')
+    # The exceptions are the system's `grep` and `find`, read as the bare names
+    program = SYSTEM_PROGRAM_PATHS.get(program, program)
     if "/" in program or "\\" in program:
         raise NoOpinion(f"non-bare program path: {program}")
 
@@ -4559,6 +4576,14 @@ def _check_command(
     # sites the project lists, and whether the shell may not wait for the command.
     if program == "curl":
         _check_curl(args, _rewritten_words(arg_tokens, live_globs, parts), spliced, scope)
+        return
+
+    # `command grep` and `command find` run the system's program, as its path does: `command`
+    # skips the shell's functions, Claude Code's `grep` and `find` among them. What it runs is
+    # checked in its place, as a wrapper's command is, before the word checks below read the
+    # words as `command`'s. Every other form of `command` is `_check_command_builtin`'s.
+    if program == "command" and words[1:2] and words[1] in COMMAND_RUNS:
+        _check_command(words[1:], parts, depth + 1, safe_names, splice_vars, scope, known_values)
         return
 
     # A wrapper's own arguments are not the command; what it runs is checked in its place.
