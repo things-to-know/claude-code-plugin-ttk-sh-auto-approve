@@ -60,6 +60,28 @@ insists on its own filename, symlink to this file rather than copying it.
     - An operand below a value the hook didn't read isn't walked: the residual of `grep -r x "$d"`
     - A wildcard operand is matched every way a startup file can make the shell read it
       (`_glob_matches`); one it can't bound, such as `**`, is walked from its literal directory
+  - A wildcard the shell expands reads what it matches, which can be a link out, as `k*` is
+    with `k -> ~/.ssh`
+    - Both layers read each path it may match, `_glob_matches`' way, as a literal path is read,
+      through its links (`_wildcard_reach`): one in a credential store is refused outright
+    - So is a wildcard an unquoted expansion puts in a word from a value the hook reads, as `$f`
+      after `for f in 'k*'` (`_globbed`)
+    - So is a wildcard in front of a value the hook didn't read, as in `d1*/k/$g`, where a match
+      leads into a store or to a directory that holds one
+    - One it can't bound, `**` or a group, reaches each link below its literal directory, walked
+      as for a reader that follows links (`GLOB_AT_ANY_DEPTH`)
+      - zsh's `***` matches through a link; bash's `**` with `globstar`, and zsh's `**` and
+        `(*/)#`, match a link by its name but nothing below it, which a reader that follows
+        links still reads
+      - Each is read as `***`, at a cost: `grep -r PRIVATE **/d1` is refused where a link below
+        the literal directory leads to a store
+    - An operator that matches within one component, such as `[^.]` or zsh's `^x`, is matched
+      there
+    - A glob character a quote holds is the character it is (`_glob_word`)
+    - Past `MAX_WALKED_ENTRIES` matches, or entries walked, the command is refused outright, under
+      any rule, in any program
+    - Each match costs a resolution in each layer, in time linear in each name it compares
+      (`_ComponentPattern`)
   - One approval makes a network call: a `curl` GET of one URL on a listed site
     - What leaves the machine is a URL Claude wrote, which a poisoned context can put a secret in
       - So the request goes to an exact listed host, with no userinfo, redirect, proxy or
