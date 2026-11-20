@@ -6660,6 +6660,54 @@ class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
                 "for f in $(ls a/b/key); do cat $f; done", "prints a/b/key, the key"
             )
 
+    def test_a_value_the_shell_splits(self):
+        """bash splits an unquoted `$f` at a blank, so after `for f in "x k/id_rsa"`, `cat $f`
+        runs `cat x k/id_rsa`: both layers read the value whole, and approved it with no rule.
+        Each field is a word of its own now, for a reader that follows links too."""
+        with self._project():
+            for command in (
+                'for f in "x k/id_rsa"; do cat "$f"; done',
+                "for f in 'README.md src/lib/x.txt'; do cat $f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: names no path out")
+            for command in (
+                'for f in "x k/id_rsa"; do cat $f; done',
+                'for d in "x k"; do grep -R PRIVATE $d; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through k")
+            self.assert_no_opinion('for f in "x d/f"; do cat $f; done', "d leads out")
+
+    def test_a_field_that_holds_a_no_break_space(self):
+        """bash splits at a blank of `IFS` alone, so `kk<U+00A0>` stays one field, which bash
+        5.2 read through its link. `str.split` split it at the no-break space too, so neither
+        layer read the field bash gives, and both approved it with no rule."""
+        with self._project() as (project, home):
+            (project / "kk\u00a0").symlink_to(home / ".ssh")
+            self.assert_allowed('for f in "x kk\u00a0"; do cat "$f"; done', "the control: whole")
+            for command in (
+                'for f in "x kk\u00a0"; do cat $f/id_rsa; done',
+                'f="x kk\u00a0"; cat $f/id_rsa',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through kk<U+00A0>")
+
+    def test_the_first_field_keeps_the_tilde(self):
+        """A tilde starts the word, and so its first field: `cat ~/a/b/proj/k*$f`, with `$f` a
+        value `/id_rsa x`, reads `~/a/b/proj/k/id_rsa`, which the first field placed in the
+        project, as a relative path that matched nothing."""
+        with self._project(), operator_rules(allow=["Bash(cat *)"]):
+            self.assert_allowed(
+                "for f in '/x.txt x'; do cat ~/a/b/proj/src/l*$f; done", "the control: in src"
+            )
+            for command in (
+                "for f in '/id_rsa x'; do cat ~/a/b/proj/k*$f; done",
+                "f='/id_rsa x'; cat ~/a/b/proj/k*$f",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
+
     def test_a_loop_variable_in_a_substitution(self):
         """A substitution's body runs in the loop's shell, where `$f` holds what the list gives,
         but neither it nor a process substitution read that: under `Bash(cat *)`, `for f in d1*;

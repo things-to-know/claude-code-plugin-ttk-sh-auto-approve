@@ -1329,6 +1329,25 @@ def _globbed(token: str, spelled: str) -> bool:
     )
 
 
+# What bash splits an unquoted expansion's value at, with the default `IFS`
+FIELD_SEPARATORS = frozenset(" \t\n")
+FIELD_SEPARATOR_RUN = re.compile(r"[ \t\n]+")
+
+
+def _fields(token: str, spelled: str) -> list[str]:
+    """``spelled``, one of ``token``'s spellings, and each field the shell may split it into.
+
+    bash splits the value of an unquoted expansion at a blank: after `for f in "x k/id_rsa"`,
+    `cat $f` reads `x` and `k/id_rsa`, and so does zsh with `SH_WORD_SPLIT`, which a startup
+    file can set. The whole text is split, the expansion's neighbours included, which reads more
+    paths, never fewer. Only at `FIELD_SEPARATORS`: `str.split` splits at any Unicode space too,
+    so a no-break space would end a field the shell keeps whole.
+    """
+    if FIELD_SEPARATORS & set(spelled) and UNQUOTED_EXPANSION.search(PLACEHOLDER.sub("", token)):
+        return [spelled, *(field for field in FIELD_SEPARATOR_RUN.split(spelled) if field)]
+    return [spelled]
+
+
 # A brace expansion the shell performs before the command runs: `{a,b}`, `{a,}`, `{1..3}`,
 # `a{b,c}d`. It needs a comma or a `..` range inside unnested braces; `{a}`, `{}` and
 # `a{}b` are left literal by bash and do not match. The `(?<!\$)` lookbehind keeps a
@@ -6807,17 +6826,26 @@ def _refuse_credential_paths(
             values = {**state.values, **state.picked}
             for reading, tilde in readings:
                 for marked in _spellings(reading, values, state.shell_bases):
-                    pattern, picked = _unpicked(marked)
-                    spelled = _plain(pattern)
-                    globbed = picked or _globbed(token, spelled)
-                    if _names_a_credential(spelled, tilde=tilde, bases=bases, live_glob=globbed):
-                        raise NotReadOnly(f"names a credential store: {word}")
-                    # And a path glued to an option or after an `@`, which no word spells alone
-                    for glued in _glued_paths(REDIRECTION_PREFIX.sub("", spelled)):
-                        if _names_a_credential(glued, tilde=False, bases=bases, live_glob=globbed):
+                    unpicked, picked = _unpicked(marked)
+                    # Each field the shell splits it into is a word. A tilde starts the whole
+                    # word, and its first field, which is the whole word where there's no other
+                    for index, pattern in enumerate(_fields(token, unpicked)):
+                        spelled = _plain(pattern)
+                        globbed = picked or _globbed(token, spelled)
+                        starts = tilde and index <= 1
+                        if _names_a_credential(
+                            spelled, tilde=starts, bases=bases, live_glob=globbed
+                        ):
                             raise NotReadOnly(f"names a credential store: {word}")
-                    if globbed:
-                        _refuse_wildcard_credentials(pattern, tilde=tilde, bases=bases)
+                        # And a path glued to an option or after an `@`, which no word spells
+                        # alone
+                        for glued in _glued_paths(REDIRECTION_PREFIX.sub("", spelled)):
+                            if _names_a_credential(
+                                glued, tilde=False, bases=bases, live_glob=globbed
+                            ):
+                                raise NotReadOnly(f"names a credential store: {word}")
+                        if globbed:
+                            _refuse_wildcard_credentials(pattern, tilde=starts, bases=bases)
 
 
 # The letters and digits of a short-option cluster that starts a word, as `-hf` in `-hf/x`
@@ -6944,7 +6972,7 @@ def _refuse_a_wildcard_before_an_unread_value(
 # directory: a name that holds one is more than one path, or another one. With the wildcards,
 # bash's `extglob` groups, and what zsh rewrites in a value with `GLOB_SUBST`, which a startup
 # file can set: a `~`, the operators of `EXTENDED_GLOB`, and a `\` that quotes the next character.
-SPLIT_OR_GLOBBED = frozenset(" \t\n*?[(|^#<>~\\")
+SPLIT_OR_GLOBBED = FIELD_SEPARATORS | frozenset("*?[(|^#<>~\\")
 
 
 def _refuse_picks_the_shell_splits(
@@ -7290,9 +7318,14 @@ def _reading_scope_problem(text: str, path: str, scope: _ReadScope, *, token: st
     candidates = _resolve_variables(text, scope)
     if candidates is None:
         return "a path this module cannot resolve"
-    for marked in candidates:
-        # A value a glob or `$(ls)` list gave is matched, quoted or not, as the paths it can be
-        spelled, picked = _unpicked(marked)
+    # A value a glob or `$(ls)` list gave is matched, quoted or not, as the paths it can be; and
+    # each field the shell splits an unquoted expansion into is a path of its own
+    fields = [
+        (field, picked)
+        for unpicked, picked in map(_unpicked, candidates)
+        for field in _fields(token, unpicked)
+    ]
+    for spelled, picked in fields:
         candidate = _expand_home(_plain(spelled), tilde=False)
         if picked or _globbed(token, candidate):
             if _glob_may_climb(candidate):
@@ -7866,13 +7899,15 @@ def _followed_links(
         # Each reading of the word's tildes, `_tilde_readings`, is a directory it may name, as a
         # pattern in which a quote's glob characters are literal. A wildcard is matched once the
         # shell has put each value in place: `d=a/b; ... "$d"/*`, and so is one a value puts
-        # there, where the shell globs it, `_globbed`, and one a glob or `$(ls)` list gave, `PICKED`
-        patterns = [
-            _unpicked(marked)
+        # there, where the shell globs it, `_globbed`, and one a glob or `$(ls)` list gave,
+        # `PICKED`; each field the shell splits a value into is an operand
+        fields = [
+            (field, picked)
             for reading in _tilde_readings(token, parts, marked=True)
-            for marked in _spellings(reading, values, bases, before=False)
+            for unpicked, picked in map(_unpicked, _spellings(reading, values, bases, before=False))
+            for field in _fields(token, unpicked)
         ]
-        for pattern, picked in patterns:
+        for pattern, picked in fields:
             spelled = _plain(pattern)
             if not (picked or _globbed(token, spelled)):
                 directories.append(spelled)
