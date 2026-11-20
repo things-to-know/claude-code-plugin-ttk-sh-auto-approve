@@ -2454,6 +2454,24 @@ class ObservedCommandsStayApproved(Verdicts, unittest.TestCase):
         self.assert_allowed("echo aGkK | base64 -d", "decodes stdin to stdout")
         self.assert_allowed("base64 -w0 AGENTS.md | head -c 40", "encodes a file in scope")
 
+    def test_the_system_grep_and_find_by_path_or_through_command(self):
+        """`non-bare program path: /usr/bin/grep`, and `command other than ...` for `command grep`.
+        In Claude Code's Bash tool `grep` and `find` are functions that run the ugrep and bfs
+        embedded in Claude Code, and ugrep refuses a bounded repeat such as `.{0,200}`, which GNU
+        grep runs, so an operator's instructions may ask for the system's `grep` by its path."""
+        for command in (
+            "/usr/bin/grep -n -E 'a.{0,200}b' AGENTS.md",
+            "/bin/grep -c x AGENTS.md",
+            "command grep -rn x tests",
+            "git log -1 | /usr/bin/grep -c x",
+            "git log -1 | command grep -c x",
+            "/usr/bin/find . -maxdepth 1 -name '*.md'",
+            "/bin/find tests -name '*.py'",
+            "command find . -maxdepth 1 -name AGENTS.md",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "the bare name is approved")
+
 
 class AllowsALoopVariableBoundToLiterals(Verdicts, unittest.TestCase):
     """`for f in 'a.json' 'b.json'; do jq -r '.x' "$f"; done` and the edge of the
@@ -2776,6 +2794,39 @@ class TheWideningsHaveAnEdge(Verdicts, unittest.TestCase):
         self.assert_refused("sed -n 'w /tmp/out' AGENTS.md")
         self.assert_refused("sed -n 's/a/b/w /tmp/out' AGENTS.md")
         self.assert_refused("sed -n '1e touch PWNED' AGENTS.md")
+
+    def test_the_system_grep_and_find_stop_where_the_bare_names_stop(self):
+        """`ObservedCommandsStayApproved` reads their paths and `command grep|find` as `grep` and
+        `find`, so each refusal of the bare name holds for them, and the read scope too. No other
+        path is read, nor any other form of `command`."""
+        self.assert_allowed("/usr/bin/grep -c x AGENTS.md", "the control")
+        self.assert_allowed("command find . -name AGENTS.md", "the control")
+        for refused in (
+            "/usr/bin/find . -name AGENTS.md -delete",
+            "/bin/find . -name AGENTS.md -exec touch PWNED ;",
+            "command find . -name AGENTS.md -fprint PWNED",
+            "command find . -name AGENTS.md -rm",
+            'command find . -name AGENTS.md "$(echo -delete)"',
+            "/usr/bin/grep --filter='md:touch PWNED' x AGENTS.md",
+            "command grep --save-config=PWNED x AGENTS.md",
+            "command -p grep x AGENTS.md",
+            "command 'grep' x AGENTS.md",
+            "command -- grep x AGENTS.md",
+            "command egrep x AGENTS.md",
+        ):
+            with self.subTest(refused=refused):
+                self.assert_refused_outright(refused)
+        for no_opinion in (
+            "/usr/bin/grep -r PRIVATE ~",
+            "command grep -r PRIVATE ~",
+            "/usr/bin/grep x /etc/hostname",
+            "/usr/local/bin/grep x AGENTS.md",
+            "/usr/bin/egrep x AGENTS.md",
+            "./grep x AGENTS.md",
+            "/usr/bin/sort AGENTS.md",
+        ):
+            with self.subTest(no_opinion=no_opinion):
+                self.assert_no_opinion(no_opinion, "outside the read roots, or another path")
 
     def test_a_writing_flag_bundled_behind_another_short_flag(self):
         """The cost of letting sed take operands, paid up front. Before it did, `sed -ni
@@ -4418,6 +4469,21 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_refused(command)
 
+    def test_a_list_of_paths_grep_reads_from_a_file(self):
+        r"""ugrep's `--from` searches each path a file or stdin lists, and no word of the command
+        names them, as with `xargs grep`. Claude Code's `grep` function hands it to ugrep: on
+        2026-11-20, under Claude Code 2.1.329, `printf '%s\n' /etc/hostname | grep --from=- -H
+        -c ''` read `/etc/hostname`. GNU grep has no `--from`."""
+        for command in (
+            "grep --from=list.txt -H x",
+            "grep --from list.txt x",
+            f"grep --from={SCRATCH}/list -H x",
+            "printf '%s\\n' /etc/hostname | grep --from=- -H x",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused_outright(command, "reads each path the list names")
+        self.assert_allowed("grep -f list.txt x AGENTS.md", "the control: the file holds patterns")
+
     def test_a_credential_reached_through_a_program_the_module_cannot_read(self):
         """Layer B's reason for running before the operator tier. With a rule file
         that allows the project's scripts, each is approved on its name alone."""
@@ -5906,6 +5972,10 @@ class RefusesALinkARecursiveReadFollows(Verdicts, unittest.TestCase):
         ("diff -N src d1", "diff -N d1 src/lib"),
         ("find -L . -name id_rsa", "find . -name id_rsa"),
         ("find . -follow -name id_rsa", "find -L d1 -name id_rsa"),
+        ("/usr/bin/grep -R PRIVATE .", "/usr/bin/grep -r PRIVATE ."),
+        ("command grep -R PRIVATE .", "command grep -r PRIVATE ."),
+        ("/usr/bin/find -L . -name id_rsa", "/usr/bin/find . -name id_rsa"),
+        ("command find -L . -name id_rsa", "command find . -name id_rsa"),
         ("ls -RL", "ls -R"),
         ("ls -R --dereference src", "ls -RL d1"),
         ("du -L", "du"),
@@ -6708,7 +6778,8 @@ class RefusesBuiltinsThatRunAProgram(Verdicts, unittest.TestCase):
 
     def test_command_only_looks_up(self):
         """`command -v` is read; every other form runs its operand or prints a function's
-        body, and an operand the shell supplies could be either."""
+        body, and an operand the shell supplies could be either. `command grep` and `command find`
+        are read as `grep` and `find`, in `ObservedCommandsStayApproved`."""
         for command in (
             "command ls",
             "command -p ls",
@@ -7123,6 +7194,43 @@ class RefusesAllowlistedProgramsThatWrite(Verdicts, unittest.TestCase):
         self.assert_allowed("git tag -l", "listing tags only reads")
         self.assert_allowed("git worktree list", "listing worktrees only reads")
 
+    def test_the_options_ugrep_runs_a_program_or_writes_a_file_with(self):
+        """In Claude Code's Bash tool `grep` is a function that runs the ugrep embedded in Claude
+        Code, and a startup file's alias can make it ugrep too. ugrep 7.8.4's `--help` lists these.
+        The function hands each to GNU grep, where it fails, but not `-Q`, and all were approved.
+        GNU grep has none of them, so refusing them costs nothing where `grep` is GNU grep."""
+        for command in (
+            "grep --filter='md:touch PWNED' x AGENTS.md",
+            "grep --filter-magic-label=md:x --filter='md:touch PWNED' x AGENTS.md",
+            "grep --filter-magic-label=md:x x AGENTS.md",
+            "grep --pager=./x x AGENTS.md",
+            "grep --pager x AGENTS.md",
+            "grep --view=./x x AGENTS.md",
+            "grep --config=x x AGENTS.md",
+            "grep --config x AGENTS.md",
+            "grep ---x x AGENTS.md",
+            "grep --save-config x AGENTS.md",
+            "grep --save-config=PWNED x AGENTS.md",
+            "grep -n x AGENTS.md --save-config=PWNED",
+            "grep -Q -e x AGENTS.md",
+            "grep -nQ5 -e x AGENTS.md",
+            "grep --query=5 -e x AGENTS.md",
+            "egrep --filter='md:touch PWNED' x AGENTS.md",
+            "git log -1 | grep --filter='*:touch PWNED' x",
+        ):
+            with self.subTest(command=command):
+                self.assert_refused_outright(command, "ugrep runs a program or writes a file")
+        for command in (
+            "grep -e --filter AGENTS.md",
+            "grep -ne --save-config AGENTS.md",
+            "grep --regexp --pager AGENTS.md",
+            "grep -eQ AGENTS.md",
+            "grep -- --config AGENTS.md",
+            "grep --no-config -c x AGENTS.md",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "the word is a pattern, or the option only reads")
+
 
 @approvals_budgeted
 class RefusesWritingFlagsBundledIntoAShortOption(Verdicts, unittest.TestCase):
@@ -7212,6 +7320,14 @@ class RefusesFindWritingPredicates(Verdicts, unittest.TestCase):
             with self.subTest(predicate=predicate):
                 command = f"find . -name AGENTS.md {predicate}"
                 self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
+
+    def test_the_delete_bfs_spells_rm(self):
+        """In Claude Code's Bash tool `find` is a function that runs the bfs embedded in Claude
+        Code, whose `-rm` deletes as `-delete` does: bfs 4.1.1's `--help` lists them together.
+        GNU find stops at it as an unknown predicate. Both were approved."""
+        self.assert_refused_outright("find . -name AGENTS.md -rm", "bfs deletes AGENTS.md")
+        self.assert_refused_outright("find -rm", "bfs deletes everything below .")
+        self.assert_refused_outright("find . '-rm'", "the quotes go before bfs reads it")
 
 
 class RefusesOutputThatIsNotInert(Verdicts, unittest.TestCase):
@@ -11096,6 +11212,13 @@ class PolicyStillUndecided(Verdicts, unittest.TestCase):
         its config, which can name a program to run, as `--git-dir` would. The module reads
         the path, not the disk, so it cannot tell. `cd vendor/lib && git status` is the same."""
         self.assert_allowed("git -C vendor/lib status", "a nested repository; approved today")
+
+    def test_a_ugrep_option_a_word_the_shell_builds_spells(self):
+        """`_check_grep` reads ugrep's options as written. `grep` is not in `EXPANSION_UNSAFE`, so
+        a word the shell builds, a substitution or an unquoted wildcard, can still spell one, and
+        Claude Code's `grep` function hands `--from` to ugrep. Putting `grep` there would refuse
+        a wildcard and a substitution given to it in every command."""
+        self.assert_allowed('grep "$(printf %s --from=-)" x', "a substitution spells --from=-")
 
 
 @unittest.skip("recorded, not asserted: see the class docstring")
