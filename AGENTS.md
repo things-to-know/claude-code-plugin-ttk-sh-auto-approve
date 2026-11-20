@@ -311,6 +311,13 @@ other change: where a fix rewrote content that was correct, revert it and adjust
   - A fix to a gap older than the branch is a distinct change, with a commit of its own
   - Rebasing a PR, fold a commit that only fixes a review of an earlier one, or say in the PR
     why it stays
+- A commit or PR that leaves part of an issue open names it in a `Refs: #N` trailer, with no
+  closing keyword in the message or the PR body: GitHub closes an issue a merged commit's message
+  names, as it does one the PR body names
+  - Before keeping a `Fixes #N`, search the PR's diff for `#N`: a line that names it as where
+    something stays open means `Refs`
+  - #127, 2026-11-20: its commit and body said `Fixes #114`, while its own `AGENTS.md` named #114
+    for the question it leaves open
 
 ## Reviews
 
