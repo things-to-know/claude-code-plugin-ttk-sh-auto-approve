@@ -4039,6 +4039,59 @@ def _check_find(args: list[str]) -> None:
             raise NotReadOnly(f"find -printf field wider than {PRINTF_WIDTH_CAP}")
 
 
+# ugrep's options that run a program, write a file, or take options or the paths to search from
+# a file, by their long names, from ugrep 7.8.4's `--help`. In Claude Code's Bash tool `grep` is
+# a function that runs the ugrep embedded in Claude Code, and a startup file's alias can make it
+# ugrep as well. The function hands each of them to GNU grep, where it fails, except `--from` and
+# `--query`. GNU grep has none of them, and ugrep reads no abbreviation of a long option.
+UGREP_REFUSED_OPTIONS = {
+    "--config": "takes its options from a file",
+    "--filter": "runs a program on each file it searches",
+    "--filter-magic-label": "picks the files a --filter runs on",
+    "--from": "searches each path a file lists, which no word of the command names",
+    "--pager": "runs a program on its output",
+    "--query": "starts an interactive search that can run --view",
+    "--save-config": "writes a file",
+    "--view": "names the program --query runs",
+}
+
+# The names a command may run ugrep by, for `_check_grep`
+GREP_NAMES = frozenset({"grep", "egrep", "fgrep"})
+
+
+def _check_grep(args: list[str]) -> None:
+    """Refuse ugrep's options in `UGREP_REFUSED_OPTIONS`, and `-Q`, `--query` in short.
+
+    `---FILE` is `--config=FILE`. A word that the flag before it takes, as in `-e --from`, is not
+    read as an option, nor any word after `--`. A word the shell builds is not read either, as for
+    any program `EXPANSION_UNSAFE` leaves out: `PolicyStillUndecided` in the tests records that
+    residual.
+    """
+    spec = READER_SPECS["grep"]
+    values = spec["values"] | spec["files"]
+    takes_next = False
+    for arg in args:
+        if takes_next:
+            takes_next = False
+            continue
+        if arg == "--":
+            return
+        if not arg.startswith("-") or arg == "-":
+            continue
+        if arg.startswith("---"):
+            raise NotReadOnly(f"ugrep's ---FILE, which is --config=FILE: {arg}")
+        if arg.startswith("--"):
+            name, equals, _ = arg.partition("=")
+            if name in UGREP_REFUSED_OPTIONS:
+                raise NotReadOnly(f"ugrep's {name}, which {UGREP_REFUSED_OPTIONS[name]}: {arg}")
+            takes_next = not equals and name in values
+            continue
+        letters = _short_letters(arg, values)
+        if "Q" in letters:
+            raise NotReadOnly(f"ugrep's -Q, which {UGREP_REFUSED_OPTIONS['--query']}: {arg}")
+        takes_next = len(letters) == len(arg) - 1 and f"-{letters[-1]}" in values
+
+
 def _check_jq(args: list[str]) -> None:
     r"""Validate jq: a filter language with no write and no exec, given two restrictions.
 
@@ -4600,6 +4653,10 @@ def _check_command(
                 f"bash may split or glob {expansion} where {program} gets it: "
                 f"{_expand(word, parts)}"
             )
+
+    # ugrep's options, as written, under each name `grep` may run ugrep by; see `_check_grep`
+    if program in GREP_NAMES:
+        _check_grep(args)
 
     # Fail-closed dispatch: either a dedicated validator, a purely read-only program, or reject
     if program in PROGRAM_VALIDATORS:
