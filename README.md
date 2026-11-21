@@ -9,7 +9,7 @@ A [Claude Code](https://code.claude.com/docs) plugin with 2 hooks:
 - A `PostToolUse` hook that restores the final newline a `Write` or `Edit` left out. A `Write`
   approved at a permission prompt saves the file without one.
 
-> **Status:** not released yet. Requires Python 3.12 or later on Linux or macOS;
+> **Status:** not released yet. Requires Python 3.13 or later on Linux or macOS;
 > anywhere else both hooks do nothing, and every command prompts.
 
 ## The Bash tool may run zsh

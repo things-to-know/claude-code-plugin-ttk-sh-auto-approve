@@ -7,7 +7,7 @@ name = "ttk-sh-auto-approve-dev"
 # from the commit the catalog pins (see AGENTS.md, "No `version`")
 version = "0"
 # The oldest Python the hook supports, as in ruff.toml
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 
 [dependency-groups]
 dev = [

@@ -132,7 +132,7 @@ HOST_COMMAND_LENGTH_CAP = 10_000
 # Where this module is supported. Anywhere else it stays silent, so every command prompts as
 # if the hook were not installed: the shells and tools it models are the ones found here,
 # and an older interpreter is one nobody has run the tests on.
-MINIMUM_PYTHON = (3, 12)
+MINIMUM_PYTHON = (3, 13)
 SUPPORTED_PLATFORMS = ("linux", "darwin")
 
 # The project the session works in:
