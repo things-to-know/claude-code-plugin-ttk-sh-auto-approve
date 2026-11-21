@@ -308,7 +308,8 @@ other change: where a fix rewrote content that was correct, revert it and adjust
 - Add a body only when the subject isn't enough, but not too verbose.
 - A commit stands for one distinct change: a fix a review asks for goes into the commit it
   fixes, not into a commit per finding
-  - A fix to a gap older than the branch is a distinct change, with a commit of its own
+  - A gap older than the branch, as a review may find, goes to an issue unless the operator
+    asks for its fix in the PR; that fix is a distinct change, with a commit of its own
   - Rebasing a PR, fold a commit that only fixes a review of an earlier one, or say in the PR
     why it stays
 - A commit or PR that leaves part of an issue open names it in a `Refs: #N` trailer, with no
