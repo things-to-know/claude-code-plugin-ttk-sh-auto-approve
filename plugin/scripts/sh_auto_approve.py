@@ -2554,6 +2554,12 @@ def _unclean_expansion(token: str, known_values: dict[str, list[str] | None]) ->
 UNREAD_VALUE = "\x02"
 OPERATOR_VALUE = "\x03"
 
+# The bytes the path checks read as this module's own marks, which a command can't hold: a name
+# read from the disk that holds one would read as a mark too, as a directory `a\x02b` reads as one
+# below a value this module didn't read, whose links a walk then skips. So such a name refuses
+# the command (`_directory_names`, `_walk_directories`).
+RESERVED_BYTES = frozenset((UNREAD_VALUE, PICKED, GLOB_LITERAL))
+
 # An expansion in unquoted or double-quoted text: a plain `$q` or `${q}`, or any other `$` form.
 TEXT_EXPANSION = re.compile(
     r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*)|(\{[^}]*\}|.?))"
@@ -8246,24 +8252,30 @@ def _directory_names(directory: str) -> list[str]:
 
     Those are `_PLANNED_LINKS`, placed as `_walk_directories` places them. What can't be listed
     holds no name here: the shell can't list it either. Raises `NotReadOnly` for a directory
-    whose `_resolutions` this module can't tell.
+    whose `_resolutions` this module can't tell, and for a name that holds one of
+    `RESERVED_BYTES`.
     """
+    names: list[str] = []
     if not _PLANNED_LINKS:
         try:
-            return os.listdir(directory)
+            names = os.listdir(directory)
         except (OSError, ValueError):
             return []
-    try:
-        reals = _resolutions(directory)
-    except (OSError, ValueError):
-        raise NotReadOnly(f"a directory this module can't resolve: {directory}") from None
-    names: list[str] = []
-    for real in sorted(reals):
+    else:
         try:
-            names += os.listdir(real)
+            reals = _resolutions(directory)
         except (OSError, ValueError):
-            continue
-    names += [os.path.basename(link) for link in _PLANNED_LINKS if os.path.dirname(link) in reals]
+            raise NotReadOnly(f"a directory this module can't resolve: {directory}") from None
+        for real in sorted(reals):
+            try:
+                names += os.listdir(real)
+            except (OSError, ValueError):
+                continue
+        names += [
+            os.path.basename(link) for link in _PLANNED_LINKS if os.path.dirname(link) in reals
+        ]
+    if any(RESERVED_BYTES & set(name) for name in names):
+        raise NotReadOnly(f"a name in {directory} holds a byte this module reserves")
     return list(dict.fromkeys(names))
 
 
@@ -8561,7 +8573,8 @@ def _walk_directories(
     - What can't be listed is skipped: the reader can't list it either
 
     Raises `_WalkTooLargeError` past `MAX_WALKED_ENTRIES` entries, and `_WalkUnresolvableError` for
-    a directory whose resolutions it can't tell, each an `OSError`.
+    a directory whose resolutions it can't tell, or whose entry holds one of `RESERVED_BYTES`,
+    each an `OSError`.
     """
     count = 0
     stack = [(root, 1) for root in roots]
@@ -8589,6 +8602,10 @@ def _walk_directories(
                 for link in _PLANNED_LINKS
                 if os.path.dirname(link) == real
             ]
+            if any(RESERVED_BYTES & set(name) for name, _, _ in entries):
+                raise _WalkUnresolvableError(
+                    f"a name in {directory} holds a byte this module reserves"
+                )
             count += len(entries)
             if count > MAX_WALKED_ENTRIES:
                 raise _WalkTooLargeError(
