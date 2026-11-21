@@ -64,7 +64,7 @@ TEST_ARGS ?=
 
 # The Python versions `test-all-python-matrix` runs the tests on: those in CI's test matrix
 # Warning: keep in sync with `.github/workflows/ci.yml` (`jobs.test.strategy.matrix.python`)
-TEST_PYTHON_VERSIONS ?= 3.12 3.13 3.14
+TEST_PYTHON_VERSIONS ?= 3.12 3.13 3.14 3.15
 
 # The session to explain a verdict for, and the copy of the hook to ask, e.g.
 # `make explain PROJECT=$HOME/ws/app CWD=$HOME/ws/app/sub < commands.txt`.
