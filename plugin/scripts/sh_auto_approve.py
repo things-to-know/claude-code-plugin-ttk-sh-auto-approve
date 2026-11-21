@@ -121,7 +121,7 @@ import re
 import shlex
 import sys
 import unicodedata
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Container, Iterable, Iterator
 from pathlib import Path
 from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import NoReturn
@@ -1376,14 +1376,15 @@ QUOTED_SPLICE_USE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Z
 
 
 def _quoted_splice_name(
-    token: str, parts: list[tuple[str, str]], values: dict[str, str]
+    token: str, parts: list[tuple[str, str]], values: Container[str]
 ) -> str | None:
     r"""The variable name whose value this token is, as one word, or None (#99).
 
-    A word that is exactly `"$name"` or `"${name}"`, whose `name` has a resolved literal
-    value: both shells hand the program that value as it is, neither split nor globbed. The
-    whole word has to be the one double-quoted span, so `"$name"x` and `"$name$other"` are not
-    read here, and neither is `"\$name"`, the literal text, which `_EscapedDollar` marks.
+    A word that is exactly `"$name"` or `"${name}"`, whose `name` is in ``values``: one with a
+    resolved literal value, or a loop's that `_gh_loop_turns` reads. Both shells hand the
+    program that value as it is, neither split nor globbed. The whole word has to be the one
+    double-quoted span, so `"$name"x` and `"$name$other"` are not read here, and neither is
+    `"\$name"`, the literal text, which `_EscapedDollar` marks.
     """
     match = PLACEHOLDER.fullmatch(token)
     if match is None:
@@ -3602,7 +3603,8 @@ def _check_gh_filter(text: str, *, rewritten: bool) -> None:
     ``NoOpinion`` that is not a verdict an operator's allow rule can overturn, so the hook does
     not approve it through a rule either. A filter the shell rewrites, ``--jq "$f"`` or an
     unquoted wildcard, is not the text this module read, and is refused the same way, as
-    ``jq "$f"`` is.
+    ``jq "$f"`` is. Where a loop over literals binds ``f``, `_gh_loop_turns` puts each value in
+    its place, and each is read here as written out.
     """
     if rewritten:
         raise NotReadOnly(f"gh --jq filter the shell rewrites: {text}")
@@ -3771,6 +3773,86 @@ def _check_gh_read(args: list[str], rewritten: list[bool]) -> None:
         pattern = GH_REPO_NAME if args[:2] == ["repo", "view"] else GH_REFERENCE
         if "://" in operand or not pattern.match(operand):
             raise NoOpinion(f"gh operand that is not a plain reference: {operand}")
+
+
+# The values an unquoted whole-word `$n` hands gh as the one word they spell, under either shell
+# and whatever options a startup file sets: no separator, which bash and zsh's `sh_word_split`
+# split on, and no character that either shell's filename expansion reads, zsh's under
+# `glob_subst` included: a wildcard, zsh's `<1-20>` and `(a|x)`, a `~`, or an `=` that starts the
+# word, as in `=ls`. Listed by what a value may hold: a number, an `OWNER/REPO` and a search word.
+UNQUOTED_LOOP_VALUE = re.compile(r"[A-Za-z0-9_.,:@#%+/-]+")
+
+
+def _gh_loop_turns(
+    args: list[str],
+    arg_tokens: list[str],
+    rewritten: list[bool],
+    parts: list[tuple[str, str]],
+    safe_names: frozenset[str],
+    known_values: dict[str, list[str] | None],
+) -> list[list[str]] | None:
+    """The argument lists gh gets on the turns of the loops whose names its words use (#101).
+
+    A name in ``safe_names`` is bound by `for` headers whose lists are literal words, none of
+    which starts with `-`. Where one header is its one binding, ``known_values`` holds each value
+    it takes, as `_literal_loop_values` reads them; two headers leave it unread. Where each word
+    the shell rewrites is a whole-word use of such a name, gh gets one list per combination of
+    those values, each value in its uses' place: `for n in 72 69; do gh issue view $n; done`
+    runs `gh issue view 72`, then `gh issue view 69`. A use is `"$n"` or `"${n}"`, the value as
+    it is, or `$n` or `${n}` of a name whose every value is `UNQUOTED_LOOP_VALUE`, which neither
+    shell splits or expands.
+
+    None where a word the shell rewrites is anything else, such as a glued `o/$n`, or where no
+    word is a use. More than `MAX_WORD_SHAPES` lists is `NoOpinion`.
+    """
+    readable = {name: values for name in safe_names if (values := known_values.get(name))}
+    uses: list[tuple[int, str]] = []
+    for index, (token, was_rewritten) in enumerate(zip(arg_tokens, rewritten, strict=True)):
+        if not was_rewritten:
+            continue
+        name = _quoted_splice_name(token, parts, readable)
+        if name is None:
+            # An unquoted use is the reduced token itself: a `\$n` keeps a placeholder for the `$`
+            match = QUOTED_SPLICE_USE.fullmatch(token)
+            name = (match.group(1) or match.group(2)) if match else None
+            if name not in readable or not all(
+                UNQUOTED_LOOP_VALUE.fullmatch(value) for value in readable[name]
+            ):
+                return None
+        uses.append((index, name))
+    if not uses:
+        return None
+    names = sorted({name for _, name in uses})
+    if math.prod(len(readable[name]) for name in names) > MAX_WORD_SHAPES:
+        raise NoOpinion(TOO_MANY_SHAPES)
+    turns: list[list[str]] = []
+    for combination in itertools.product(*(readable[name] for name in names)):
+        value = dict(zip(names, combination, strict=True))
+        turn = list(args)
+        for index, name in uses:
+            turn[index] = value[name]
+        turns.append(turn)
+    return turns
+
+
+def _check_gh_turns(turns: list[list[str]]) -> None:
+    """Read each argument list `_gh_loop_turns` gives, as `_check_gh_read` reads one written out.
+
+    A refusal on any turn is the verdict: a `--jq` that reads the environment stays refused
+    outright, whatever a rule says, so no other turn's `NoOpinion` may stand in front of it.
+    Otherwise a turn the hook can't vouch for leaves the command to the operator's rules.
+    """
+    unread: NoOpinion | None = None
+    for turn in turns:
+        try:
+            _check_gh_read(turn, [False] * len(turn))
+        except NotReadOnly as error:
+            labelled = type(error)(f"{error}, with the values this command sets: {' '.join(turn)}")
+            if not isinstance(error, NoOpinion):
+                raise labelled from None
+            unread = unread or labelled
+    if unread is not None:
+        raise unread
 
 
 def _gh_give_up(words: list[str], rewritten: list[bool], start: int, reason: str) -> NoReturn:
@@ -4659,7 +4741,13 @@ def _check_command(
         # '$ENV.GH_TOKEN'` prints the token, so the hook approves it neither by reading it nor
         # through a rule. A native `Bash(gh issue view *)` rule still lets Claude Code run it
         # without asking; only a native deny rule stops that.
-        _check_gh_read(args, _rewritten_words(arg_tokens, live_globs, parts))
+        rewritten = _rewritten_words(arg_tokens, live_globs, parts)
+        # A word that a loop over literals binds is read once for each value it takes (#101)
+        turns = _gh_loop_turns(args, arg_tokens, rewritten, parts, safe_names, known_values)
+        if turns is None:
+            _check_gh_read(args, rewritten)
+        else:
+            _check_gh_turns(turns)
         _check_where_git_runs(scope)
         return
 

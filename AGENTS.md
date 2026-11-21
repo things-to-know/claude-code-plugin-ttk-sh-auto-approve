@@ -86,10 +86,13 @@ insists on its own filename, symlink to this file rather than copying it.
   - The hook reads `gh api` GETs itself
   - It reads these subcommands itself, flag by flag (`GH_READ_SPECS`): `pr view|list|diff|checks`,
     `run list|view`, `issue view|list`, `repo view` and `search issues|prs`
+    - With a whole-word `$n` or `"$n"` that a `for` loop over literal words binds, once for each
+      value (`_gh_loop_turns`)
   - It leaves any other subcommand, and a flag the table doesn't list, to the operator's rules
     - Read-only ones too, such as `gh pr status`, `gh repo list` and `gh search code`
   - A `--jq` that reads the environment, or that the shell rewrites, is refused, which no rule
     overturns
+    - Except a loop variable it reads as above: each value is read as the filter
   - Operators can drop native `Bash(gh ... view|list *)` allow rules for the subcommands the hook
     reads
     - A native rule still approves `--jq '$ENV.GH_TOKEN'`, and only a native deny rule stops that
