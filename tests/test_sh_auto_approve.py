@@ -62,7 +62,7 @@ from a command that prompted in a real session.
           RefusesDescriptorAndSocketRedirection, RefusesRedirectionAttachedToACompound,
           RefusesReadsOutsideTheWorkingDirectories, ReadsWhereAReadRuleAllows,
           ResolvesThroughALinkTheCommandMakes, RefusesALinkARecursiveReadFollows,
-          RefusesACredentialStoreAWildcardOrABaseReaches,
+          RefusesACredentialStoreAWildcardOrABaseReaches, ReadsWhatAWildcardMatches,
           ReadsAValueOnlyWhereTheShellHoldsIt, ReadsATildeAsEachShellExpandsIt,
           RefusesAScratchPathThroughALinkOut, RefusesEgressThroughAnApprovedProgram
      9  Program identity, environment, and session state
@@ -5002,6 +5002,19 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_refused(command)
 
+    def test_a_dot_and_a_bracket_expression(self):
+        """A `[` that no `]` closes is the character it is, so `.[x*` can't match `..`; a set is
+        one character that may be `.`, and a collating element `[...]` is one member, so
+        `.[[...]]` matches `..` in a bash with `globskipdots` off. A second `_bracket_end`, which
+        reads neither so, had replaced the one `_may_match_dot_dot` was written against: the hook
+        raised `TypeError` on `.[x*` and approved `grep -r x .[[...]]` (#123)."""
+        for command in ("cat .[x*", "ls .[x*", "echo .[x#", "cat .[x~y"):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "the control: an unclosed [ is a [")
+        for command in ("grep -r x .[[...]]", "cat .[x]*", "grep -r x .[x*/.."):
+            with self.subTest(command=command):
+                self.assert_refused(command, "may read ..")
+
     def test_a_nul_byte_is_refused_rather_than_crashing(self):
         """Bash ends a string at a NUL, so the hook and bash would read different commands."""
         self.assert_refused("cat AGENTS.md\x00 ~/.aws/credentials", "bash truncates here")
@@ -6139,12 +6152,15 @@ class RefusesALinkARecursiveReadFollows(Verdicts, unittest.TestCase):
             (project / "a" / "b" / "d1").mkdir(parents=True)
             (project / "a" / "b" / "d1" / "k").symlink_to(home)
             self.assert_allowed("grep -R one src/**", "the control: src holds no link")
-            self.assert_allowed("grep -r PRIVATE **/d1", "the control: follows none")
+            self.assert_allowed("grep -r PRIVATE */*/d1", "the control: follows none")
             for command in (
                 "grep -R PRIVATE **/d1",
                 "grep -R PRIVATE ***/d1",
                 "grep -R PRIVATE */*/d1",
                 "grep -R PRIVATE a/[^z]",
+                # The cost, recorded: `**` is read as zsh's `***`, which matches through `k`
+                # (#54); bash's `**` and zsh's match none below a link
+                "grep -r PRIVATE **/d1",
             ):
                 with self.subTest(command=command):
                     self.assert_refused_outright(command, "reads ~/.ssh through a/b/d1/k")
@@ -6282,8 +6298,8 @@ class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase
     one, so a word the shell expands into a credential store got past it (#43). Each is refused
     outright now, so no allow rule overturns it, beside a control approved under the same setup.
 
-    Not covered here: what a wildcard matches, such as `k*` in `cat k*/id_rsa` through the link
-    `k` to `~/.ssh`, which is #54.
+    What a wildcard matches, such as `k*` in `cat k*/id_rsa` through the link `k` to `~/.ssh`,
+    is `ReadsWhatAWildcardMatches`' (#54).
     """
 
     def test_a_store_glued_to_a_short_option_or_after_an_at(self):
@@ -6472,6 +6488,661 @@ class RefusesACredentialStoreAWildcardOrABaseReaches(Verdicts, unittest.TestCase
             ):
                 with self.subTest(command=command):
                     self.assert_refused_outright(command)
+
+
+class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
+    """#54: neither layer read what a wildcard the shell expands matches, so with `k -> ~/.ssh` in
+    the project, `cat k/id_rsa` was refused and `cat k*/id_rsa` approved, with no rule. Both
+    layers now read each path it may match as a literal path is read, through its links: one in
+    a credential store refuses the command outright, under any rule, and one out of the working
+    directories leaves it to the rules.
+
+    In `a_project_below_home`, with `src/lib2 -> ~/.ssh`, `d -> ~/a/b/outside`, which holds no
+    store, and `e -> src/lib`.
+    """
+
+    @contextlib.contextmanager
+    def _project(self):
+        with a_project_below_home() as project:
+            home = Path(os.environ["HOME"])
+            (project / "src" / "lib2").symlink_to(home / ".ssh")
+            outside = project.parent / "outside"
+            outside.mkdir()
+            (outside / "f").write_text("one\n")
+            (project / "d").symlink_to(outside)
+            (project / "e").symlink_to("src/lib")
+            yield project, home
+
+    REFUSED_AND_CONTROLS = (
+        ("cat k*/id_rsa", "cat src*/lib/x.txt"),
+        ("cat [k]/id_rsa", "cat [s]rc/lib/x.txt"),
+        ("cat k?/id_rsa ./k*/id_rsa", "cat ./s?c/lib/x.txt"),
+        ("grep -r PRIVATE k*", "grep -r PRIVATE src*"),
+        ("cat src/*/id_rsa", "cat src/*/x.txt"),
+        ("cat src/lib*/id_rsa", "cat src/lib*/x.txt"),
+        ("ls *", "ls src/lib/*"),
+        ("head -n1 k*/id_rsa", "head -n1 e*/x.txt"),
+        ("echo k*", "echo src*"),
+    )
+
+    def test_a_link_to_a_credential_store(self):
+        """Each word is read whatever program it belongs to, as a literal one is: `echo k` is
+        refused too."""
+        with self._project():
+            for refused, control in self.REFUSED_AND_CONTROLS:
+                with self.subTest(refused=refused):
+                    self.assert_refused_outright(refused, "reads ~/.ssh through a link")
+                    self.assert_allowed(control, "matches no link to it")
+
+    def test_under_a_rule_for_the_reader(self):
+        with self._project(), operator_rules(allow=["Bash(cat *)", "Bash(grep *)"]):
+            self.assert_allowed("cat d*/f", "the control: the rule approves this")
+            for command in ("cat k*/id_rsa", "grep -r PRIVATE src/l*"):
+                with self.subTest(command=command):
+                    self.assert_refused(command, "the rule says yes")
+
+    def test_a_link_out_of_the_working_directories(self):
+        """No store: the read scope's question, and so the rule's. A component at the root was
+        placed in the project, as the directory in front of `/u*` was ``""``."""
+        with self._project() as (project, _):
+            self.assert_allowed("cat e*/x.txt", "the control: e leads to src/lib")
+            self.assert_allowed(f"cat {project}/s*/lib/x.txt", "the control")
+            for command in ("cat d*/f", "cat [d]/f", "grep -r one d*", "cat /u?r/bin/env"):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "reads outside the project")
+            with operator_rules(allow=["Bash(cat *)"]):
+                self.assert_allowed("cat d*/f", "the rule approves it")
+
+    def test_a_name_the_shell_leaves_as_spelled(self):
+        """bash leaves a word that matches nothing as it is, so `[j]x` names the entry `[j]x`. A
+        set is read as any one character, so `[j]` alone would match `k` as well."""
+        with self._project() as (project, home):
+            self.assert_allowed("cat [j]x/id_rsa", "the control: there is no [j]x")
+            (project / "[j]x").symlink_to(home / ".ssh")
+            self.assert_refused_outright("cat [j]x/id_rsa", "reads ~/.ssh through [j]x")
+
+    def test_a_wildcard_that_recurses(self):
+        """zsh's `***` matches through a link, as `src/***/id_rsa` does through `src/lib2`, and
+        bash's `**` with `globstar` and zsh's `**` match none below one: each is read as `***`,
+        the links below its literal directory walked, as for a reader that follows links."""
+        with self._project() as (project, _):
+            (project / "g").mkdir()
+            (project / "g" / "o").symlink_to(project.parent / "outside")
+            self.assert_allowed("cat src/lib/**/x.txt", "the control: src/lib holds no link")
+            self.assert_allowed(f"cat {project}/src/lib/**/x.txt", "the control")
+            for command in (
+                "cat src/**/id_rsa",
+                "cat **/f",
+                "cat ***/f",
+                f"cat {project}/src/**/id_rsa",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "src/lib2 and k are ~/.ssh")
+            self.assert_no_opinion("cat g/**/f", "g/o leads out of the project")
+
+    def test_a_tilde_prefix_that_names_no_user(self):
+        """bash reads `~name` as the home directory of the user `name`, and as the text it is
+        when there is none: a directory in the project. zsh refuses to run the command."""
+        with self._project() as (project, home), operator_rules(allow=["Bash(cat *)"]):
+            tilde = "~readonly_hook_no_such_user"
+            (project / tilde).mkdir()
+            (project / tilde / "k").symlink_to(home / ".ssh")
+            (project / tilde / "s").mkdir()
+            (project / tilde / "s" / "x.txt").write_text("one\n")
+            self.assert_allowed(f"cat {tilde}/s*/x.txt", "the control: the rule approves this")
+            self.assert_refused_outright(f"cat {tilde}/k*/id_rsa", "reads ~/.ssh through k")
+
+    def test_a_value_the_shell_globs(self):
+        """bash globs the value of an unquoted `$f`, not of a quoted `"$f"`."""
+        with self._project():
+            self.assert_allowed("for f in 's*'; do cat $f/lib/x.txt; done", "the control")
+            self.assert_allowed("for f in 'k*'; do cat \"$f\"/id_rsa; done", "names k*, no k")
+            self.assert_refused_outright("for f in 'k*'; do cat $f/id_rsa; done", "k/id_rsa")
+            self.assert_no_opinion("for f in 'd*'; do cat $f/f; done", "d/f leads out")
+            self.assert_refused_outright("for f in 'k*'; do grep -R PRIVATE $f; done")
+
+    def test_a_loop_over_a_wildcard_or_a_listing(self):
+        """A `for` list's wildcard, or a `$(ls)`, gives the variable each path it matches or each
+        name it lists. The read scope placed one name in the list's directory, by its text, and
+        the credential check read the variable as unread, so `for f in $(ls); do cat $f/id_rsa;
+        done` was approved, and `for f in d1*; do cat $f/k/id_rsa; done` under `Bash(cat *)`."""
+        with self._project() as (project, home):
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            for command in (
+                "for f in src*; do cat $f/lib/x.txt; done",
+                "for f in $(ls src); do cat src/$f/x.txt; done",
+                'for d in src*; do grep -r PRIVATE "$d"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: reads through no link out")
+            for command in (
+                "for f in $(ls); do cat $f/id_rsa; done",
+                'for f in $(ls); do cat "$f"/id_rsa; done',
+                "for f in $(ls src); do cat src/$f/id_rsa; done",
+                "for f in d1*; do cat $f/k/id_rsa; done",
+                'for d in src*; do grep -R PRIVATE "$d"; done',
+                'for d in $(ls); do grep -R PRIVATE "$d"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through a link")
+            for command in ("for f in d*; do cat $f/f; done", "for f in $(ls); do cat $f/f; done"):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "d/f leads out of the project")
+            with operator_rules(allow=["Bash(cat *)"]):
+                self.assert_allowed("for f in d*; do cat $f/f; done", "the rule approves it")
+                self.assert_refused("for f in d1*; do cat $f/k/id_rsa; done", "the rule says yes")
+
+    def test_a_listing_that_prints_more_than_names(self):
+        """`$(ls ...)` was read as the names of a directory's entries whatever flags and operands
+        it had. `ls -l` prints a link's target, `ls -d` and `ls FILE` the operand, and `ls a b` a
+        header for each: these are no listing now, and a single operand is a value too. The
+        project's `k` is gone, which any name `$(ls)` gives at the top could be."""
+        with self._project() as (project, home):
+            (project / "k").unlink()
+            (project / "a" / "b").mkdir(parents=True)
+            (project / "a" / "b" / "k").symlink_to(home / ".ssh")
+            (project / "a" / "b" / "key").symlink_to(home / ".ssh" / "id_rsa")
+            for command in (
+                "for f in $(ls src); do cat src/$f/x.txt; done",
+                "for f in $(ls -1 src); do cat src/$f/x.txt; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: the names of src/")
+            for command in (
+                "for f in $(ls -l src); do cat $f/id_rsa; done",
+                "for f in $(ls -d a/b); do cat $f/k/id_rsa; done",
+                "for f in $(ls a/b src); do cat $f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "prints more than names")
+            self.assert_refused_outright(
+                "for f in $(ls a/b/key); do cat $f; done", "prints a/b/key, the key"
+            )
+
+    def test_a_value_the_shell_splits(self):
+        """bash splits an unquoted `$f` at a blank, so after `for f in "x k/id_rsa"`, `cat $f`
+        runs `cat x k/id_rsa`: both layers read the value whole, and approved it with no rule.
+        Each field is a word of its own now, for a reader that follows links too."""
+        with self._project():
+            for command in (
+                'for f in "x k/id_rsa"; do cat "$f"; done',
+                "for f in 'README.md src/lib/x.txt'; do cat $f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: names no path out")
+            for command in (
+                'for f in "x k/id_rsa"; do cat $f; done',
+                'for d in "x k"; do grep -R PRIVATE $d; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through k")
+            self.assert_no_opinion('for f in "x d/f"; do cat $f; done', "d leads out")
+
+    def test_a_field_that_holds_a_no_break_space(self):
+        """bash splits at a blank of `IFS` alone, so `kk<U+00A0>` stays one field, which bash
+        5.2 read through its link. `str.split` split it at the no-break space too, so neither
+        layer read the field bash gives, and both approved it with no rule."""
+        with self._project() as (project, home):
+            (project / "kk\u00a0").symlink_to(home / ".ssh")
+            self.assert_allowed('for f in "x kk\u00a0"; do cat "$f"; done', "the control: whole")
+            for command in (
+                'for f in "x kk\u00a0"; do cat $f/id_rsa; done',
+                'f="x kk\u00a0"; cat $f/id_rsa',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through kk<U+00A0>")
+
+    def test_the_first_field_keeps_the_tilde(self):
+        """A tilde starts the word, and so its first field: `cat ~/a/b/proj/k*$f`, with `$f` a
+        value `/id_rsa x`, reads `~/a/b/proj/k/id_rsa`, which the first field placed in the
+        project, as a relative path that matched nothing."""
+        with self._project(), operator_rules(allow=["Bash(cat *)"]):
+            self.assert_allowed(
+                "for f in '/x.txt x'; do cat ~/a/b/proj/src/l*$f; done", "the control: in src"
+            )
+            for command in (
+                "for f in '/id_rsa x'; do cat ~/a/b/proj/k*$f; done",
+                "f='/id_rsa x'; cat ~/a/b/proj/k*$f",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
+
+    def test_an_operator_of_zshs_extended_glob(self):
+        """With `EXTENDED_GLOB`, which a startup file can set, zsh reads an unquoted `^x` as any
+        name but `x` and `x#` as any run of `x`: `cat g/^x/id_rsa` reads `g/k/id_rsa`. Neither
+        layer read a word with no `*`, `?` or `[` as a wildcard, and both approved it with no
+        rule. A word that spells one is matched now, in the path checks alone."""
+        with self._project() as (project, home):
+            (project / "g").mkdir()
+            (project / "g" / "k").symlink_to(home / ".ssh")
+            for command in (
+                "cat src/^x/x.txt",
+                "cat src/lib#/x.txt",
+                "cat 'g/^x/id_rsa'",
+                "echo a#b c^d e~f",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: matches no link out")
+            for command in ("cat g/^x/id_rsa", "cat g/k#/id_rsa", "cat src/^x/id_rsa"):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through a link")
+
+    def test_an_operator_of_zshs_extended_glob_in_a_loop(self):
+        """zsh binds `f=d/y` in `for f in d/^x`, but the list word was a literal value, so a
+        quoted `"$f"` read `d/^x/k/id_rsa` as a path in the project. It is a glob now, as `d/*`
+        is. Here `d/y/k -> ~/.ssh`."""
+        with self._project() as (project, home):
+            (project / "d").unlink()
+            (project / "d" / "y").mkdir(parents=True)
+            (project / "d" / "y" / "k").symlink_to(home / ".ssh")
+            for command in (
+                'for f in e/^x; do cat "$f"; done',
+                'for r in HEAD~1 HEAD~2; do echo "$r"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: matches no link out")
+            for command in (
+                'for f in d/^x; do cat "$f"/k/id_rsa; done',
+                'for f in d/y#; do cat "$f"/k/id_rsa; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "zsh binds d/y, and d/y/k is ~/.ssh")
+            # A name such a list gives is one the shell splits, as a `*` list's is
+            (project / "n").mkdir()
+            (project / "n" / "x ..").write_text("one\n")
+            self.assert_allowed(
+                'for f in n/^z; do grep -r one "$f"; done', "the control: quoted, it is the name"
+            )
+            self.assert_refused_outright(
+                "for f in n/^z; do grep -r one $f; done", "zsh with SH_WORD_SPLIT reads .."
+            )
+
+    def test_a_loop_over_revisions_zsh_alone_globs(self):
+        """The flag checks read `HEAD~1` and `HEAD^` as bash does, but a list word with one
+        dropped its name from the values they read, so `main`'s approvals of these were refused.
+        Each is read as bash reads it, and as zsh may, the text before the operator followed by
+        any other: no flag. A `#` lets the character before it match nothing, as zsh 5.9 matched
+        `a#-o` against a file `-o`, and `^x` matches any name."""
+        with self._project():
+            for command in (
+                "for r in HEAD~1 HEAD~2; do git diff $r..HEAD; done",
+                'for r in HEAD~1 HEAD~2; do git diff "$r..HEAD"; done',
+                "for r in HEAD~1 HEAD~2; do git show $r:README.md; done",
+                "for r in HEAD^ HEAD^^; do git show $r:README.md; done",
+                'for r in HEAD~1; do echo "$(git show $r:README.md)"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "no match of HEAD~1 or HEAD^ is a flag")
+            for command in (
+                "for r in a#-o; do git diff $r..HEAD; done",
+                "for r in ^x; do git diff $r..HEAD; done",
+                "for r in -x^y; do git diff $r..HEAD; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "a match can be a flag")
+
+    def test_an_assignment_that_holds_a_wildcard(self):
+        """bash globs the value of an unquoted `$f`, so `f='k*'; cat $f/id_rsa` reads
+        `k/id_rsa`. `_literal_assignments` reads no value with a wildcard, so `$f` was unread,
+        and the rule approved the read: the credential check reads that value too now. Also one
+        after `do`, `then`, `{` or `!`, which it read only at the start of a segment, and an
+        append, the value it gives a name that was unset: bash 5.2 ran `do`, `then` and `+=`."""
+        with self._project(), operator_rules(allow=["Bash(cat *)", "Bash(echo *)"]):
+            for command in (
+                "f='s*'; cat $f/lib/x.txt",
+                "f='k*'; cat \"$f\"/id_rsa",
+                "for x in a; do f='s*'; cat $f/lib/x.txt; done",
+                "if true; then f='s*'; cat $f/lib/x.txt; fi",
+                "{ f='s*'; cat $f/lib/x.txt; }",
+                "! f='s*'; cat $f/lib/x.txt",
+                "f+='s*'; cat $f/lib/x.txt",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: the rule approves this")
+            for command in (
+                "f='k*'; cat $f/id_rsa",
+                "f=k\\*; cat $f/id_rsa",
+                "f='x *'; cat $f/id_rsa",
+                "f='k*'; echo \"$(cat $f/id_rsa)\"",
+                "for x in a; do f='k*'; cat $f/id_rsa; done",
+                "if true; then f='k*'; cat $f/id_rsa; fi",
+                "{ f='k*'; cat $f/id_rsa; }",
+                "! f='k*'; cat $f/id_rsa",
+                "f+='k*'; cat $f/id_rsa",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
+
+    def test_a_loop_wherever_its_header_stands(self):
+        """The credential check read a loop's glob only where its header started a segment and
+        bound its name once, settled where a word used it: each of these read through `d1/k`
+        under `Bash(cat *)`, in bash 5.2 and zsh 5.9. It reads each list's `PICKED` values
+        wherever the header stands now, however often the name is bound, as an assignment's."""
+        shapes = (
+            "{loop}; echo $f",
+            "{loop}; f=x",
+            "f=x; {loop}",
+            "if true; then {loop}; fi",
+            "{{ {loop}; }}",
+            "for x in 1; do {loop}; done",
+        )
+        control = "for f in s*; do cat $f/lib/x.txt; done"
+        refused = "for f in d1*; do cat $f/k/id_rsa; done"
+        with self._project() as (project, home):
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            with operator_rules(allow=["Bash(cat *)", "Bash(echo *)"]):
+                for shape in shapes:
+                    with self.subTest(shape=shape):
+                        self.assert_allowed(shape.format(loop=control), "the control")
+                        self.assert_refused(shape.format(loop=refused), "it reads ~/.ssh")
+
+    def test_a_loop_variable_in_a_substitution(self):
+        """A substitution's body runs in the loop's shell, where `$f` holds what the list gives,
+        but neither it nor a process substitution read that: under `Bash(cat *)`, `for f in d1*;
+        do echo "$(cat $f/k/id_rsa)"; done` was approved. A name the body binds is its own."""
+        with self._project() as (project, home):
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            with operator_rules(allow=["Bash(cat *)", "Bash(diff *)"]):
+                self.assert_allowed(
+                    'for f in s*; do echo "$(cat $f/lib/x.txt)"; done', "the control: in src"
+                )
+                for command in (
+                    'for f in d1*; do echo "$(cat $f/k/id_rsa)"; done',
+                    "for f in d1*; do diff <(cat $f/k/id_rsa) README.md; done",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
+            for command in (
+                'for f in d*; do echo "$(cat $f/f)"; done',
+                'for f in s*; do echo "$(f=d; cat $f/f)"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "d/f leads out of the project")
+
+    def test_the_loop_reads_a_substitution_widens(self):
+        """The body read `$f` as unread, so `main` left each of these to the rules: they are
+        approved with no rule now, each beside its refusals, a recursive read of the directory
+        holding a store among them. Here `h -> ~` and `d1/k -> ~/.ssh`."""
+        with self._project() as (project, home):
+            (project / "h").symlink_to(home)
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            for command in (
+                'for f in s*; do echo "$(cat $f/lib/x.txt)"; done',
+                'for f in $(ls src); do echo "$(cat src/$f/x.txt)"; done',
+                "for f in s*; do diff <(cat $f/lib/x.txt) src/lib/x.txt; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "reads src/lib/x.txt")
+            self.assert_no_opinion('for f in h*; do echo "$(grep -r PRIVATE $f)"; done', "reads ~")
+            for command in (
+                'for f in d1*; do echo "$(grep -r PRIVATE $f/k)"; done',
+                "for f in d1*; do diff <(cat $f/k/id_rsa) README.md; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through d1/k")
+
+    def test_a_name_the_shell_splits(self):
+        """bash splits an unquoted `$f`, and a `$(ls)` in the list, at a blank: with a file `x k`,
+        `for f in x*; do cat $f/id_rsa; done` runs `cat x k/id_rsa`. A name the list gives that
+        the shell splits, or matches again, refuses the command, where the shell splits it."""
+        with self._project() as (project, _):
+            (project / "x k").write_text("one\n")
+            (project / "g").mkdir()
+            (project / "g" / "c").write_text("one\n")
+            for command in (
+                'for f in x*; do cat "$f"; done',
+                "for f in $(ls g); do cat g/$f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: reads each name whole")
+            for command in (
+                "for f in x*; do cat $f/id_rsa; done",
+                'for f in x*; do echo "$(cat $f/id_rsa)"; done',
+                # Wherever the header stands, however often the name is bound
+                "{ for f in x*; do cat $f/id_rsa; done; }",
+                "f=x; for f in x*; do cat $f/id_rsa; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads k/id_rsa")
+            (project / "g" / "a b").write_text("one\n")
+            self.assert_refused_outright('for f in $(ls g); do cat "g/$f"; done', "reads g/a, g/b")
+
+    def test_the_names_a_pattern_gives_from_the_root(self):
+        """A relative match is the text after its base and a `/`, which a base of `/` ends with:
+        from `/`, `*` gave `tc` for `/etc`, which the split check read in its place."""
+        names = hook._names_a_pattern_gives("*", ["/"])
+        self.assertTrue(names, "/ holds entries")
+        self.assertLessEqual(set(names), {entry.name for entry in Path("/").iterdir()})
+
+    def test_a_name_the_shell_rewrites_below_any_depth(self):
+        """A `**` list gives a name from any depth, as `x ..`, which `grep -r one $f` splits into
+        a recursive read of `..`; and zsh with `GLOB_SUBST` reads a file `~` as the home
+        directory. Here the project holds no link out, so only the names decide."""
+        with self._project() as (project, _):
+            for link in ("k", "d", "src/lib2"):
+                (project / link).unlink()
+            for command in (
+                "for f in **; do grep -r one $f; done",
+                "for f in *; do grep -r PRIVATE $f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: no name the shell rewrites")
+            (project / "src" / "lib" / "x ..").write_text("one\n")
+            self.assert_refused_outright("for f in **; do grep -r one $f; done", "reads ..")
+            self.assert_allowed('for f in **; do grep -r one "$f"; done', "quoted, it is the name")
+            (project / "src" / "lib" / "x ..").unlink()
+            (project / "~").write_text("one\n")
+            for command in (
+                "for f in *; do grep -r PRIVATE $f; done",
+                "for f in $(ls); do grep -r PRIVATE $f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "zsh's GLOB_SUBST reads ~ as home")
+            self.assert_allowed('for f in *; do grep -r PRIVATE "$f"; done', "quoted, ~ is a name")
+
+    def test_a_loop_over_a_wildcard_from_the_root_or_home(self):
+        """A glob list that starts with `/` or `~` left its variable unread, so under
+        `Bash(cat *)`, `for f in <project>/d1*; do cat $f/k/id_rsa; done` was approved. It gives
+        the paths it matches now, as a relative one does. This widens: `main` left each control
+        to the rules. Here `h -> ~` and `d1/k -> ~/.ssh`."""
+        with self._project() as (project, home):
+            (project / "h").symlink_to(home)
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            for command in (
+                f"for f in {project}/s*; do cat $f/lib/x.txt; done",
+                "for f in ~/a/b/proj/s*; do cat $f/lib/x.txt; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "reads src/lib/x.txt")
+            self.assert_no_opinion("for f in ~/a/b/proj/h*; do grep -r PRIVATE $f; done", "reads ~")
+            # bash reads `~"/a"` as the literal `~/a`, a name zsh's `GLOB_SUBST` expands again
+            for command in (
+                'for f in ~"/a/b/proj/s"*; do cat $f/lib/x.txt; done',
+                "for f in '~'/a/b/proj/s*; do cat $f/lib/x.txt; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "a match that keeps a tilde")
+            for command in (
+                f"for f in {project}/d1*; do cat $f/k/id_rsa; done",
+                "for f in ~/a/b/proj/d1*; do cat $f/k/id_rsa; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through d1/k")
+            # A name such a list gives is one the shell splits, as a relative list's is
+            (project / "x k").write_text("one\n")
+            self.assert_allowed(
+                'for f in ~/a/b/proj/x*; do cat "$f"; done', "the control: reads x k whole"
+            )
+            for command in (
+                f"for f in {project}/x*; do cat $f/id_rsa; done",
+                "for f in ~/a/b/proj/x*; do cat $f/id_rsa; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "bash splits x k, and k is ~/.ssh")
+
+    def test_a_name_on_the_disk_that_holds_a_reserved_byte(self):
+        r"""A directory `a\\x02b` reads as one below a value this module didn't read, whose links
+        a walk skips as the residual, so with `a\\x02b/kk -> ~/.ssh`, `grep -R PRIVATE *` was
+        approved with no rule, where `grep -R PRIVATE .` was refused. A cloned repository can
+        hold such a name: one that holds a byte this module reserves refuses the command."""
+        with self._project() as (project, home):
+            for link in ("k", "d", "src/lib2"):
+                (project / link).unlink()
+            (project / "g").mkdir()
+            self.assert_allowed("grep -R PRIVATE *", "the control: no link out, no such name")
+            for byte in ("\x02", "\x04", "\x05"):
+                (project / f"a{byte}b").mkdir()
+                (project / f"a{byte}b" / "kk").symlink_to(home / ".ssh")
+                for command in (
+                    "grep -R PRIVATE *",
+                    "grep -R PRIVATE a*",
+                    'for d in $(ls); do grep -R PRIVATE "$d"; done',
+                ):
+                    with self.subTest(byte=byte, command=command):
+                        self.assert_refused_outright(command, "reads ~/.ssh through kk")
+                self.assert_allowed("grep -R PRIVATE g", "the control: below g, no such name")
+                shutil.rmtree(project / f"a{byte}b")
+
+    def test_a_word_spelled_around_two_values_this_module_didnt_read(self):
+        """`PICKED` shared its byte with `UNREAD_VALUE`, so `${a}picked$b` read as the mark, and
+        Layer B took both values out with it, to read `/.ssh/id_rsa` alone. bash splits the first
+        command's word into `picked` and `~/.ssh/id_rsa`. A command can't spell the mark."""
+        with self._project(), operator_rules(allow=["Bash(cat *)"]):
+            self.assert_allowed("cat ${a}picked$b/README.md", "the control: the rule approves this")
+            for command in (
+                'b=" $HOME"; cat ${a}picked$b/.ssh/id_rsa',
+                "cat ${a}picked${b}/.ssh/id_rsa",
+                "cat $(pwd)picked$(pwd)/.ssh/id_rsa",
+                f"cat {hook.PICKED}README.md",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh, or spells the mark")
+
+    def test_a_link_the_command_makes(self):
+        """#79's links count: `j` isn't there when the hook runs, as a name the wildcard matches
+        or as the one it spells, which bash leaves where the wildcard matches nothing."""
+        with self._project(), operator_rules(allow=["Bash(ln *)"]):
+            self.assert_allowed("ln -s src j && cat j*/lib/x.txt", "the control")
+            self.assert_refused_outright("ln -s ~ j && cat j*/.ssh/id_rsa", "j is ~")
+            self.assert_allowed("ln -s src '[j]' && cat [j]/lib/x.txt", "the control")
+            self.assert_refused_outright("ln -s ~ '[j]' && cat [j]/.ssh/id_rsa", "[j] is ~")
+
+    def test_an_operator_that_matches_within_one_component(self):
+        """bash's `[^.]`, a set, and zsh's `^`, `#` and `<...>` match within one component,
+        and a `~` after the start is bash's character or zsh's exclusion, whose left side
+        decides the match: each is matched there, not walked as `**` is. Here only
+        `vendor/x/y/h -> ~` lies below a match: the project's `k`, `d` and `src/lib2` are gone."""
+        with self._project() as (project, home):
+            for link in ("k", "d", "src/lib2"):
+                (project / link).unlink()
+            (project / "vendor" / "x" / "y").mkdir(parents=True)
+            (project / "vendor" / "x" / "y" / "h").symlink_to(home)
+            for command in (
+                "ls -d [^.]*",
+                "ls -d [!.]*",
+                "ls *~",
+                "cat src/lib/[^_]*.txt",
+                "cat [s]#rc/lib/x.txt",
+                "ls v*~x",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "matches vendor, and walks nothing below it")
+            self.assert_refused_outright("grep -r PRIVATE vendor/**", "vendor/x/y/h is ~")
+            (project / "k").symlink_to(home / ".ssh")
+            self.assert_refused_outright("cat [k]#/id_rsa", "zsh's [k]# matches k")
+
+    def test_a_glob_character_a_quote_holds(self):
+        """A quote makes `(` and `#` the characters they are, but the pattern was the word as
+        `_expand` gives it: in a project at `~/p (x)`, the `(` walked `~`, which met a sibling's
+        link to `~/.ssh`, and in one at `~/c#`, the `#` cut the literal directory at `~`."""
+        home = Path(os.path.realpath(tempfile.mkdtemp(prefix="readonly_hook_home_")))
+        try:
+            (home / ".ssh").mkdir()
+            (home / ".ssh" / "id_rsa").write_text("not a key\n")
+            (home / "other").mkdir()
+            (home / "other" / "k").symlink_to(home / ".ssh")
+            for name in ("p (x)", "c#"):
+                project = home / name
+                (project / "src").mkdir(parents=True)
+                (project / "src" / "x.txt").write_text("one\n")
+                (project / "k").symlink_to(home / ".ssh")
+                with (
+                    unittest.mock.patch.dict(os.environ, {"HOME": str(home)}),
+                    unittest.mock.patch.object(hook, "REPO_ROOT", project),
+                    unittest.mock.patch.object(hook, "_SESSION_CWD", str(project)),
+                    self.subTest(project=name),
+                ):
+                    self.assert_allowed(f"cat '{project}/src/'*.txt", "matches src/x.txt alone")
+                    self.assert_allowed(f"cat '{project}/src/x.txt'", "the control")
+                    self.assert_refused_outright(f"cat '{project}/'k*/id_rsa", "k is ~/.ssh")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_a_wildcard_in_front_of_a_value_this_module_didnt_read(self):
+        """The value can be any name below what the wildcard in front of it matches: with
+        `d1/k -> ~/.ssh`, `cat d1*/k/$g` reads `~/.ssh/id_rsa` where `$g` is `id_rsa`. Only the
+        text after the value was read, so the rule approved it, where `cat d1/k/$g` is refused."""
+        with self._project() as (project, home):
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            with operator_rules(allow=["Bash(cat *)", "Bash(grep *)"]):
+                self.assert_allowed("cat src*/lib/$g", "the control: the rule approves this")
+                for command in ("cat d1/k/$g", "cat d1*/k/$g", "grep -r PRIVATE d1*/k/$g"):
+                    with self.subTest(command=command):
+                        self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
+
+    def test_a_component_matched_in_linear_time(self):
+        """A regex of `*a*a*a*b`, or of zsh's `k###`, backtracks exponentially against a long
+        name of `a`s or `k`s, which a planted file holds, and every wildcard word is matched
+        against each name it may: the steps are run as a set of states instead."""
+        for pattern, name, matches in (
+            ("*a" * 8 + "*b", "a" * 40, False),
+            ("*a" * 8 + "*b", "a" * 40 + "b", True),
+            ("k###z", "k" * 24 + "y", False),
+            ("a#" * 8 + "b", "a" * 40, False),
+        ):
+            with self.subTest(pattern=pattern):
+                started = time.perf_counter()
+                self.assertEqual(hook._glob_component_pattern(pattern).fullmatch(name), matches)
+                self.assertLess(time.perf_counter() - started, 0.5)
+        with self._project() as (project, _):
+            (project / ("a" * 40)).write_text("one\n")
+            started = time.perf_counter()
+            self.assert_allowed("ls *a*a*a*a*a*a*a*a*b", "matches no name")
+            self.assertLess(time.perf_counter() - started, 2.0)
+
+    def test_in_the_scratchpad(self):
+        """The scratchpad is a read root as the project is, holding `k -> ~/.ssh`,
+        `key -> ~/.ssh/id_rsa`, the directory `inner` and `in -> inner`."""
+        with self._project() as (_, home):
+            scratch = home / "scratch" / "scratchpad"
+            (scratch / "inner").mkdir(parents=True)
+            (scratch / "inner" / "x.txt").write_text("one\n")
+            (scratch / "in").symlink_to("inner")
+            (scratch / "k").symlink_to(home / ".ssh")
+            (scratch / "key").symlink_to(home / ".ssh" / "id_rsa")
+            with with_scratchpad_dir(str(scratch)):
+                self.assert_refused_outright(f"cat {scratch}/k/id_rsa", "the control: refused")
+                for refused, control in (
+                    (f"cat {scratch}/k*/id_rsa", f"cat {scratch}/in*/x.txt"),
+                    (f"cat {scratch}/[k]/id_rsa", f"cat {scratch}/[i]nner/x.txt"),
+                    (f"cat {scratch}/*", f"cat {scratch}/inner/*"),
+                    (f"grep -r PRIVATE {scratch}/k*", f"grep -r one {scratch}/i*"),
+                ):
+                    with self.subTest(refused=refused):
+                        self.assert_refused_outright(refused, "reads ~/.ssh through a link")
+                        self.assert_allowed(control, "every link stays in the scratchpad")
+
+    def test_past_the_walk_budget(self):
+        """A link the walk didn't reach could lead anywhere, and a rule would approve the read."""
+        with self._project(), unittest.mock.patch.object(hook, "MAX_WALKED_ENTRIES", 3):
+            self.assert_allowed("cat src/lib/x.tx?", "the control: matches one name")
+            self.assert_refused_outright("cat src/**/x.txt", "more entries than the budget")
 
 
 class ReadsAValueOnlyWhereTheShellHoldsIt(Verdicts, unittest.TestCase):
