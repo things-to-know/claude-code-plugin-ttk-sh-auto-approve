@@ -2028,16 +2028,21 @@ def _bindings(segments: list[list[str]], parts: list[tuple[str, str]]) -> dict[s
 
 
 def _command_index(
-    words: list[str], *, refuse: bool, headers: list[int] | None = None
+    words: list[str],
+    *,
+    refuse: bool,
+    assignments: list[str] | None = None,
+    headers: list[int] | None = None,
 ) -> int | None:
     """The index of the command in this segment, past the structure in front of it, or None.
 
     The one walk to it, so that `_strip_structure`, which checks the command there, and
-    `_bindings`, which reads the builtin there, agree on where it starts, and `_loop_headers`,
-    which reads the index of each `for` it steps past, into ``headers``. With ``refuse``, it
-    refuses what `_strip_structure` does on the way: `case` and `select`, a binding of a name
-    `_refuse_binding` refuses, by an assignment or a `for` header, and an assignment that
-    prefixes a command.
+    `_bindings`, which reads the builtin there, agree on where it starts, and
+    `_wildcard_assignments`, which reads the assignments it steps past, into ``assignments``,
+    and `_loop_headers`, which reads the index of each `for` it steps past, into ``headers``.
+    With ``refuse``, it refuses what `_strip_structure` does on the way: `case` and `select`, a
+    binding of a name `_refuse_binding` refuses, by an assignment or a `for` header, and an
+    assignment that prefixes a command.
     """
     index = 0
     while index < len(words):
@@ -2063,6 +2068,8 @@ def _command_index(
             index += 1
             continue
         if ASSIGNMENT.match(word):
+            if assignments is not None:
+                assignments.append(word)
             if refuse:
                 # TODO(decision): `while IFS= read -r line; do ...; done` prompts here. An
                 # *empty* `IFS=` prefixed to one command is scoped to that command and can
@@ -6614,13 +6621,17 @@ class _ShellState:
     substitution or in a command that does. A substitution's body runs in the shell around it,
     so it is read against that one's. ``picked`` holds the `PICKED` values of each name a `for`
     list of this command's own binds to the paths a glob or `$(ls)` gives, `_picked_values`,
-    which ``values`` holds as unread: only the credential check reads them.
+    which ``values`` holds as unread: only the credential check reads them. ``globbed`` holds
+    the value of each assignment that holds a wildcard, `_wildcard_assignments`, and the
+    `PICKED` values of each loop wherever its header stands, `_wildcard_loop_values`, this
+    command's and those around it, which only the credential check reads, `_credential_values`.
     """
 
     __slots__ = (
         "backgrounds",
         "bases",
         "bindings",
+        "globbed",
         "picked",
         "run_bases",
         "shell_bases",
@@ -6637,6 +6648,7 @@ class _ShellState:
         run_bases: list[str],
         backgrounds: bool = False,
         picked: dict[str, list[str]] | None = None,
+        globbed: dict[str, list[str]] | None = None,
     ) -> None:
         self.bases = bases
         self.shell_bases = shell_bases
@@ -6645,6 +6657,86 @@ class _ShellState:
         self.bindings = bindings
         self.backgrounds = backgrounds
         self.picked = picked or {}
+        self.globbed = globbed or {}
+
+
+def _credential_values(state: _ShellState) -> dict[str, list[str] | None]:
+    """The values the credential check reads a name as: `_known_values`', and those it adds.
+
+    The `PICKED` ones a glob or `$(ls)` list gives, and those in `_ShellState.globbed`: an
+    assignment's that holds a wildcard, and a list's wherever its header stands. Each is one more
+    spelling, which only adds a path to refuse; `_spellings` adds the value the shell had before.
+    """
+    values = {**state.values, **state.picked}
+    for name, more in state.globbed.items():
+        # Once each: a spelling twice is one more combination `MAX_SPELLINGS` counts
+        values[name] = list(dict.fromkeys([*(values.get(name) or []), *more]))
+    return values
+
+
+def _wildcard_assignments(
+    segments: list[list[str]], parts: list[tuple[str, str]]
+) -> dict[str, list[str]]:
+    """The value of each assignment in these segments that holds a wildcard, for Layer B.
+
+    `_literal_assignments` reads none of them: bash globs the value where an unquoted `$f` uses
+    it, so `f='k*'; cat $f/id_rsa` reads `k/id_rsa`. The credential check reads each as one more
+    spelling of the name, which `_globbed` matches where it is unquoted. Each assignment the walk
+    to a segment's command steps past is read, `_command_index`, so one after `do`, `then`, `{`
+    or `!` too, however many times its name is bound, since a spelling only adds a path to
+    refuse. An append, `f+='k*'`, is read as its own text, the value it gives a name that was
+    unset; the value it adds to, as a copy's, `g=$f`, is one this module didn't read. A value
+    with an expansion, a substitution or a brace is left out, as `_literal_assignments` leaves it.
+    """
+    assigned: dict[str, list[str]] = {}
+    for segment in segments:
+        words: list[str] = []
+        _command_index(segment, refuse=False, assignments=words)
+        for word in words:
+            name, _, value_token = word.partition("=")
+            value = _expand(value_token, parts)
+            if (
+                not _has_wildcard(value)
+                or _has_bare_variable(value_token, parts)
+                or _carries_substitution(value_token, parts)
+                or _carries_brace_expansion(value_token)
+            ):
+                continue
+            if value_token.startswith("~"):
+                directory = _tilde_expansion(value)
+                if directory is None:
+                    continue
+                value = directory
+            assigned.setdefault(name.removesuffix("+"), []).append(value)
+    return assigned
+
+
+def _wildcard_loop_values(
+    segments: list[list[str]], parts: list[tuple[str, str]]
+) -> dict[str, list[str]]:
+    """The `PICKED` values each `for` list in these segments gives its names, for Layer B.
+
+    `_literal_loop_values` reads a list only where its header starts a segment and is its name's
+    one binding, and `_classify_with` drops a name the shell may not hold its values for where a
+    word uses it: under `Bash(cat *)`, `{ for f in d1*; do cat $f/k/id_rsa; done; }` read through
+    `d1/k -> ~/.ssh`, and so did the same loop after `then` or `do`, after `f=x`, or followed by
+    `echo $f`. The credential check reads each such value as one more spelling of each name the
+    header binds, wherever the header stands, `_loop_headers`, however many times the name is
+    bound, and for each word of the list that gives one, since a spelling only adds a path to
+    refuse, as for `_wildcard_assignments`.
+    """
+    picked: dict[str, list[str]] = {}
+    for segment in segments:
+        for names, words in _loop_headers(segment):
+            values = [
+                shape
+                for word in words
+                for shape in _loop_value_shapes(word, parts) or []
+                if PICKED in shape
+            ]
+            for name in names if values else []:
+                picked.setdefault(_expand(name, parts), []).extend(values)
+    return picked
 
 
 def _working_directories(
@@ -6876,8 +6968,9 @@ def _refuse_credential_paths(
             readings = [(_glob_word(token, parts), target.startswith("~") or bool(prefix))] + [
                 (prefix + reading, False) for reading in _tilde_readings(target, parts, marked=True)
             ]
-            # A name a glob or `$(ls)` list binds is each path it gives, and as unread too
-            values = {**state.values, **state.picked}
+            # A name a glob or `$(ls)` list binds is each path it gives, and as unread too, as is
+            # an assignment's value that holds a wildcard: `_credential_values`
+            values = _credential_values(state)
             for reading, tilde in readings:
                 for marked in _spellings(reading, values, state.shell_bases, picks=True):
                     unpicked, picked = _unpicked(marked)
@@ -8559,7 +8652,7 @@ def _refuse_followed_credential_links(
                 tokens[index + 1 :],
                 parts,
                 state.shell_bases,
-                {**state.values, **state.picked},
+                _credential_values(state),
                 operands_elsewhere=elsewhere,
             )
             for link, target in links:
@@ -9179,6 +9272,15 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # Where a relative word may be resolved from, worked out once for the credential check, the
     # read scope and each substitution's body
     bases, shell_bases, run_bases = _working_directories(segments, parts, inherited, known_values)
+    # An assignment's value that holds a wildcard, and what each loop's glob or `$(ls)` gives,
+    # wherever its header stands, for the credential check alone, which adds a path to refuse:
+    # the command's own, and all of those around it
+    globbed = {
+        name: list(values) for name, values in (inherited.globbed if inherited else {}).items()
+    }
+    for found in (_wildcard_assignments(segments, parts), _wildcard_loop_values(segments, parts)):
+        for name, values in found.items():
+            globbed[name] = [*globbed.get(name, []), *values]
     state = _ShellState(
         bases,
         shell_bases,
@@ -9187,6 +9289,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         backgrounds=backgrounds,
         run_bases=run_bases,
         picked=_picked_values(loop_values),
+        globbed=globbed,
     )
 
     # The links an `ln` here makes, which every path below is resolved through as if they were
@@ -9221,7 +9324,13 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # opinion, so a body's refusal still comes first. The shell runs a process substitution
     # without waiting for it, as it runs a job behind `&`: `true <(curl x)` returns at once.
     detached = _ShellState(
-        bases, shell_bases, known_values, bindings, backgrounds=True, run_bases=run_bases
+        bases,
+        shell_bases,
+        known_values,
+        bindings,
+        backgrounds=True,
+        run_bases=run_bases,
+        globbed=globbed,
     )
     for kind, value in parts:
         if kind in RUNS_A_COMMAND:

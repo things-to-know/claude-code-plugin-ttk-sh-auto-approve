@@ -77,8 +77,18 @@ insists on its own filename, symlink to this file rather than copying it.
       - A name with a wildcard among its values, past `MAX_SPELLINGS` spellings of a word,
         refuses the word outright (`_refuse_unread_picks`)
         - At a cost: `for f in s* a0 ... a69; do echo $f; done` is refused
+      - The credential check reads each list wherever its header stands, however often the
+        name is bound, as for an assignment below (`_wildcard_loop_values`)
     - So is a wildcard in front of a value the hook didn't read, as in `d1*/k/$g`, where a match
       leads into a store or to a directory that holds one
+    - An assignment's value that holds a wildcard, as in `f='k*'`, only the credential check
+      reads (`_wildcard_assignments`)
+      - The read scope and the flag check read `$f` as unread
+      - Wherever the structure puts it, as after `do` or `!`
+      - An append, `f+='k*'`, as the text it adds
+        - The value it adds to is one the hook doesn't read, as in `f=d; f+='1*/k'`
+      - A copy, `g=$f`, is a value the hook doesn't read
+        - The residual of `cat $g/id_rsa` under `Bash(cat *)`
     - One it can't bound, `**` or a group, reaches each link below its literal directory, walked
       as for a reader that follows links (`GLOB_AT_ANY_DEPTH`)
       - zsh's `***` matches through a link

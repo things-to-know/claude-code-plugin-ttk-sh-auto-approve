@@ -6815,6 +6815,86 @@ class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
                 with self.subTest(command=command):
                     self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
 
+    def test_an_assignment_that_holds_a_wildcard(self):
+        """bash globs the value of an unquoted `$f`, so `f='k*'; cat $f/id_rsa` reads
+        `k/id_rsa`. `_literal_assignments` reads no value with a wildcard, so `$f` was unread,
+        and the rule approved the read: the credential check reads that value too now. Also one
+        after `do`, `then`, `{` or `!`, which it read only at the start of a segment, and an
+        append, the value it gives a name that was unset: bash 5.2 ran `do`, `then` and `+=`."""
+        with self._project(), operator_rules(allow=["Bash(cat *)", "Bash(echo *)"]):
+            for command in (
+                "f='s*'; cat $f/lib/x.txt",
+                "f='k*'; cat \"$f\"/id_rsa",
+                "for x in a; do f='s*'; cat $f/lib/x.txt; done",
+                "if true; then f='s*'; cat $f/lib/x.txt; fi",
+                "{ f='s*'; cat $f/lib/x.txt; }",
+                "! f='s*'; cat $f/lib/x.txt",
+                "f+='s*'; cat $f/lib/x.txt",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: the rule approves this")
+            for command in (
+                "f='k*'; cat $f/id_rsa",
+                "f=k\\*; cat $f/id_rsa",
+                "f='x *'; cat $f/id_rsa",
+                "f='k*'; echo \"$(cat $f/id_rsa)\"",
+                "for x in a; do f='k*'; cat $f/id_rsa; done",
+                "if true; then f='k*'; cat $f/id_rsa; fi",
+                "{ f='k*'; cat $f/id_rsa; }",
+                "! f='k*'; cat $f/id_rsa",
+                "f+='k*'; cat $f/id_rsa",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
+
+    def test_a_loop_wherever_its_header_stands(self):
+        """The credential check read a loop's glob only where its header started a segment and
+        bound its name once, settled where a word used it: each of these read through `d1/k`
+        under `Bash(cat *)`, in bash 5.2 and zsh 5.9. It reads each list's `PICKED` values
+        wherever the header stands now, however often the name is bound, as an assignment's."""
+        shapes = (
+            "{loop}; echo $f",
+            "{loop}; f=x",
+            "f=x; {loop}",
+            "if true; then {loop}; fi",
+            "{{ {loop}; }}",
+            "for x in 1; do {loop}; done",
+        )
+        control = "for f in s*; do cat $f/lib/x.txt; done"
+        refused = "for f in d1*; do cat $f/k/id_rsa; done"
+        with self._project() as (project, home):
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            with operator_rules(allow=["Bash(cat *)", "Bash(echo *)"]):
+                for shape in shapes:
+                    with self.subTest(shape=shape):
+                        self.assert_allowed(shape.format(loop=control), "the control")
+                        self.assert_refused(shape.format(loop=refused), "it reads ~/.ssh")
+
+    def test_a_loop_variable_in_a_substitution(self):
+        """A substitution's body runs in the loop's shell, where `$f` holds what the list gives,
+        but neither it nor a process substitution read that: under `Bash(cat *)`, `for f in d1*;
+        do echo "$(cat $f/k/id_rsa)"; done` was approved. A name the body binds is its own."""
+        with self._project() as (project, home):
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            with operator_rules(allow=["Bash(cat *)", "Bash(diff *)"]):
+                self.assert_allowed(
+                    'for f in s*; do echo "$(cat $f/lib/x.txt)"; done', "the control: in src"
+                )
+                for command in (
+                    'for f in d1*; do echo "$(cat $f/k/id_rsa)"; done',
+                    "for f in d1*; do diff <(cat $f/k/id_rsa) README.md; done",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
+            for command in (
+                'for f in d*; do echo "$(cat $f/f)"; done',
+                'for f in s*; do echo "$(f=d; cat $f/f)"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "d/f leads out of the project")
+
     def test_a_name_the_shell_splits(self):
         """bash splits an unquoted `$f`, and a `$(ls)` in the list, at a blank: with a file `x k`,
         `for f in x*; do cat $f/id_rsa; done` runs `cat x k/id_rsa`. A name the list gives that
