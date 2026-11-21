@@ -6767,6 +6767,113 @@ class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
                 "for f in $(ls a/b/key); do cat $f; done", "prints a/b/key, the key"
             )
 
+    def test_a_value_the_shell_splits(self):
+        """bash splits an unquoted `$f` at a blank, so after `for f in "x k/id_rsa"`, `cat $f`
+        runs `cat x k/id_rsa`: both layers read the value whole, and approved it with no rule.
+        Each field is a word of its own now, for a reader that follows links too."""
+        with self._project():
+            for command in (
+                'for f in "x k/id_rsa"; do cat "$f"; done',
+                "for f in 'README.md src/lib/x.txt'; do cat $f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: names no path out")
+            for command in (
+                'for f in "x k/id_rsa"; do cat $f; done',
+                'for d in "x k"; do grep -R PRIVATE $d; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through k")
+            self.assert_no_opinion('for f in "x d/f"; do cat $f; done', "d leads out")
+
+    def test_a_field_that_holds_a_no_break_space(self):
+        """bash splits at a blank of `IFS` alone, so `kk<U+00A0>` stays one field, which bash
+        5.2 read through its link. `str.split` split it at the no-break space too, so neither
+        layer read the field bash gives, and both approved it with no rule."""
+        with self._project() as (project, home):
+            (project / "kk\u00a0").symlink_to(home / ".ssh")
+            self.assert_allowed('for f in "x kk\u00a0"; do cat "$f"; done', "the control: whole")
+            for command in (
+                'for f in "x kk\u00a0"; do cat $f/id_rsa; done',
+                'f="x kk\u00a0"; cat $f/id_rsa',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through kk<U+00A0>")
+
+    def test_the_first_field_keeps_the_tilde(self):
+        """A tilde starts the word, and so its first field: `cat ~/a/b/proj/k*$f`, with `$f` a
+        value `/id_rsa x`, reads `~/a/b/proj/k/id_rsa`, which the first field placed in the
+        project, as a relative path that matched nothing."""
+        with self._project(), operator_rules(allow=["Bash(cat *)"]):
+            self.assert_allowed(
+                "for f in '/x.txt x'; do cat ~/a/b/proj/src/l*$f; done", "the control: in src"
+            )
+            for command in (
+                "for f in '/id_rsa x'; do cat ~/a/b/proj/k*$f; done",
+                "f='/id_rsa x'; cat ~/a/b/proj/k*$f",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
+
+    def test_a_name_the_shell_splits(self):
+        """bash splits an unquoted `$f`, and a `$(ls)` in the list, at a blank: with a file `x k`,
+        `for f in x*; do cat $f/id_rsa; done` runs `cat x k/id_rsa`. A name the list gives that
+        the shell splits, or matches again, refuses the command, where the shell splits it."""
+        with self._project() as (project, _):
+            (project / "x k").write_text("one\n")
+            (project / "g").mkdir()
+            (project / "g" / "c").write_text("one\n")
+            for command in (
+                'for f in x*; do cat "$f"; done',
+                "for f in $(ls g); do cat g/$f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: reads each name whole")
+            for command in (
+                "for f in x*; do cat $f/id_rsa; done",
+                'for f in x*; do echo "$(cat $f/id_rsa)"; done',
+                # Wherever the header stands, however often the name is bound
+                "{ for f in x*; do cat $f/id_rsa; done; }",
+                "f=x; for f in x*; do cat $f/id_rsa; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads k/id_rsa")
+            (project / "g" / "a b").write_text("one\n")
+            self.assert_refused_outright('for f in $(ls g); do cat "g/$f"; done', "reads g/a, g/b")
+
+    def test_the_names_a_pattern_gives_from_the_root(self):
+        """A relative match is the text after its base and a `/`, which a base of `/` ends with:
+        from `/`, `*` gave `tc` for `/etc`, which the split check read in its place."""
+        names = hook._names_a_pattern_gives("*", ["/"])
+        self.assertTrue(names, "/ holds entries")
+        self.assertLessEqual(set(names), {entry.name for entry in Path("/").iterdir()})
+
+    def test_a_name_the_shell_rewrites_below_any_depth(self):
+        """A `**` list gives a name from any depth, as `x ..`, which `grep -r one $f` splits into
+        a recursive read of `..`; and zsh with `GLOB_SUBST` reads a file `~` as the home
+        directory. Here the project holds no link out, so only the names decide."""
+        with self._project() as (project, _):
+            for link in ("k", "d", "src/lib2"):
+                (project / link).unlink()
+            for command in (
+                "for f in **; do grep -r one $f; done",
+                "for f in *; do grep -r PRIVATE $f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: no name the shell rewrites")
+            (project / "src" / "lib" / "x ..").write_text("one\n")
+            self.assert_refused_outright("for f in **; do grep -r one $f; done", "reads ..")
+            self.assert_allowed('for f in **; do grep -r one "$f"; done', "quoted, it is the name")
+            (project / "src" / "lib" / "x ..").unlink()
+            (project / "~").write_text("one\n")
+            for command in (
+                "for f in *; do grep -r PRIVATE $f; done",
+                "for f in $(ls); do grep -r PRIVATE $f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "zsh's GLOB_SUBST reads ~ as home")
+            self.assert_allowed('for f in *; do grep -r PRIVATE "$f"; done', "quoted, ~ is a name")
+
     def test_a_word_spelled_around_two_values_this_module_didnt_read(self):
         """`PICKED` shared its byte with `UNREAD_VALUE`, so `${a}picked$b` read as the mark, and
         Layer B took both values out with it, to read `/.ssh/id_rsa` alone. bash splits the first
