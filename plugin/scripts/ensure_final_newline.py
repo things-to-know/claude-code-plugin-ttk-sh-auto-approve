@@ -49,7 +49,7 @@ import sys
 from pathlib import Path
 
 # The same as `sh_auto_approve.py`'s, which says why; a test keeps the two equal.
-MINIMUM_PYTHON = (3, 12)
+MINIMUM_PYTHON = (3, 13)
 SUPPORTED_PLATFORMS = ("linux", "darwin")
 
 TOOLS = frozenset({"Edit", "Write"})
