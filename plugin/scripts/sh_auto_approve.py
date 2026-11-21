@@ -1234,6 +1234,46 @@ def _expand(token: str, parts: list[tuple[str, str]]) -> str:
     return PLACEHOLDER.sub(replace, token)
 
 
+# Marks the character after it as one a quote made literal, which no operator of `_glob_matches`
+# reads: `_glob_word` reads `'p (x)/'*` as `p \x05(x\x05)/*`. A byte of its own, which a command
+# can't hold (`_classify_with`).
+GLOB_LITERAL = "\x05"
+
+# What a quote makes literal in a pattern: each character a wildcard or an operator can be
+GLOB_CHARACTERS = frozenset("*?[]()|#^<>~")
+
+
+def _glob_word(token: str, parts: list[tuple[str, str]]) -> str:
+    """The word ``token`` is, as `_expand` gives it, with each glob character a quote holds marked.
+
+    `GLOB_LITERAL` marks each of `GLOB_CHARACTERS` in a quoted or escaped part, so that
+    `_glob_matches` reads `'p (x)/'*` as the files in `p (x)`, as the shell matches them, and not
+    as a group. The character after a `$` stays as it is, for `_spellings` to read the expansion,
+    and a value an expansion puts in stays live, which reads more paths, never fewer. `_plain`
+    takes the marks out again.
+    """
+
+    def replace(match: re.Match) -> str:
+        kind, value = parts[int(match.group(1))]
+        if kind in RUNS_A_COMMAND:
+            return SUBSTITUTION_MARKER
+        if kind not in (LITERAL, DOUBLE_QUOTED):
+            return value
+        return "".join(
+            GLOB_LITERAL + character
+            if character in GLOB_CHARACTERS and value[index - 1 : index] != "$"
+            else character
+            for index, character in enumerate(value)
+        )
+
+    return PLACEHOLDER.sub(replace, token)
+
+
+def _plain(text: str) -> str:
+    """``text``, a pattern `_glob_word` built, without its `GLOB_LITERAL` marks."""
+    return text.replace(GLOB_LITERAL, "")
+
+
 def _carries_substitution(token: str, parts: list[tuple[str, str]]) -> bool:
     """Whether any part of this word is produced by running a command."""
     return any(parts[int(index)][0] in RUNS_A_COMMAND for index in PLACEHOLDER.findall(token))
@@ -1273,6 +1313,20 @@ def _carries_live_glob(token: str) -> bool:
     `_has_wildcard` lists.
     """
     return _has_wildcard(PLACEHOLDER.sub("", token))
+
+
+def _globbed(token: str, spelled: str) -> bool:
+    """Whether the shell matches ``spelled``, one of ``token``'s spellings, against the directory.
+
+    Where the token carries a live wildcard, `_carries_live_glob`, and where an unquoted
+    expansion puts a value with a wildcard in it: bash globs the value of an unquoted `$f`, so
+    after `for f in 'k*'`, `cat $f/x` reads `k/x`, and so does zsh with `GLOB_SUBST`, which a
+    startup file can set. A wildcard a quoted part spells next to it counts too, which reads
+    more paths, never fewer.
+    """
+    return _carries_live_glob(token) or (
+        _has_wildcard(spelled) and UNQUOTED_EXPANSION.search(PLACEHOLDER.sub("", token)) is not None
+    )
 
 
 # A brace expansion the shell performs before the command runs: `{a,b}`, `{a,}`, `{1..3}`,
@@ -1646,7 +1700,9 @@ def _tilde_elements(token: str, parts: list[tuple[str, str]]) -> list[tuple[str,
     return elements
 
 
-def _tilde_reading(elements: list[tuple[str, bool]], *, bash: bool, value_from: int | None) -> str:
+def _tilde_reading(
+    elements: list[tuple[str, bool]], *, bash: bool, value_from: int | None, marked: bool = False
+) -> str:
     """The text bash, or else zsh, makes of a word by expanding its tildes.
 
     A `~` that starts the word expands. With ``value_from``, where the value of an assignment
@@ -1658,6 +1714,8 @@ def _tilde_reading(elements: list[tuple[str, bool]], *, bash: bool, value_from: 
     character of the prefix is quoted, the prefix running to the next unquoted `/` or `:`: it keeps
     `~"/x"` and `a':'~/x` as they are spelled. zsh expands wherever the `~` itself is unquoted, the
     prefix running to the next `/` or `:` however quoted: `~"/x"` is its home directory's `x`.
+
+    With ``marked``, each glob character a quote holds is marked as `_glob_word` marks it.
     """
     starts = {0}
     if value_from is not None:
@@ -1682,13 +1740,19 @@ def _tilde_reading(elements: list[tuple[str, bool]], *, bash: bool, value_from: 
                 continue
         if value_from is not None and index >= value_from and char == ":" and not (bash and quoted):
             starts.add(index + 1)
-        out.append(char)
+        literal = (
+            marked
+            and quoted
+            and char in GLOB_CHARACTERS
+            and not (index and elements[index - 1][0] == "$")
+        )
+        out.append(GLOB_LITERAL + char if literal else char)
         index += 1
     return "".join(out)
 
 
 def _tilde_readings(
-    token: str, parts: list[tuple[str, str]], *, assignment: bool = False
+    token: str, parts: list[tuple[str, str]], *, assignment: bool = False, marked: bool = False
 ) -> list[str]:
     """Each text bash or zsh makes of ``token``, a reduced word, by expanding its tildes.
 
@@ -1696,11 +1760,12 @@ def _tilde_readings(
     which a shell may also expand as a value after its first unquoted `=`: bash in a word whose
     name is an identifier, outside posix mode, `for` lists included, and zsh in any word under
     `magic_equal_subst`, which a startup file can set. Each reading is one `_tilde_reading` makes;
-    a word without a `~` has one, its text.
+    a word without a `~` has one, its text. With ``marked``, each is a pattern `_glob_word` would
+    build, in which a quote's glob characters are marked.
     """
     text = _expand(token, parts)
     if "~" not in text:
-        return [text]
+        return [_glob_word(token, parts) if marked else text]
     elements = _tilde_elements(token, parts)
     value_froms: list[int | None] = [0] if assignment else [None]
     if not assignment:
@@ -1712,7 +1777,7 @@ def _tilde_readings(
         if equals:
             value_froms.append(equals + 1)
     readings = [
-        _tilde_reading(elements, bash=bash, value_from=value_from)
+        _tilde_reading(elements, bash=bash, value_from=value_from, marked=marked)
         for value_from in value_froms
         for bash in (True, False)
     ]
@@ -6075,6 +6140,19 @@ def _is_under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
+def _in_a_store(absolute: str, roots: list[str]) -> bool:
+    """Whether the literal path ``absolute`` is in a credential store, as spelled or where it leads.
+
+    ``roots`` are `_credential_roots`; a process's secrets are `PROCESS_SECRETS`. Where it leads
+    is each of its `_resolutions`, which raises `OSError` for a path it can't place.
+    """
+    return any(
+        PROCESS_SECRETS.match(candidate) is not None
+        or any(_is_under(candidate, root) for root in roots)
+        for candidate in {os.path.normpath(absolute), *_resolutions(absolute)}
+    )
+
+
 def _expand_home(text: str, *, tilde: bool) -> str:
     """Replace a leading `~`, `$HOME` or `${HOME}` with the directory it names.
 
@@ -6107,9 +6185,10 @@ def _names_a_credential_unguarded(
 
     A relative path, or literal part, is resolved from each of `bases`, the directories the
     command can run in, and through any symbolic link, so a link inside the project that
-    points at `~/.ssh` is caught by its target. What a wildcard matches is not read: a
-    wildcard that matches such a link is not caught (#54). A value this module didn't read,
-    `UNREAD_VALUE`, in the word or as a base, is read by `_below_an_unread_value`.
+    points at `~/.ssh` is caught by its target. What a wildcard matches is read by
+    `_refuse_wildcard_credentials`, so that `k*` is caught where it matches such a link (#54). A
+    value this module didn't read, `UNREAD_VALUE`, in the word or as a base, is read by
+    `_below_an_unread_value`.
 
     With `live_glob`, the shell expands a wildcard in the word, and a component that can
     match `..`, as `.*` does in a bash older than 5.2, is read as `..` too: `../.*/.ssh/x` can
@@ -6160,13 +6239,7 @@ def _path_names_a_credential(text: str, *, tilde: bool, bases: list[str], live_g
 
     special = PATH_SPECIAL.search(text)
     if special is None:
-        for absolute in spellings:
-            for candidate in {os.path.normpath(absolute), *_resolutions(absolute)}:
-                if PROCESS_SECRETS.match(candidate):
-                    return True
-                if any(_is_under(candidate, root) for root in roots):
-                    return True
-        return False
+        return any(_in_a_store(absolute, roots) for absolute in spellings)
 
     if live_glob:
         components = text.split("/")
@@ -6193,8 +6266,8 @@ def _path_names_a_credential(text: str, *, tilde: bool, bases: list[str], live_g
     if not text.startswith("/") and not relative_partial and relative_directory in ("", "."):
         # The wildcard or expansion reads the base itself, as `*` and `"$f"` do: the read
         # scope's question. No base is in a credential store, `_working_directories` sees to
-        # that, and a link in one that the wildcard matches is read by neither layer (#54); one
-        # a reader follows while it recurses is `_refuse_followed_credential_links`'
+        # that. A link in one that the wildcard matches is `_refuse_wildcard_credentials`' (#54),
+        # and one a reader follows while it recurses is `_refuse_followed_credential_links`'
         return False
     for absolute in spellings:
         prefix = absolute[: len(absolute) - len(text) + special.start()]
@@ -6638,7 +6711,8 @@ def _refuse_credential_paths(
 
     A wildcard the shell expands, followed by a `..`, can land anywhere, credential stores
     included, and is refused for that. Only a live wildcard counts: a quoted one is the
-    program's pattern, as in `sed 's|.*/../||'`.
+    program's pattern, as in `sed 's|.*/../||'`. Each path a wildcard matches is read as well,
+    `_refuse_wildcard_credentials`, wherever the shell expands one: `_globbed`.
     """
     lines = [_tokenize(line) for line in reduced.split("\n")]
     bases = list(state.shell_bases)
@@ -6660,23 +6734,26 @@ def _refuse_credential_paths(
             # literal path it spells, and `~"/x"` is that to bash and the home directory's `x` to
             # zsh. A redirection's target is read after its operator. The word as spelled is read
             # too, its leading `~` as `_names_a_credential` reads it, which reads `~name` as the
-            # home directory of a user `name`, where there is one.
+            # home directory of a user `name`, where there is one. Each is a pattern too, in which
+            # a quote's glob characters are literal: `_glob_word`.
             operator = REDIRECTION_PREFIX.match(token)
             prefix = operator.group(0) if operator else ""
             target = token[len(prefix) :]
-            readings = [(word, target.startswith("~") or bool(prefix))] + [
-                (prefix + reading, False) for reading in _tilde_readings(target, parts)
+            readings = [(_glob_word(token, parts), target.startswith("~") or bool(prefix))] + [
+                (prefix + reading, False) for reading in _tilde_readings(target, parts, marked=True)
             ]
             for reading, tilde in readings:
-                for spelled in _spellings(reading, state.values, state.shell_bases):
-                    if _names_a_credential(spelled, tilde=tilde, bases=bases, live_glob=live_glob):
+                for marked in _spellings(reading, state.values, state.shell_bases):
+                    spelled = _plain(marked)
+                    globbed = _globbed(token, spelled)
+                    if _names_a_credential(spelled, tilde=tilde, bases=bases, live_glob=globbed):
                         raise NotReadOnly(f"names a credential store: {word}")
                     # And a path glued to an option or after an `@`, which no word spells alone
                     for glued in _glued_paths(REDIRECTION_PREFIX.sub("", spelled)):
-                        if _names_a_credential(
-                            glued, tilde=False, bases=bases, live_glob=live_glob
-                        ):
+                        if _names_a_credential(glued, tilde=False, bases=bases, live_glob=globbed):
                             raise NotReadOnly(f"names a credential store: {word}")
+                    if globbed:
+                        _refuse_wildcard_credentials(marked, tilde=tilde, bases=bases)
 
 
 # The letters and digits of a short-option cluster that starts a word, as `-hf` in `-hf/x`
@@ -6710,6 +6787,93 @@ def _glued_paths(text: str) -> list[str]:
             if text[start] == "@":
                 paths.append(text[start + 1 :])
     return [path for path in paths if path]
+
+
+def _refuse_wildcard_credentials(spelled: str, *, tilde: bool, bases: list[str]) -> None:
+    """Layer B, for each path a wildcard the shell expands in ``spelled`` reaches (#54).
+
+    ``spelled`` is a pattern `_glob_word` built. Each path it matches is read as the literal path
+    it is, through its links, so `k*/id_rsa` is refused where `k` leads to `~/.ssh`, as
+    `k/id_rsa` is. The whole word is matched, as the shell matches it: `--file=k*` matches a name
+    that starts with `--file=`. A pattern that can match at any depth, as `**` can, reaches each
+    link below its literal directory, and is refused where one leads to a store or to a directory
+    that holds one, as for a reader that follows links: `_wildcard_reach`. A value this module
+    didn't read is any name below what the wildcard in front of it matches,
+    `_refuse_a_wildcard_before_an_unread_value`, and the text after it is
+    `_below_an_unread_value`'s.
+    """
+    text = REDIRECTION_PREFIX.sub("", spelled)
+    patterns = [_expand_home(text, tilde=tilde)]
+    # bash reads `~name` as the home directory of the user `name`, and as the text it is when
+    # there is none, which `_expand_home` reads as `UNREAD_VALUE`
+    if tilde and text.startswith("~") and _tilde_expansion(text) is None:
+        patterns.append(os.path.expanduser(text))
+    roots = _credential_roots()
+    stores = [os.path.realpath(store) for store in roots]
+    shown = _plain(spelled)
+    for pattern in dict.fromkeys(patterns):
+        if UNREAD_VALUE in pattern:
+            _refuse_a_wildcard_before_an_unread_value(pattern, bases, stores, shown)
+            continue
+        matches, links = _wildcard_reach(pattern, bases)
+        for match in matches:
+            try:
+                in_a_store = _in_a_store(match, roots)
+            except (OSError, ValueError):
+                in_a_store = True  # cannot be resolved, and this is the layer that refuses outright
+            if in_a_store:
+                raise NotReadOnly(f"a wildcard matches a credential store: {shown} is {match}")
+        for link, target in links:
+            if _leads_to_a_store(target, stores):
+                raise NotReadOnly(
+                    f"a wildcard reaches a credential store through the link {link}: {target}"
+                )
+
+
+def _leads_to_a_store(target: str, stores: list[str]) -> bool:
+    """Whether a link that leads to ``target`` leads into a credential store, or to one's parent.
+
+    A directory that holds a store, as `~` does, is one for a read that follows the link down.
+    ``stores`` are the `_credential_roots`, each where it resolves.
+    """
+    return _names_a_credential(target, tilde=False, bases=[], live_glob=False) or any(
+        _is_under(store, target) for store in stores
+    )
+
+
+def _refuse_a_wildcard_before_an_unread_value(
+    pattern: str, bases: list[str], stores: list[str], shown: str
+) -> None:
+    """Layer B, for a wildcard in the components in front of a value this module didn't read.
+
+    The value can be any name below each directory they match: with `d1/k -> ~/.ssh`, `cat
+    d1*/k/$g` reads `~/.ssh/id_rsa` where `$g` is `id_rsa`. So a match that leads into a store,
+    or to a directory that holds one, refuses the command, as `_names_a_credential` refuses a
+    literal part that is a store's or its parent's. Text glued in front of the value is part of
+    its component, and a value that spells a `/` or a `..` itself is the residual of any value
+    this module didn't read.
+    """
+    head = pattern.split(UNREAD_VALUE, 1)[0]
+    directory = head.rpartition("/")[0] if "/" in head else ""
+    if not GLOB_SPECIAL.search(directory):
+        return  # a literal part, `_names_a_credential`'s
+    matches, links = _wildcard_reach(directory, bases)
+    for match in matches:
+        try:
+            targets = _resolutions(match)
+        except (OSError, ValueError):
+            raise NotReadOnly(f"a path this module can't resolve: {match}") from None
+        for target in targets:
+            if _leads_to_a_store(target, stores):
+                raise NotReadOnly(
+                    f"a wildcard in front of a value this module didn't read reaches a credential "
+                    f"store: {_shown(shown)}, through {match}"
+                )
+    for link, target in links:
+        if _leads_to_a_store(target, stores):
+            raise NotReadOnly(
+                f"a wildcard reaches a credential store through the link {link}: {target}"
+            )
 
 
 class _ReadScope:
@@ -6930,34 +7094,43 @@ def _read_scope_problem(
         return None
     if SUBSTITUTION_MARKER in path:
         return "a path produced by a command"
-    for reading in _tilde_readings(token, parts):
+    # Each reading of the word's tildes as a pattern too, in which a quote's glob characters are
+    # literal: `_tilde_readings` with their marks
+    for reading in _tilde_readings(token, parts, marked=True):
         if reading[:start] != text[:start]:
             return f"a file flag a tilde rewrites: {text}"
-        problem = _reading_scope_problem(
-            reading[start:], path, scope, live_glob=_carries_live_glob(cut)
-        )
+        problem = _reading_scope_problem(reading[start:], path, scope, token=cut)
         if problem is not None:
             return problem
     return None
 
 
-def _reading_scope_problem(
-    text: str, path: str, scope: _ReadScope, *, live_glob: bool
-) -> str | None:
-    """Why ``text``, a reading of the file operand ``path``, is not in scope, or None when it is."""
+def _reading_scope_problem(text: str, path: str, scope: _ReadScope, *, token: str) -> str | None:
+    """Why ``text``, a reading of the file operand ``path``, is not in scope, or None when it is.
+
+    ``text`` is a pattern `_glob_word` built, of the operand's word ``token``.
+    """
     if UNREAD_VALUE in text:
         return f"a path in a directory the shell picks: {path}"
     candidates = _resolve_variables(text, scope)
     if candidates is None:
         return "a path this module cannot resolve"
     for spelled in candidates:
-        candidate = _expand_home(spelled, tilde=False)
-        if live_glob:
+        candidate = _expand_home(_plain(spelled), tilde=False)
+        if _globbed(token, candidate):
             if _glob_may_climb(candidate):
                 return f"a glob that may climb out of its directory: {candidate}"
-            # The directory the glob runs in: everything up to the last `/` before it.
-            head = PATH_SPECIAL.split(candidate, 1)[0]
-            candidate = head.rsplit("/", 1)[0] if "/" in head else "."
+            # Each path it matches, through its links, as a literal path is measured (#54)
+            pattern = _expand_home(spelled, tilde=False)
+            matches, links = _wildcard_reach(pattern, scope.bases)
+            for match in matches:
+                if not _in_scope(match, scope):
+                    return f"outside the working directories: {candidate} matches {match}"
+            for link, _ in links:
+                if not _in_scope(link, scope):
+                    return f"outside the working directories: {candidate} reaches the link {link}"
+            # And the directory the glob runs in, which a match is below
+            candidate = _literal_directory(pattern)
         absolutes = (
             [candidate]
             if candidate.startswith("/")
@@ -7512,23 +7685,26 @@ def _followed_links(
         whole = PLACEHOLDER.fullmatch(token)
         if whole is not None and parts[int(whole.group(1))][0] == PROCESS_SUBSTITUTION:
             continue  # `<(...)`: a pipe, not a directory
-        # Each reading of the word's tildes, `_tilde_readings`, is a directory it may name
-        spellings = [
-            spelled
-            for reading in _tilde_readings(token, parts)
-            for spelled in _spellings(reading, values, bases, before=False)
+        # Each reading of the word's tildes, `_tilde_readings`, is a directory it may name, as a
+        # pattern in which a quote's glob characters are literal. A wildcard is matched once the
+        # shell has put each value in place: `d=a/b; ... "$d"/*`, and so is one a value puts
+        # there, where the shell globs it: `_globbed`
+        patterns = [
+            pattern
+            for reading in _tilde_readings(token, parts, marked=True)
+            for pattern in _spellings(reading, values, bases, before=False)
         ]
-        if not _carries_live_glob(token):
-            directories += spellings
-            continue
-        # A wildcard is matched once the shell has put each value in place: `d=a/b; ... "$d"/*`
-        for spelled in spellings:
+        for pattern in patterns:
+            spelled = _plain(pattern)
+            if not _globbed(token, spelled):
+                directories.append(spelled)
+                continue
             if UNREAD_VALUE in spelled:
                 directories.append(spelled)  # the residual: see the docstring
                 continue
-            if GLOB_FROM_ITS_DIRECTORY.search(spelled) and depth:
+            if GLOB_AT_ANY_DEPTH.search(pattern) and depth:
                 depth = 0  # the literal directory holds the matches at any depth
-            directories += _glob_matches(spelled, bases)
+            directories += _glob_matches(pattern, bases)
     if not indexes and LINK_FOLLOWERS[program].get("default"):
         directories.append(".")
     roots: list[str] = []
@@ -7543,13 +7719,23 @@ def _followed_links(
     return _walk_for_links(roots, depth)
 
 
-# A wildcard `_glob_matches` doesn't match by its parts: `**`, which zsh, and bash with
-# `globstar`, read as any depth, and zsh's `***`, which follows links as it recurses; a collating
-# element, `[[.ch.]]`, which can be several characters; and the operators of bash's `extglob` and
-# zsh's `EXTENDED_GLOB`, which a startup file can set, `[^...]` among them. Such a pattern is
-# walked from the directory its literal part names instead, which holds every name it matches:
-# the walk follows each link below it anyway.
-GLOB_FROM_ITS_DIRECTORY = re.compile(r"\*\*|\[\[\.|[()|#^<>]|(?<!^)~")
+# A wildcard that can match at any depth, which `_glob_matches` doesn't match by its parts: `**`,
+# which zsh, and bash with `globstar`, read as any depth, and zsh's `***`, which follows links as
+# it recurses; and a group, which zsh's `(*/)#` repeats across directories, as bash's `extglob`
+# groups may, both of which a startup file can turn on. Such a pattern is walked from the
+# directory its literal part names instead, which holds every name it matches: the walk follows
+# each link below it anyway. A character a quote made literal, `GLOB_LITERAL`, is none.
+GLOB_AT_ANY_DEPTH = re.compile(r"(?<!\x05)\*\*|(?<!\x05)[()|]")
+
+# The operators of zsh's `EXTENDED_GLOB`, which a startup file can set, that match within one
+# component: `^x`, anything but `x`; `x#`, any run of `x`; and `<1-9>`, a number. bash reads each
+# as the character it is. Outside a set, `_glob_component_pattern` reads `#` as the run it is,
+# and each other one as any name that starts with the text in front of it.
+GLOB_COMPONENT_OPERATORS = frozenset("#^<>")
+
+# Where the literal part of a pattern ends: an expansion, a wildcard, or an operator above, which
+# a quote didn't make literal
+GLOB_SPECIAL = re.compile(r"(?<!\x05)[$*?\[{`()|#^<>~]")
 
 # How many bytes of UTF-8 a character can take: in the C locale, `?` and `[...]` match one byte
 MAX_CHARACTER_BYTES = 4
@@ -7562,41 +7748,83 @@ def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
     match, as with `dotglob` or zsh's `GLOB_DOTS`; a name matches whatever its case, as with
     `nocaseglob` or zsh's `NO_CASE_GLOB`, which reads a literal component that way too; and a run
     of `?` and `[...]`, each a byte in the C locale, matches from a quarter as many characters to
-    as many. A set, `[[:alpha:]]` and `[!x]` included, is any one of them. A pattern
-    `GLOB_FROM_ITS_DIRECTORY` holds is its literal directory instead, which a recursive walk
-    covers. Past `MAX_WALKED_ENTRIES` names, `NotReadOnly`.
+    as many. A set, `[[:alpha:]]` and `[!x]` included, is any one of them. A component is also
+    the name it spells, where one is there: bash leaves a word that matches nothing as it is, so
+    `[k]` names the entry `[k]`, and a directory that can't be listed can still be passed
+    through. A directory's names include each link the command makes there, `_PLANNED_LINKS`.
+    zsh's `x~y`, with `EXTENDED_GLOB`, matches what `x` matches, across components, and bash's the
+    `~` it spells: both are read. A pattern `GLOB_AT_ANY_DEPTH` holds is its literal directory
+    instead, which a recursive walk covers. ``pattern`` is one `_glob_word` built, in which a
+    character a quote made literal is that character. Past `MAX_WALKED_ENTRIES` names,
+    `NotReadOnly`.
     """
-    if GLOB_FROM_ITS_DIRECTORY.search(pattern):
-        head = PATH_SPECIAL.split(pattern, 1)[0]
-        return [head.rsplit("/", 1)[0] or "/" if "/" in head else "."]
+    if GLOB_AT_ANY_DEPTH.search(pattern):
+        return [_literal_directory(pattern)]
+    readings = [pattern]
+    exclusion = next(
+        (index for index, character in _outside_sets(pattern) if character == "~" and index), None
+    )
+    if exclusion is not None:
+        readings.append(pattern[:exclusion])
+    matches: list[str] = []
+    for reading in readings:
+        matches += _glob_reading_matches(reading, bases, len(matches))
+    return list(dict.fromkeys(matches))
+
+
+def _outside_sets(text: str) -> Iterator[tuple[int, str]]:
+    """Each character of ``text`` that an operator can be, with its index.
+
+    That is, each one no bracket set holds, nor a quote made literal: a set ends where
+    `_bracket_end` says, and a `[` it doesn't close is the character itself; a character
+    `GLOB_LITERAL` marks is skipped with its mark.
+    """
+    index = 0
+    while index < len(text):
+        if text[index] == GLOB_LITERAL:
+            index += 2
+            continue
+        if text[index] == "[":
+            end = _bracket_end(text, index)
+            if end is not None:
+                index = end + 1
+                continue
+        yield index, text[index]
+        index += 1
+
+
+def _glob_reading_matches(pattern: str, bases: list[str], found_before: int) -> list[str]:
+    """`_glob_matches` for one reading of ``pattern``, with ``found_before`` matches already."""
     components = [component for component in pattern.split("/") if component]
     starts = ["/"] if pattern.startswith("/") else [b for b in bases if UNREAD_VALUE not in b]
     matches: list[str] = []
     for start in starts:
         current = [start]
-        for index, component in enumerate(components):
-            regex = _glob_component_regex(component)
+        for index, marked in enumerate(components):
+            matcher = _glob_component_pattern(marked)
+            component = _plain(marked)
             last = index == len(components) - 1
             found: list[str] = []
             for directory in current:
-                try:
-                    names = os.listdir(directory)
-                except (OSError, ValueError):
-                    names = []
-                if regex is None:
-                    chosen = [name for name in names if name.casefold() == component.casefold()]
-                    if component in (".", ".."):
-                        chosen.append(component)
+                names = _directory_names(directory)
+                if matcher is None:
+                    chosen = [name for name in names if _same_name(name, component)]
                 else:
-                    chosen = [name for name in names if regex.fullmatch(name)]
+                    chosen = [name for name in names if matcher.fullmatch(name)]
                     # bash before 5.2 matches `.` and `..` with a pattern that starts with `.`
                     if component.startswith("."):
-                        chosen += [name for name in (".", "..") if regex.fullmatch(name)]
+                        chosen += [name for name in (".", "..") if matcher.fullmatch(name)]
+                if (
+                    component in (".", "..")
+                    or component in names
+                    or os.path.lexists(os.path.join(directory, component))
+                ):
+                    chosen.append(component)
                 for name in dict.fromkeys(chosen):
                     path = os.path.join(directory, name)
-                    if last or os.path.isdir(path):
+                    if last or _is_directory(path):
                         found.append(path)
-                if len(found) + len(matches) > MAX_WALKED_ENTRIES:
+                if len(found) + len(matches) + found_before > MAX_WALKED_ENTRIES:
                     raise NotReadOnly(
                         f"a wildcard that matches more than {MAX_WALKED_ENTRIES} names"
                     )
@@ -7605,27 +7833,217 @@ def _glob_matches(pattern: str, bases: list[str]) -> list[str]:
     return matches
 
 
-def _glob_component_regex(component: str) -> re.Pattern[str] | None:
+def _literal_directory(pattern: str) -> str:
+    """The directory the literal part of ``pattern`` names, in front of its first wildcard.
+
+    Or in front of its first expansion or operator, `GLOB_SPECIAL`: `.` where that part names
+    none, and `/` for a wildcard in a component at the root, as in `/u*/share`. A character a
+    quote made literal in ``pattern``, `GLOB_LITERAL`, is part of it, and the directory is plain.
+    """
+    head = _plain(GLOB_SPECIAL.split(pattern, 1)[0])
+    if "/" not in head:
+        return "."
+    return head.rsplit("/", 1)[0] or "/"
+
+
+def _directory_names(directory: str) -> list[str]:
+    """The names in ``directory``, wherever it resolves, and each link the command makes there.
+
+    Those are `_PLANNED_LINKS`, placed as `_walk_directories` places them. What can't be listed
+    holds no name here: the shell can't list it either. Raises `NotReadOnly` for a directory
+    whose `_resolutions` this module can't tell.
+    """
+    if not _PLANNED_LINKS:
+        try:
+            return os.listdir(directory)
+        except (OSError, ValueError):
+            return []
+    try:
+        reals = _resolutions(directory)
+    except (OSError, ValueError):
+        raise NotReadOnly(f"a directory this module can't resolve: {directory}") from None
+    names: list[str] = []
+    for real in sorted(reals):
+        try:
+            names += os.listdir(real)
+        except (OSError, ValueError):
+            continue
+    names += [os.path.basename(link) for link in _PLANNED_LINKS if os.path.dirname(link) in reals]
+    return list(dict.fromkeys(names))
+
+
+def _is_directory(path: str) -> bool:
+    """Whether ``path`` is a directory, there or once the links the command makes are made.
+
+    Raises `NotReadOnly` for a path whose `_resolutions` this module can't tell.
+    """
+    if os.path.isdir(path):
+        return True
+    if not _PLANNED_LINKS:
+        return False
+    try:
+        return any(os.path.isdir(real) for real in _resolutions(path))
+    except (OSError, ValueError):
+        raise NotReadOnly(f"a path this module can't resolve: {path}") from None
+
+
+def _wildcard_reach(pattern: str, bases: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """What a wildcard the shell expands in ``pattern`` reaches, from each of ``bases``.
+
+    The paths it matches, `_glob_matches`, each to be read as the literal path it is. A pattern
+    `GLOB_AT_ANY_DEPTH` holds can match at any depth, as bash's `**` does with `globstar`, and
+    through a link, as zsh's `***` does: it matches none here, and reaches instead
+    each link a walk of its literal directory finds, as a reader that follows links does,
+    `_walk_for_links`, with the place each leads to. A base below `UNREAD_VALUE` holds nothing
+    to read here. Raises `NotReadOnly` past `MAX_WALKED_ENTRIES`, of matches or of entries
+    walked.
+    """
+    if not GLOB_AT_ANY_DEPTH.search(pattern):
+        return _glob_matches(pattern, bases), []
+    directory = _literal_directory(pattern)
+    if directory.startswith("/"):
+        roots = [directory]
+    else:
+        roots = [
+            base if directory == "." else os.path.join(base, directory)
+            for base in bases
+            if UNREAD_VALUE not in base
+        ]
+    return [], _walk_for_links(roots, 0)
+
+
+# The steps of a `_ComponentPattern`: one character, compared whatever its case (`_case_forms`);
+# any one character; at most one; any run of characters; and any run of one unit, a character or
+# `ANY_ONE`
+ONE_CHARACTER, ANY_ONE, AT_MOST_ONE, ANY_RUN, RUN_OF = range(5)
+
+
+def _case_forms(character: str) -> tuple[str, str]:
+    """The forms by which `_ComponentPattern` matches a character with another, whatever its case.
+
+    Its casefold, and its lowercase alone, as a shell's `towlower` gives it. They differ for
+    U+0130, a capital I with a dot: its casefold is `i` and a combining dot, as its lowercase is,
+    and bash 5.2 and zsh 5.9, matching whatever the case, match it to `i`, both ways. It is the
+    one character whose lowercase is more than one, so its first is the one `towlower` gives.
+    """
+    return character.casefold(), character.lower()[0]
+
+
+def _same_name(name: str, component: str) -> bool:
+    """Whether ``name`` is the literal ``component``, whatever its case.
+
+    Casefolded whole, or character by character as `_ComponentPattern` compares them.
+    """
+    if name.casefold() == component.casefold():
+        return True
+    return len(name) == len(component) and all(
+        _case_forms(a)[1] == _case_forms(b)[1] for a, b in zip(name, component, strict=True)
+    )
+
+
+class _ComponentPattern:
+    """The names one component of a wildcard may match, as a list of steps.
+
+    `fullmatch` runs the steps as a set of states, one character of the name at a time, in time
+    linear in the name, however the steps repeat: a regex of `*a*a*a*b`, or of zsh's `k###`,
+    backtracks exponentially on a long name of `a`s or `k`s, which a planted file would hold.
+    """
+
+    __slots__ = ("steps",)
+
+    def __init__(self, steps: list[tuple]) -> None:
+        self.steps = steps
+
+    def _closure(self, states: set[int]) -> set[int]:
+        """``states``, and each a step that may match nothing lets the name reach without one."""
+        pending = list(states)
+        while pending:
+            state = pending.pop()
+            if (
+                state < len(self.steps)
+                and self.steps[state][0] in (AT_MOST_ONE, ANY_RUN, RUN_OF)
+                and state + 1 not in states
+            ):
+                states.add(state + 1)
+                pending.append(state + 1)
+        return states
+
+    def fullmatch(self, name: str) -> bool:
+        """Whether the whole of ``name`` matches, whatever its case."""
+        states = self._closure({0})
+        for character in name:
+            folded, lowered = _case_forms(character)
+            following: set[int] = set()
+            for state in states:
+                if state == len(self.steps):
+                    continue
+                kind, unit = self.steps[state]
+                if kind in (ANY_ONE, AT_MOST_ONE) or (
+                    kind == ONE_CHARACTER and (unit[0] == folded or unit[1] == lowered)
+                ):
+                    following.add(state + 1)
+                elif kind == ANY_RUN or (
+                    kind == RUN_OF
+                    and (unit[0] == ANY_ONE or unit[1][0] == folded or unit[1][1] == lowered)
+                ):
+                    following.add(state)
+            if not following:
+                return False
+            states = self._closure(following)
+        return len(self.steps) in states
+
+
+def _glob_component_pattern(component: str) -> _ComponentPattern | None:
     """The names one component of a wildcard may match, as `_glob_matches` reads them.
 
-    None for a component with no wildcard.
+    None for a component with no wildcard. A character a quote made literal, which `GLOB_LITERAL`
+    marks, is that character. A set that holds a collating element, `[[.ch.]]`, is any run of
+    characters. Outside a set, zsh's `x#` and `x##` are any run of the unit `x`, and any other
+    operator of `GLOB_COMPONENT_OPERATORS` any name that starts with the text in front of it.
     """
-    parts: list[str] = []
+    steps: list[tuple] = []
     singles = 0
     wildcard = False
 
     def flush() -> None:
         nonlocal singles
-        if singles:
-            parts.append(f".{{{-(-singles // MAX_CHARACTER_BYTES)},{singles}}}")
-            singles = 0
+        least = -(-singles // MAX_CHARACTER_BYTES)
+        steps.extend([(ANY_ONE, None)] * least + [(AT_MOST_ONE, None)] * (singles - least))
+        singles = 0
+
+    def any_run() -> None:
+        flush()
+        if not steps or steps[-1][0] != ANY_RUN:
+            steps.append((ANY_RUN, None))
 
     index = 0
     while index < len(component):
         character = component[index]
-        if character == "*":
+        if character == GLOB_LITERAL and index + 1 < len(component):
             flush()
-            parts.append(".*")
+            steps.append((ONE_CHARACTER, _case_forms(component[index + 1])))
+            index += 2
+            continue
+        if character == "#" and (singles or steps):
+            # `x#` is any run of `x`, none included, and `x##` one or more: the unit in front
+            # of it, repeated, and the rest of the component after it
+            if singles:
+                singles -= 1
+                any_run()
+            elif steps[-1][0] == ONE_CHARACTER:
+                steps.append((RUN_OF, steps.pop()))
+            elif steps[-1][0] != RUN_OF:
+                steps.pop()
+                any_run()
+            wildcard = True
+            index += 2 if component.startswith("##", index) else 1
+            continue
+        if character in GLOB_COMPONENT_OPERATORS:
+            any_run()
+            wildcard = True
+            break
+        if character == "*":
+            any_run()
             wildcard = True
             index += 1
         elif character == "?":
@@ -7634,24 +8052,27 @@ def _glob_component_regex(component: str) -> re.Pattern[str] | None:
             index += 1
         elif character == "[":
             end = _bracket_end(component, index)
-            singles += 1  # a set is one character; an unmatched `[` is the character itself
             wildcard = True
+            if "[." in component[index + 1 : len(component) if end is None else end]:
+                # A collating element can be several characters, and `_bracket_end` doesn't
+                # read one: the rest of the component is any run of characters
+                any_run()
+                break
+            singles += 1  # a set is one character; an unmatched `[` is the character itself
             index = index + 1 if end is None else end + 1
         else:
             flush()
-            parts.append(re.escape(character))
+            steps.append((ONE_CHARACTER, _case_forms(character)))
             index += 1
     flush()
-    if not wildcard:
-        return None
-    return re.compile("".join(parts), re.DOTALL | re.IGNORECASE)
+    return _ComponentPattern(steps) if wildcard else None
 
 
 def _bracket_end(text: str, start: int) -> int | None:
     """The index of the `]` that ends the set opening at ``start``, or None for a literal `[`.
 
     A `]` right after the `[`, or after its `!` or `^`, is a member, and so is each `[:...:]`
-    and `[=...=]` class whole.
+    and `[=...=]` class whole, and a character a quote made literal, `GLOB_LITERAL`.
     """
     index = start + 1
     if index < len(text) and text[index] in "!^":
@@ -7659,6 +8080,9 @@ def _bracket_end(text: str, start: int) -> int | None:
     if index < len(text) and text[index] == "]":
         index += 1
     while index < len(text):
+        if text[index] == GLOB_LITERAL:
+            index += 2
+            continue
         if text[index] == "]":
             return index
         if text.startswith(("[:", "[="), index):
@@ -7849,9 +8273,7 @@ def _refuse_followed_credential_links(
                 operands_elsewhere=elsewhere,
             )
             for link, target in links:
-                if _names_a_credential(target, tilde=False, bases=[], live_glob=False) or any(
-                    _is_under(store, target) for store in stores
-                ):
+                if _leads_to_a_store(target, stores):
                     raise NotReadOnly(
                         f"{program} follows the link {link} to a credential store: {target}"
                     )
@@ -8314,7 +8736,9 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
 
     # Bash ends a string at a NUL byte, so a command containing one is a different command
     # to bash than to this module; and no path containing one can be resolved to check it.
-    if "\x00" in command or "\x02" in command:
+    # `UNREAD_VALUE` and `GLOB_LITERAL` have to be unforgeable for the words read with them to mean
+    # anything.
+    if any(byte in command for byte in ("\x00", UNREAD_VALUE, GLOB_LITERAL)):
         raise NotReadOnly("NUL or reserved control byte in command")
 
     # See `TERMINAL_CONTROL_BYTE`; the spelled forms are read in `_check_command`.
