@@ -1096,6 +1096,18 @@ def _skip_arithmetic(text: str, index: int) -> int:
     raise NotReadOnly("unterminated arithmetic expansion")
 
 
+class _EscapedDollar(str):
+    r"""Double-quoted text that closes its span and holds a `$` a backslash made literal.
+
+    `_scan_double_quoted` takes the backslash out, so `"\$r"` and `"$r"` are the same text in
+    the parts table. `_quoted_splice_name` reads a word's text as the expansion it spells, and
+    must not read the first as one: this type is how it tells them apart. Every other reader
+    takes the text as a plain `str`, as before.
+    """
+
+    __slots__ = ()
+
+
 def _scan_double_quoted(text: str, index: int, emit: Callable[[str, str], None]) -> int:
     """Scan a ``"..."`` span at word level, emitting its literal runs and substitutions.
 
@@ -1103,6 +1115,7 @@ def _scan_double_quoted(text: str, index: int, emit: Callable[[str, str], None])
     word, so ``"a$(id)b"`` stays one word and its command is still reachable.
     """
     buffer: list[str] = []
+    escaped_dollar = False
     length = len(text)
     while index < length:
         char = text[index]
@@ -1113,10 +1126,12 @@ def _scan_double_quoted(text: str, index: int, emit: Callable[[str, str], None])
                 continue
             if following in '$`"\\':
                 buffer.append(following)
+                escaped_dollar = escaped_dollar or following == "$"
                 index += 2
                 continue
         if char == '"':
-            emit(DOUBLE_QUOTED, "".join(buffer))
+            span = "".join(buffer)
+            emit(DOUBLE_QUOTED, _EscapedDollar(span) if escaped_dollar else span)
             return index + 1
         if char == "`":
             raise NotReadOnly("backtick command substitution")
@@ -1332,7 +1347,7 @@ def _safe_loop_names(
 # A use of `name` that the shell word-splits into the argument list: `$name`, `${name}`,
 # and the zsh `${=name}`. All three split an unquoted value into several words, so all
 # three are spliceable when the value is one this module resolved. A quoted `"$name"` is
-# not here -- it is a single word and is handled by the loop-name path -- and neither is a
+# not here -- it is a single word, which `_quoted_splice_name` reads -- and neither is a
 # glued `${name}x`, which is one word too.
 # TODO(zsh): under zsh only `${=name}` word-splits; a bare `$name` or `${name}` is one word
 # (SH_WORD_SPLIT is off by default). The splice checks the split words, which is the bash
@@ -1345,8 +1360,8 @@ def _splice_name(token: str, splice_vars: dict[str, list[str]]) -> str | None:
     """The variable name this token splices in, or None.
 
     A bare, unquoted `$name`, `${name}` or `${=name}` whose `name` has a resolved literal
-    value. A quoted use is a placeholder, not this literal text, so it never matches here
-    and stays with the loop-name path. A glued `${name}x` is not a whole-word match either.
+    value. A quoted use is a placeholder, not this literal text, so it never matches here:
+    `_quoted_splice_name` reads it. A glued `${name}x` is not a whole-word match either.
     """
     match = SPLICE_USE.match(token)
     if match is None:
@@ -1355,10 +1370,38 @@ def _splice_name(token: str, splice_vars: dict[str, list[str]]) -> str | None:
     return name if name in splice_vars else None
 
 
+# The text of a double-quoted span that is one plain expansion: `"$name"` or `"${name}"`. Not
+# zsh's `"${=name}"`, which splits the value inside the quotes.
+QUOTED_SPLICE_USE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _quoted_splice_name(
+    token: str, parts: list[tuple[str, str]], values: dict[str, str]
+) -> str | None:
+    r"""The variable name whose value this token is, as one word, or None (#99).
+
+    A word that is exactly `"$name"` or `"${name}"`, whose `name` has a resolved literal
+    value: both shells hand the program that value as it is, neither split nor globbed. The
+    whole word has to be the one double-quoted span, so `"$name"x` and `"$name$other"` are not
+    read here, and neither is `"\$name"`, the literal text, which `_EscapedDollar` marks.
+    """
+    match = PLACEHOLDER.fullmatch(token)
+    if match is None:
+        return None
+    kind, text = parts[int(match.group(1))]
+    if kind != DOUBLE_QUOTED or isinstance(text, _EscapedDollar):
+        return None
+    use = QUOTED_SPLICE_USE.fullmatch(text)
+    if use is None:
+        return None
+    name = use.group(1) or use.group(2)
+    return name if name in values else None
+
+
 def _literal_assignments(
     segments: list[list[str]], parts: list[tuple[str, str]], bindings: dict[str, int]
-) -> dict[str, list[str]]:
-    """Variables assigned a fully literal value in a sibling segment, as split words.
+) -> dict[str, str]:
+    """Variables assigned a fully literal value in a sibling segment, each with the value it holds.
 
     `_p='--profile admin --region us-east-1'` puts those three flags in `_p`, and because
     the assignment is in the same command as the `${=_p}` that uses it, the value is right
@@ -1403,16 +1446,14 @@ def _literal_assignments(
                 or any(ch in expanded_value for ch in ";|&<>`()$\n")
             ):
                 continue
-            # Bash expands a leading tilde in an assignment's value, so `x=~/a` holds the
+            # Both shells expand a tilde in an assignment's value, so `x=~/a` holds the
             # home-relative path, not the two characters. Storing the expansion is what lets
-            # the read scope see where `"$x"` really points. `x=~-` holds `$OLDPWD`, which
-            # the shell holds: no value here to read.
-            if value_token.startswith("~"):
-                directory = _tilde_expansion(expanded_value)
-                if directory is None:
-                    continue
-                expanded_value = directory
-            assigned[name] = expanded_value.split()
+            # the read scope see where `"$x"` really points. A value the two store differently,
+            # or one with a directory the shell picks, as `x=~-`, is none to read: see
+            # `_assigned_value`.
+            value = _assigned_value(value_token, parts)
+            if value is not None:
+                assigned[name] = value
     return assigned
 
 
@@ -1546,12 +1587,14 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
     # the literal it spells, such a value would be measured below the directory it climbs from.
     if _has_wildcard(expanded) and _glob_may_climb(expanded):
         return None
-    # Both shells expand a `~` that starts a word of the list: `for p in ~` binds the home
-    # directory, which the text `~` would place in the project
-    if token.startswith("~"):
-        directory = _tilde_expansion(expanded)
-        return None if directory is None else [directory]
-    return [expanded]
+    # Both shells expand a `~` that starts a word of the list, and bash one in a word shaped like
+    # an assignment: `for p in ~` binds the home directory, which the text `~` would place in the
+    # project. Each reading is one value the name may hold, `_tilde_readings`. One that keeps a
+    # tilde, as `for p in '~'` binds, is none to read: `LITERAL_TILDE`
+    readings = _tilde_readings(token, parts)
+    if any(UNREAD_VALUE in reading or LITERAL_TILDE.search(reading) for reading in readings):
+        return None
+    return readings
 
 
 def _tilde_expansion(text: str) -> str | None:
@@ -1579,6 +1622,118 @@ def _tilde_word(text: str) -> str:
         return directory
     _, slash, rest = text.partition("/")
     return UNREAD_VALUE + slash + rest
+
+
+def _tilde_elements(token: str, parts: list[tuple[str, str]]) -> list[tuple[str, bool]]:
+    """``token``'s characters as the shell reads them, each with whether a quote made it literal.
+
+    A backslash is a quote here. A quoted part with no character, as `""` is, stands as one
+    element with none: it still quotes a tilde-prefix it sits in. A substitution is
+    `SUBSTITUTION_MARKER`, quoted.
+    """
+    elements: list[tuple[str, bool]] = []
+    index = 0
+    for match in PLACEHOLDER.finditer(token):
+        elements += [(char, False) for char in token[index : match.start()]]
+        kind, value = parts[int(match.group(1))]
+        text = SUBSTITUTION_MARKER if kind in RUNS_A_COMMAND else value
+        elements += [(char, True) for char in text] or [("", True)]
+        index = match.end()
+    elements += [(char, False) for char in token[index:]]
+    return elements
+
+
+def _tilde_reading(elements: list[tuple[str, bool]], *, bash: bool, value_from: int | None) -> str:
+    """The text bash, or else zsh, makes of a word by expanding its tildes.
+
+    A `~` that starts the word expands. With ``value_from``, where the value of an assignment
+    starts, or of a word shaped like one, so does one that starts the value or follows a `:` in it.
+    The tilde-prefix runs to the next `/`, or `:` in a value, and an empty one is the home
+    directory; any other is `UNREAD_VALUE`, as `_tilde_expansion` reads it.
+
+    The shells differ on quoting. bash expands only after an unquoted `:`, and only where no
+    character of the prefix is quoted, the prefix running to the next unquoted `/` or `:`: it keeps
+    `~"/x"` and `a':'~/x` as they are spelled. zsh expands wherever the `~` itself is unquoted, the
+    prefix running to the next `/` or `:` however quoted: `~"/x"` is its home directory's `x`.
+    """
+    starts = {0}
+    if value_from is not None:
+        starts.add(value_from)
+    out: list[str] = []
+    index = 0
+    while index < len(elements):
+        char, quoted = elements[index]
+        if index in starts and char == "~" and not quoted:
+            delimiters = "/:" if value_from is not None and index >= value_from else "/"
+            end = index + 1
+            while end < len(elements):
+                following, following_quoted = elements[end]
+                if following and following in delimiters and not (bash and following_quoted):
+                    break
+                end += 1
+            prefix = elements[index + 1 : end]
+            if not (bash and any(prefix_quoted for _, prefix_quoted in prefix)):
+                name = "".join(prefix_char for prefix_char, _ in prefix)
+                out.append(UNREAD_VALUE if name else _home())
+                index = end
+                continue
+        if value_from is not None and index >= value_from and char == ":" and not (bash and quoted):
+            starts.add(index + 1)
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _tilde_readings(
+    token: str, parts: list[tuple[str, str]], *, assignment: bool = False
+) -> list[str]:
+    """Each text bash or zsh makes of ``token``, a reduced word, by expanding its tildes.
+
+    With ``assignment``, ``token`` is an assignment's value. Otherwise it is a word of a command,
+    which a shell may also expand as a value after its first unquoted `=`: bash in a word whose
+    name is an identifier, outside posix mode, `for` lists included, and zsh in any word under
+    `magic_equal_subst`, which a startup file can set. Each reading is one `_tilde_reading` makes;
+    a word without a `~` has one, its text.
+    """
+    text = _expand(token, parts)
+    if "~" not in text:
+        return [text]
+    elements = _tilde_elements(token, parts)
+    value_froms: list[int | None] = [0] if assignment else [None]
+    if not assignment:
+        # Not one at the start: a word that starts with `=` is zsh's `=cmd`
+        equals = next(
+            (index for index, (char, quoted) in enumerate(elements) if char == "=" and not quoted),
+            0,
+        )
+        if equals:
+            value_froms.append(equals + 1)
+    readings = [
+        _tilde_reading(elements, bash=bash, value_from=value_from)
+        for value_from in value_froms
+        for bash in (True, False)
+    ]
+    return list(dict.fromkeys(readings))
+
+
+def _assigned_value(value_token: str, parts: list[tuple[str, str]]) -> str | None:
+    """The value an assignment stores in both shells, or None where it can't be read.
+
+    That is where they store different ones, as for `x=~"/a"`, `~/a` to bash and the home
+    directory's `a` to zsh, and where the shell picks a directory in it, as `$OLDPWD` for `x=~-`.
+    """
+    readings = _tilde_readings(value_token, parts, assignment=True)
+    if len(readings) != 1 or UNREAD_VALUE in readings[0]:
+        return None
+    return readings[0]
+
+
+# A `~` in a value that filename expansion reads in each word the value splits into: one that
+# starts it, and under zsh's `magic_equal_subst` one after an `=` or a `:`. bash keeps it where an
+# unquoted `$x` uses the value, and zsh expands it under `glob_subst`, which a startup file can
+# set: such a value, as `x='a ~/b'` and `for x in '~'` hold, has no one reading there. It is not
+# spliced, and a `for` value is not read at all.
+LITERAL_TILDE = re.compile(r"(?:^|[\s=:])~")
 
 
 def _literal_loop_values(
@@ -1982,10 +2137,9 @@ def _known_values(
             name, _, value_token = word.partition("=")
             # `name` keeps the `+` of an append, which `splice_vars` never holds
             if name in splice_vars:
-                value = _expand(value_token, parts)
-                if value_token.startswith("~"):
-                    value = _tilde_word(value)
-                values[name] = [value]
+                value = _assigned_value(value_token, parts)
+                if value is not None:
+                    values[name] = [value]
     return {name: values.get(name) for name in bindings}
 
 
@@ -4409,6 +4563,7 @@ def _check_command(
     splice_vars: dict[str, list[str]] | None = None,
     scope: _ReadScope | None = None,
     known_values: dict[str, list[str] | None] | None = None,
+    quoted_values: dict[str, str] | None = None,
 ) -> None:
     """Inspect simple command name and argument list with strict fail-closed dispatch.
 
@@ -4437,20 +4592,34 @@ def _check_command(
     # flag-position check below skips them: they are known literals, and the validator that
     # runs on the full list is what actually clears them. An argument that is not a splice
     # keeps its token, so quoting and placeholders are preserved for every other check.
+    # A quoted `"$name"` or `"${name}"` of such a name is the value as one word, unsplit, and
+    # is read as that value written out in single quotes: its token is a placeholder for a
+    # literal part added here, so every check below reads the word as quoted text (#99).
     splice_vars = splice_vars or {}
     known_values = known_values or {}
+    quoted_values = quoted_values or {}
     args: list[str] = []
     arg_tokens: list[str] = []
     live_globs: list[bool] = []
     spliced: list[bool] = []
     for word in words[1:]:
         name = _splice_name(word, splice_vars)
+        # The value before any split, which `_literal_assignments` reads only where the commands
+        # around this one bind the name nowhere, and `_classify_with` keeps only where the
+        # shell holds it at the use
+        quoted_name = _quoted_splice_name(word, parts, quoted_values)
         if name is not None:
             for value_word in splice_vars[name]:
                 args.append(value_word)
                 arg_tokens.append(value_word)
                 live_globs.append(False)  # a resolved literal has no live glob
                 spliced.append(True)
+        elif quoted_name is not None:
+            parts.append((LITERAL, quoted_values[quoted_name]))
+            args.append(quoted_values[quoted_name])
+            arg_tokens.append(f"{PLACEHOLDER_MARK}{len(parts) - 1}{PLACEHOLDER_MARK}")
+            live_globs.append(False)
+            spliced.append(True)
         else:
             args.append(_expand(word, parts))
             arg_tokens.append(word)
@@ -4517,7 +4686,9 @@ def _check_command(
                 raise NotReadOnly(
                     f"{program} given a word the shell still builds: {_expand(word, parts)}"
                 )
-        _check_command(inner, parts, depth + 1, safe_names, splice_vars, scope, known_values)
+        _check_command(
+            inner, parts, depth + 1, safe_names, splice_vars, scope, known_values, quoted_values
+        )
         return
 
     # Every flag test below reads a word that is already complete. One that begins with
@@ -4805,11 +4976,13 @@ def _check_git_paths(
                 )
             if word == "-L" and subcommand == "log" and position + 1 < len(args):
                 # `-L <range>:<file>`: the file, after the last `:`, is read from where git runs
-                value = args[position + 1]
-                _check_git_path(value.rpartition(":")[2], tokens[position + 1], parts, scope, value)
+                value, value_token = args[position + 1], tokens[position + 1]
+                for reading in _git_readings(value_token, parts, value):
+                    _check_git_path(reading.rpartition(":")[2], value_token, parts, scope, value)
                 skip = True
             elif word.startswith("-L") and subcommand == "log":
-                _check_git_path(word.rpartition(":")[2], token, parts, scope, word)
+                for reading in _git_readings(token, parts, word):
+                    _check_git_path(reading.rpartition(":")[2], token, parts, scope, word)
             else:
                 skip = word in values
             continue
@@ -4818,8 +4991,20 @@ def _check_git_paths(
         if pattern_pending and not after_dashes:
             pattern_pending = False
             continue
-        path = _git_path_from_cwd(word, after_dashes=after_dashes)
-        _check_git_path(path, token, parts, scope, word)
+        for reading in _git_readings(token, parts, word):
+            path = _git_path_from_cwd(reading, after_dashes=after_dashes)
+            _check_git_path(path, token, parts, scope, word)
+
+
+def _git_readings(token: str, parts: list[tuple[str, str]], word: str) -> list[str]:
+    """Each text git gets for ``word``, as each shell expands its tildes: `_tilde_readings`.
+
+    Raises ``NoOpinion`` for one with a directory the shell picks, as `~-/x`.
+    """
+    readings = _tilde_readings(token, parts)
+    if any(UNREAD_VALUE in reading for reading in readings):
+        raise NoOpinion(f"git given a path in a directory the shell picks: {word}")
+    return readings
 
 
 def _check_git_path(
@@ -4900,13 +5085,11 @@ def _check_read_scope(
     """
     for index, start in found:
         token, text = arg_tokens[index], args[index]
-        if start:
-            # A path attached to its flag: the flag must be written out, so that the token
-            # can be cut where the text is. `'--from-file=/x'` quotes both together.
-            if token[:start] != text[:start]:
-                raise NoOpinion(f"{reader} given a file flag it cannot split: {text}")
-            token, text = token[start:], text[start:]
-        problem = _read_scope_problem(token, text, parts, scope)
+        # A path attached to its flag: the flag must be written out, so that the token can be
+        # cut where the text is. `'--from-file=/x'` quotes both together.
+        if start and token[:start] != text[:start]:
+            raise NoOpinion(f"{reader} given a file flag it cannot split: {text}")
+        problem = _read_scope_problem(token, text, parts, scope, start)
         if problem is not None:
             raise NoOpinion(f"{reader} reads {problem}")
 
@@ -5932,11 +6115,21 @@ def _names_a_credential_unguarded(
     """
     text = REDIRECTION_PREFIX.sub("", text)
     if "=" in text and not text.startswith(("/", "~", "$", UNREAD_VALUE)):
-        # An assignment's or a `--flag=`'s right-hand side. Bash expands a tilde after the
-        # `=` of an assignment, so `x=~/.aws/credentials` puts the real path in `x`; a
-        # `--flag=~/x` is not expanded, and treating it as if it were costs a prompt at most.
-        text = text.split("=", 1)[1]
-        tilde = True
+        # The word whole, as `cat x=y` opens it, and its right-hand side, as `--file=y` and an
+        # assignment do. bash expands a tilde after the `=` of a word shaped like an assignment,
+        # so `x=~/.aws/credentials` puts the real path in `x`, and keeps the one in `--flag=~/x`,
+        # which zsh expands under `magic_equal_subst`: the right-hand side's leading `~` is read
+        # both ways. The caller reads one after a `:`, `_tilde_readings`.
+        value = text.split("=", 1)[1]
+        return any(
+            _path_names_a_credential(path, tilde=path_tilde, bases=bases, live_glob=live_glob)
+            for path, path_tilde in ((text, False), (value, True), (value, False))
+        )
+    return _path_names_a_credential(text, tilde=tilde, bases=bases, live_glob=live_glob)
+
+
+def _path_names_a_credential(text: str, *, tilde: bool, bases: list[str], live_glob: bool) -> bool:
+    """Whether ``text``, read as one path, reaches a credential store: `_names_a_credential`."""
     if not text:
         return False
     # `_expand_home` reads `~name` as `UNREAD_VALUE`, which zsh can take from a named directory;
@@ -6088,8 +6281,17 @@ def _directory_targets(words: list[str], parts: list[tuple[str, str]]) -> list[s
             if target in DIRECTORY_CHANGER_OPTIONS:
                 continue
             if not target.startswith(("-", "+")):
-                if following.startswith("~"):
-                    target = _tilde_expansion(target) or UNREAD_VALUE
+                # A tilde as each shell expands it, `_tilde_readings`: a target they read
+                # differently, as `~"/x"`, is one the shell picks
+                readings = _tilde_readings(following, parts)
+                if len(readings) > 1:
+                    target = UNREAD_VALUE
+                elif following.startswith("~"):
+                    target = (
+                        UNREAD_VALUE
+                        if UNREAD_VALUE in readings[0]
+                        else readings[0].replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
+                    )
                 if _carries_live_glob(following):
                     raise NotReadOnly(f"cd to a directory a wildcard picks: {target}")
                 if index != program or position == len(words) - 1:
@@ -6130,13 +6332,15 @@ def _directory_word(token: str, parts: list[tuple[str, str]]) -> str:
     """The directory ``token``, a word of its own, names for a program that changes to it.
 
     A command's output, and a wildcard the shell expands, which picks the directory, are
-    `UNREAD_VALUE`. A leading `~` is read by `_tilde_word`. A variable stays as spelled, for
-    `_spellings`.
+    `UNREAD_VALUE`, and so is a word bash and zsh read differently, `_tilde_readings`. A variable
+    stays as spelled, for `_spellings`.
     """
     if _carries_live_glob(token):
         return UNREAD_VALUE
-    text = _expand(token, parts).replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
-    return _tilde_word(text) if token.startswith("~") else text
+    readings = _tilde_readings(token, parts)
+    if len(readings) > 1:
+        return UNREAD_VALUE
+    return readings[0].replace(SUBSTITUTION_MARKER, UNREAD_VALUE)
 
 
 def _changed_directories(
@@ -6449,12 +6653,60 @@ def _refuse_credential_paths(
             live_glob = _carries_live_glob(token)
             if live_glob and _glob_may_climb(word, dot_components=False):
                 raise NotReadOnly(f"a glob that climbs past its wildcard can land anywhere: {word}")
-            # A tilde is expanded only at the start of an unquoted word, so a quoted
-            # `'~/x'` is the literal path it spells. A placeholder start means quoted.
-            tilde = token.startswith("~") or bool(REDIRECTION_PREFIX.match(token))
-            for spelled in _spellings(word, state.values, state.shell_bases):
-                if _names_a_credential(spelled, tilde=tilde, bases=bases, live_glob=live_glob):
-                    raise NotReadOnly(f"names a credential store: {word}")
+            # A tilde as each shell expands it, `_tilde_readings`: a quoted `'~/x'` is the
+            # literal path it spells, and `~"/x"` is that to bash and the home directory's `x` to
+            # zsh. A redirection's target is read after its operator. The word as spelled is read
+            # too, its leading `~` as `_names_a_credential` reads it, which reads `~name` as the
+            # home directory of a user `name`, where there is one.
+            operator = REDIRECTION_PREFIX.match(token)
+            prefix = operator.group(0) if operator else ""
+            target = token[len(prefix) :]
+            readings = [(word, target.startswith("~") or bool(prefix))] + [
+                (prefix + reading, False) for reading in _tilde_readings(target, parts)
+            ]
+            for reading, tilde in readings:
+                for spelled in _spellings(reading, state.values, state.shell_bases):
+                    if _names_a_credential(spelled, tilde=tilde, bases=bases, live_glob=live_glob):
+                        raise NotReadOnly(f"names a credential store: {word}")
+                    # And a path glued to an option or after an `@`, which no word spells alone
+                    for glued in _glued_paths(REDIRECTION_PREFIX.sub("", spelled)):
+                        if _names_a_credential(
+                            glued, tilde=False, bases=bases, live_glob=live_glob
+                        ):
+                            raise NotReadOnly(f"names a credential store: {word}")
+
+
+# The letters and digits of a short-option cluster that starts a word, as `-hf` in `-hf/x`
+SHORT_OPTION_CLUSTER = re.compile(r"-[A-Za-z0-9]*")
+
+# The longest cluster `_glued_paths` reads: past it, a word is refused rather than read at each
+# of its letters
+MAX_GLUED_CLUSTER = 64
+
+
+def _glued_paths(text: str) -> list[str]:
+    """The paths a program may open from ``text``, a word, other than the word itself.
+
+    A short option's value attached to it, which can start after any letter of the cluster, as
+    `-T<path>` and `-hf<path>` do; and a file a leading `@` names, as curl reads it for `-d`,
+    `--data-binary` and `-F`: `@<path>`, `-d@<path>` and `name=@<path>`. A path after a long
+    option's `=` is read by `_names_a_credential`.
+    """
+    paths: list[str] = []
+    if text.startswith("@"):
+        paths.append(text[1:])
+    _, equals, value = text.partition("=")
+    if equals and value.startswith("@"):
+        paths.append(value[1:])
+    if text.startswith("-") and not text.startswith("--"):
+        end = SHORT_OPTION_CLUSTER.match(text).end()
+        if end > MAX_GLUED_CLUSTER:
+            raise NotReadOnly(f"a short-option cluster too long to read: {text[:end]}")
+        for start in range(2, min(end, len(text) - 1) + 1):
+            paths.append(text[start:])
+            if text[start] == "@":
+                paths.append(text[start + 1 :])
+    return [path for path in paths if path]
 
 
 class _ReadScope:
@@ -6658,27 +6910,46 @@ def _resolve_variables(text: str, scope: _ReadScope) -> list[str] | None:
 
 
 def _read_scope_problem(
-    token: str, text: str, parts: list[tuple[str, str]], scope: _ReadScope
+    token: str, text: str, parts: list[tuple[str, str]], scope: _ReadScope, start: int = 0
 ) -> str | None:
-    """Why a reader's file operand is not in scope, or None when it is."""
-    whole = PLACEHOLDER.fullmatch(token)
+    """Why a reader's file operand is not in scope, or None when it is.
+
+    The operand is ``text`` from ``start``, where a path attached to its flag begins, and
+    ``token`` the whole word, which `_check_read_scope` has checked spells the flag out: a tilde is
+    read where each shell expands it in the word, `_tilde_readings`, and each reading measured.
+    """
+    path = text[start:]
+    cut = token[start:]
+    whole = PLACEHOLDER.fullmatch(cut)
     if whole is not None and parts[int(whole.group(1))][0] == PROCESS_SUBSTITUTION:
         return None  # `<(...)`: a pipe whose body was classified, not a path on disk
-    if text == "-":
+    if path == "-":
         return None
-    if SUBSTITUTION_MARKER in text:
+    if SUBSTITUTION_MARKER in path:
         return "a path produced by a command"
-    if token.startswith("~"):
-        directory = _tilde_expansion(text)
-        if directory is None:
-            return f"a path in a directory the shell picks: {text}"
-        text = directory
+    for reading in _tilde_readings(token, parts):
+        if reading[:start] != text[:start]:
+            return f"a file flag a tilde rewrites: {text}"
+        problem = _reading_scope_problem(
+            reading[start:], path, scope, live_glob=_carries_live_glob(cut)
+        )
+        if problem is not None:
+            return problem
+    return None
+
+
+def _reading_scope_problem(
+    text: str, path: str, scope: _ReadScope, *, live_glob: bool
+) -> str | None:
+    """Why ``text``, a reading of the file operand ``path``, is not in scope, or None when it is."""
+    if UNREAD_VALUE in text:
+        return f"a path in a directory the shell picks: {path}"
     candidates = _resolve_variables(text, scope)
     if candidates is None:
         return "a path this module cannot resolve"
     for spelled in candidates:
         candidate = _expand_home(spelled, tilde=False)
-        if _carries_live_glob(token):
+        if live_glob:
             if _glob_may_climb(candidate):
                 return f"a glob that may climb out of its directory: {candidate}"
             # The directory the glob runs in: everything up to the last `/` before it.
@@ -7234,13 +7505,16 @@ def _followed_links(
     indexes = _follower_operands(program, args)
     directories: list[str] = []
     for index in indexes:
-        token, text = tokens[index], args[index]
+        token = tokens[index]
         whole = PLACEHOLDER.fullmatch(token)
         if whole is not None and parts[int(whole.group(1))][0] == PROCESS_SUBSTITUTION:
             continue  # `<(...)`: a pipe, not a directory
-        if token.startswith("~"):
-            text = _tilde_word(text)
-        spellings = _spellings(text, values, bases, before=False)
+        # Each reading of the word's tildes, `_tilde_readings`, is a directory it may name
+        spellings = [
+            spelled
+            for reading in _tilde_readings(token, parts)
+            for spelled in _spellings(reading, values, bases, before=False)
+        ]
         if not _carries_live_glob(token):
             directories += spellings
             continue
@@ -7905,9 +8179,10 @@ def _ln_word(token: str, parts: list[tuple[str, str]]) -> str:
     """An `ln` argument as the program gets it, or `NotReadOnly` for one the shell decides."""
     if _word_the_shell_builds(token, parts):
         raise NotReadOnly(f"ln given a word the shell builds: {_expand(token, parts)}")
-    word = _expand(token, parts)
-    if token.startswith("~"):
-        word = _tilde_word(word)
+    readings = _tilde_readings(token, parts)
+    if len(readings) > 1:
+        raise NotReadOnly(f"ln given a word bash and zsh read differently: {_expand(token, parts)}")
+    word = readings[0]
     if UNREAD_VALUE in word:
         raise NotReadOnly(f"ln given a directory the shell picks: {token}")
     return word
@@ -7956,11 +8231,12 @@ def _input_target(target: str, parts: list[tuple[str, str]]) -> str | None:
     expanded = PLACEHOLDER.sub(lambda match: parts[int(match.group(1))][1], target)
     if NETWORK_DEVICE.search(expanded) is not None:
         return None
-    if target.startswith("~"):
-        directory = _tilde_expansion(expanded)
-        if directory is None:
-            return None
-        expanded = directory
+    # A tilde as each shell expands it, `_tilde_readings`: a target they read differently, as
+    # `~"/x"`, or one in a directory the shell picks, is left in place too
+    readings = _tilde_readings(target, parts)
+    if len(readings) > 1 or UNREAD_VALUE in readings[0]:
+        return None
+    expanded = readings[0]
     if not expanded.startswith("/") and ".." in Path(expanded).parts:
         return None
     return expanded
@@ -8146,18 +8422,25 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
 
     # Variables assigned a fully literal value in this command. A `$name`/`${name}`/`${=name}`
     # that uses one is spliced into its words and checked as the flags it is, which is how a
-    # `_p='--profile x --region y'` hoisted out of repeated vendor calls stops prompting.
-    splice_vars = _literal_assignments(segments, parts, bindings)
+    # `_p='--profile x --region y'` hoisted out of repeated vendor calls stops prompting. A
+    # `"$name"` is read as the value itself, one that keeps a tilde included; an unquoted use of
+    # that one is not, as zsh's `glob_subst` expands the tilde there: `LITERAL_TILDE`.
+    assigned = _literal_assignments(segments, parts, bindings)
+    splice_vars = {
+        name: value.split() for name, value in assigned.items() if not LITERAL_TILDE.search(value)
+    }
     loop_values = _literal_loop_values(segments, parts, bindings)
     known_values = _known_values(segments, parts, splice_vars, loop_values, own_bindings)
     # A value the shell may not hold where a word uses it is no value to read: every reader
-    # takes the name as unread, the value it had before, as for `cd $d; d=src`
+    # takes the name as unread, the value it had before, as for `cd $d; d=src`. `assigned`
+    # holds one that keeps a tilde too, which `splice_vars` leaves out and a `"$name"` reads.
     read = {name for name, values in known_values.items() if values is not None}
     unsettled = _unsettled_names(
-        segments, separators, parts, read | set(splice_vars) | set(loop_values)
+        segments, separators, parts, read | set(assigned) | set(loop_values)
     )
     for name in unsettled:
         known_values[name] = None
+        assigned.pop(name, None)
         splice_vars.pop(name, None)
         loop_values.pop(name, None)
     for name, values in (inherited.values if inherited else {}).items():
@@ -8244,6 +8527,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
                 splice_vars=splice_vars,
                 scope=scope,
                 known_values=known_values,
+                quoted_values=assigned,
             )
             _check_where_it_runs(unvouched)
         except NoOpinion:

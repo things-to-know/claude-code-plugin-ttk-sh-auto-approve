@@ -72,6 +72,10 @@ insists on its own filename, symlink to this file rather than copying it.
     `CLAUDE_CODE_SHELL` names. Every rule has to hold under both grammars.
   - When only one shell expands a construct (zsh's `${(e)x}`, `$~x`, glob qualifiers, `=(...)`,
     `echo` escapes without `-e`), refuse it wherever it is spelled.
+    - Except a tilde, which the hook reads as each shell expands it (`_tilde_readings`): zsh's
+      `~"/x"`, and bash's `x=~/y` in an argument
+      - A word is approved only where every reading is, and Layer B reads each of them
+      - A value the two shells store differently, as `x=~"/y"`, is not read
   - Aliases and functions from the user's shell startup file apply as well, and the hook can't
     see them. The module docstring of `sh_auto_approve.py` has the sources.
 - **Fail closed.** Print nothing unless the command is proven read-only. On
