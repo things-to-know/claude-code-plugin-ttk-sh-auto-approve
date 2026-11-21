@@ -89,6 +89,17 @@ insists on its own filename, symlink to this file rather than copying it.
         - The value it adds to is one the hook doesn't read, as in `f=d; f+='1*/k'`
       - A copy, `g=$f`, is a value the hook doesn't read
         - The residual of `cat $g/id_rsa` under `Bash(cat *)`
+    - And a word that spells an operator of zsh's `EXTENDED_GLOB` unquoted, `^`, `#` or a `~`
+      after its start (`ZSH_GLOB_OPERATOR`), for the path checks alone
+      - And a value that spells one, as `f=x; f='^x'` assigns, which `GLOB_SUBST` matches where
+        `$f` is unquoted (`_wildcard_value`)
+      - The flag checks read `HEAD~1` as bash does, and as zsh may, the text in front of the
+        operator followed by any other (`_zsh_glob_prefix`)
+        - So a loop over `HEAD~1` gives no flag
+        - A loop over `^x` or `a#-o`, which zsh 5.9 matched against a file `-o`, gives one, as in
+          `git diff $r..HEAD`
+        - Not where a quoted `"$r"` is the whole word, which the flag check exempts
+          (`_safe_loop_names`): the residual #147 tracks
     - One it can't bound, `**` or a group, reaches each link below its literal directory, walked
       as for a reader that follows links (`GLOB_AT_ANY_DEPTH`)
       - zsh's `***` matches through a link

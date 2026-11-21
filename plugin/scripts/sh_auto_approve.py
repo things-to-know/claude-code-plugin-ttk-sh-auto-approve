@@ -1315,6 +1315,11 @@ def _carries_live_glob(token: str) -> bool:
     return _has_wildcard(PLACEHOLDER.sub("", token))
 
 
+# The operators of zsh's `EXTENDED_GLOB` that a word can spell unquoted: `^x`, `x#`, and `x~y`,
+# whose `~` at the start of a word is a tilde instead. The others, `(`, `|` and `<`, end a word.
+ZSH_GLOB_OPERATOR = re.compile(r"[#^]|(?<!^)~")
+
+
 def _globbed(token: str, spelled: str) -> bool:
     """Whether the shell matches ``spelled``, one of ``token``'s spellings, against the directory.
 
@@ -1323,10 +1328,36 @@ def _globbed(token: str, spelled: str) -> bool:
     after `for f in 'k*'`, `cat $f/x` reads `k/x`, and so does zsh with `GLOB_SUBST`, which a
     startup file can set. A wildcard a quoted part spells next to it counts too, which reads
     more paths, never fewer.
+
+    And where the token spells an operator of zsh's `EXTENDED_GLOB` unquoted, `ZSH_GLOB_OPERATOR`,
+    which a startup file can set: `g/^x/id_rsa` matches `g/k/id_rsa`. bash reads it as the
+    character it is, which `_glob_matches` reads too. Only the path checks ask this: the flag
+    checks read `HEAD~1` and `HEAD^` as the words they are, as bash does.
     """
-    return _carries_live_glob(token) or (
-        _has_wildcard(spelled) and UNQUOTED_EXPANSION.search(PLACEHOLDER.sub("", token)) is not None
-    )
+    unquoted = PLACEHOLDER.sub("x", token)
+    if _carries_live_glob(token) or ZSH_GLOB_OPERATOR.search(unquoted):
+        return True
+    return (
+        _has_wildcard(spelled) or ZSH_GLOB_OPERATOR.search(spelled) is not None
+    ) and UNQUOTED_EXPANSION.search(PLACEHOLDER.sub("", token)) is not None
+
+
+def _zsh_glob_prefix(token: str, parts: list[tuple[str, str]]) -> str | None:
+    """The text each name zsh matches ``token`` against starts with, or None where it can't tell.
+
+    For a word that is a glob only through an operator of zsh's `EXTENDED_GLOB`: the text in
+    front of its first one, less the character in front of a `#`, which `#` lets match nothing:
+    zsh 5.9 matched `a#-o` against a file `-o`. `^` and `~` keep what comes before them, so
+    `HEAD^` matches only names that start with `HEAD`. None where that text is empty or starts
+    with `-` or `~`, as `^x` may match a file `-o`, and for any other word.
+    """
+    match = ZSH_GLOB_OPERATOR.search(token)
+    if match is None or _carries_live_glob(token) or token.startswith("~"):
+        return None
+    prefix = _expand(token[: match.start()], parts)
+    if match.group() == "#":
+        prefix = prefix[:-1]
+    return prefix if prefix and not prefix.startswith(("-", "~")) else None
 
 
 # What bash splits an unquoted expansion's value at, with the default `IFS`
@@ -1671,13 +1702,16 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
         return None
     if _carries_brace_expansion(token):
         return None
-    if _carries_live_glob(token):
+    # A word that spells an operator of zsh's `EXTENDED_GLOB` unquoted is a glob too, which zsh
+    # matches with a startup file's `setopt extendedglob`: `for f in d/^x` binds `d/y`
+    zsh = ZSH_GLOB_OPERATOR.search(PLACEHOLDER.sub("x", token)) is not None
+    if _carries_live_glob(token) or zsh:
         head = PATH_SPECIAL.split(expanded, 1)[0]
         directory = head.rpartition("/")[0]
         if (
             _glob_may_climb(expanded)
             or expanded.startswith(("/", "~"))
-            or ".." in directory.split("/")
+            or ".." in (expanded if zsh else directory).split("/")
         ):
             return None
         # The pattern in which a quote's glob characters are literal: `_glob_word`
@@ -1687,14 +1721,47 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
     # the literal it spells, such a value would be measured below the directory it climbs from.
     if _has_wildcard(expanded) and _glob_may_climb(expanded):
         return None
-    # Both shells expand a `~` that starts a word of the list, and bash one in a word shaped like
-    # an assignment: `for p in ~` binds the home directory, which the text `~` would place in the
-    # project. Each reading is one value the name may hold, `_tilde_readings`. One that keeps a
-    # tilde, as `for p in '~'` binds, is none to read: `LITERAL_TILDE`
+    return _literal_readings(token, parts)
+
+
+def _literal_readings(token: str, parts: list[tuple[str, str]]) -> list[str] | None:
+    """Each value a `for`-list word the shell doesn't glob gives, or None where it can't tell.
+
+    Both shells expand a `~` that starts a word of the list, and bash one in a word shaped like
+    an assignment: `for p in ~` binds the home directory, which the text `~` would place in the
+    project. Each reading is one value the name may hold, `_tilde_readings`. One that keeps a
+    tilde, as `for p in '~'` binds, is none to read: `LITERAL_TILDE`.
+    """
     readings = _tilde_readings(token, parts)
     if any(UNREAD_VALUE in reading or LITERAL_TILDE.search(reading) for reading in readings):
         return None
     return readings
+
+
+def _loop_flag_values(words: list[str], parts: list[tuple[str, str]]) -> list[str] | None:
+    """The values a `for` list gives its name, as the flag checks read them, or None.
+
+    A word that gives a `PICKED` value is none to read, as a file `-rf` may be one of its
+    matches, unless zsh alone globs it, through an operator of `EXTENDED_GLOB`, after a text no
+    match can make a flag, `_zsh_glob_prefix`. Then it is read as bash reads it, the word it is,
+    and as zsh may, that text followed by any other, `OPERATOR_VALUE`: `for r in HEAD~1 HEAD^`
+    gives no flag to `git diff $r..HEAD`, while a `printf $r` still reads a format it didn't read.
+    Only the flag checks and the validators ask this: a `cd $d`, which zsh takes to a match,
+    reads `$d` as unread, `_classify_with`.
+    """
+    values: list[str] = []
+    for word in words:
+        shapes = _loop_value_shapes(word, parts)
+        if shapes is None:
+            return None
+        if any(PICKED in shape for shape in shapes):
+            prefix = _zsh_glob_prefix(word, parts)
+            readings = None if prefix is None else _literal_readings(word, parts)
+            if prefix is None or readings is None:
+                return None
+            shapes = [*readings, prefix + OPERATOR_VALUE]
+        values.extend(shapes)
+    return values
 
 
 def _tilde_expansion(text: str) -> str | None:
@@ -2248,16 +2315,16 @@ def _known_values(
 
     A name's values are known where its one binding is one this module read as literal: an
     assignment that `_literal_assignments` accepted, or a `for` header that
-    `_literal_loop_values` resolved to no `PICKED` value. Each of those holds only a name that
-    `_bindings` counts once, so the binding it read is the name's only one. The value is the
-    one bash stores, before any split: `q=' -o'` holds ` -o`, which `splice_vars` keeps as the
-    one word `-o`.
+    `_literal_loop_values` resolved, as `_loop_flag_values` reads it. Each of those holds only a
+    name that `_bindings` counts once, so the binding it read is the name's only one. The value
+    is the one bash stores, before any split: `q=' -o'` holds ` -o`, which `splice_vars` keeps as
+    the one word `-o`.
 
     Any other name ``bindings`` holds is unread: one bound twice, by an append, after `do`,
     `then` or `{`, by a header inside a loop's body or one that binds the name second, by a
     builtin, or by a glob or `$(ls)` list, which a planted file name decides, and which only the
-    path checks read, as its `PICKED` values. `$_` is always unread: each command sets it to its
-    last word.
+    path checks read, as its `PICKED` values, unless zsh alone globs it after a text no match
+    can make a flag. `$_` is always unread: each command sets it to its last word.
 
     A name this command never binds is left out: the residual `_word_the_shell_decides`
     documents.
@@ -2269,8 +2336,9 @@ def _known_values(
     for segment in segments:
         if len(segment) >= 3 and segment[0] in WORD_LIST_HEADS and segment[2] == "in":
             name = _expand(segment[1], parts)
-            if name in loop_values and name not in _picked_values(loop_values):
-                values[name] = loop_values[name]
+            flag_values = _loop_flag_values(segment[3:], parts) if name in loop_values else None
+            if flag_values is not None:
+                values[name] = flag_values
             continue
         for word in segment:
             if not ASSIGNMENT.match(word):
@@ -2401,9 +2469,9 @@ def _unsettled_names(
       `||` or a pipe
     - runs in the shell itself, `SUBSHELL_SEPARATORS`: not in a pipeline, nor behind `&`, by
       the separator after its segment, or after the `done` of the loop it opens
-    - is no `for` whose list may hold no word, which then runs no turn: one with a word the
-      shell builds, `_word_the_shell_builds`, such as a wildcard, which bash's `nullglob` and
-      zsh's `null_glob` drop where it matches nothing, or a `$(ls)` of an empty directory
+    - is no `for` whose list may hold no word, which then runs no turn: one with a word that may
+      give none, `_may_give_no_word`, such as a wildcard, which bash's `nullglob` and zsh's
+      `null_glob` drop where it matches nothing, or a `$(ls)` of an empty directory
 
     ``separators`` holds the separator before and after each segment, `_segment_separators`.
     """
@@ -2438,11 +2506,24 @@ def _unsettled_names(
             or separators[end][1] in SUBSHELL_SEPARATORS
             or (
                 header[0] in WORD_LIST_HEADS
-                and any(_word_the_shell_builds(word, parts) for word in header[3:])
+                and any(_may_give_no_word(word, parts) for word in header[3:])
             )
         ):
             unsettled.add(name)
     return unsettled
+
+
+def _may_give_no_word(token: str, parts: list[tuple[str, str]]) -> bool:
+    """Whether a `for` list word may give no word at all, so that the loop runs no turn.
+
+    One the shell builds, `_word_the_shell_builds`, and one that spells an operator of zsh's
+    `EXTENDED_GLOB` unquoted, `ZSH_GLOB_OPERATOR`, which `null_glob` drops where it matches
+    nothing as it drops a wildcard.
+    """
+    return (
+        _word_the_shell_builds(token, parts)
+        or ZSH_GLOB_OPERATOR.search(PLACEHOLDER.sub("x", token)) is not None
+    )
 
 
 def _unclean_expansion(token: str, known_values: dict[str, list[str] | None]) -> str | None:
@@ -6605,8 +6686,12 @@ def _operand_name(match: re.Match[str]) -> str | None:
 
 
 def _wildcard_value(value: str) -> bool:
-    """Whether the shell may match ``value`` against the directory: `PICKED`, or a wildcard."""
-    return PICKED in value or _has_wildcard(value)
+    """Whether the shell may match ``value`` against the directory: `PICKED`, or a wildcard.
+
+    An operator of zsh's `EXTENDED_GLOB` is one, which `GLOB_SUBST` matches in a value, as
+    `_globbed` reads it: `f=x; f='^x'; cat $f/id_rsa` reads `k/id_rsa`.
+    """
+    return PICKED in value or _has_wildcard(value) or ZSH_GLOB_OPERATOR.search(value) is not None
 
 
 class _ShellState:
@@ -6679,6 +6764,8 @@ def _wildcard_assignments(
 ) -> dict[str, list[str]]:
     """The value of each assignment in these segments that holds a wildcard, for Layer B.
 
+    A wildcard as `_wildcard_value` reads it, an operator of zsh's `EXTENDED_GLOB` included.
+
     `_literal_assignments` reads none of them: bash globs the value where an unquoted `$f` uses
     it, so `f='k*'; cat $f/id_rsa` reads `k/id_rsa`. The credential check reads each as one more
     spelling of the name, which `_globbed` matches where it is unquoted. Each assignment the walk
@@ -6696,7 +6783,7 @@ def _wildcard_assignments(
             name, _, value_token = word.partition("=")
             value = _expand(value_token, parts)
             if (
-                not _has_wildcard(value)
+                not _wildcard_value(value)
                 or _has_bare_variable(value_token, parts)
                 or _carries_substitution(value_token, parts)
                 or _carries_brace_expansion(value_token)
@@ -7155,7 +7242,8 @@ def _refuse_picks_the_shell_splits(
     character, `SPLIT_OR_GLOBBED`, refuses the command outright: one a `$(ls)` lists, and one a
     glob matches where the command uses the name unquoted, in a substitution's body included. A
     glob that can match at any depth, as `**` can, gives each name below its literal directory,
-    `_names_a_pattern_gives`.
+    `_names_a_pattern_gives`. A glob is each list word `_loop_value_shapes` reads as one, an
+    operator of zsh's `EXTENDED_GLOB` included: `for f in ^z` gives `x ..` too.
 
     Each such word of each header is read, wherever the header stands, `_loop_headers`, and
     however many times its name is bound, since the check only adds a name to refuse.
@@ -9029,8 +9117,14 @@ def _input_target(target: str, parts: list[tuple[str, str]]) -> str | None:
     Such a target, a relative one with a ``..``, and one below a directory the shell picks, as
     ``~-/x``, is left in place for ``_segments`` to refuse as an unaccounted ``<``. Whether
     the file is in the working directories is `_check_input_targets`'s, once they are known.
+
+    A glob includes an operator of zsh's `EXTENDED_GLOB` spelled unquoted, `ZSH_GLOB_OPERATOR`,
+    which a startup file can set: `cat < ^x/f` reads `d/f` where `d` leads out, as `_globbed`
+    reads it for the credential check.
     """
     if re.search(r"[$*?\[\]{}`\\]", PLACEHOLDER.sub("", target)):
+        return None
+    if ZSH_GLOB_OPERATOR.search(PLACEHOLDER.sub("x", target)):
         return None
     for index in PLACEHOLDER.findall(target):
         kind, value = parts[int(index)]
@@ -9269,9 +9363,15 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # a value no header spells.
     safe_names = _safe_loop_names(segments, parts, bindings, known_values) - unsettled
 
+    # The paths a glob or `$(ls)` list of this command's own gives a name
+    picked = _picked_values(loop_values)
     # Where a relative word may be resolved from, worked out once for the credential check, the
-    # read scope and each substitution's body
-    bases, shell_bases, run_bases = _working_directories(segments, parts, inherited, known_values)
+    # read scope and each substitution's body. A name such a list binds is unread there, though
+    # the flag checks read a word zsh alone globs as bash does, `_loop_flag_values`: zsh's `cd $d`
+    # goes to a match
+    bases, shell_bases, run_bases = _working_directories(
+        segments, parts, inherited, {**known_values, **dict.fromkeys(picked)}
+    )
     # An assignment's value that holds a wildcard, and what each loop's glob or `$(ls)` gives,
     # wherever its header stands, for the credential check alone, which adds a path to refuse:
     # the command's own, and all of those around it
@@ -9288,7 +9388,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         bindings,
         backgrounds=backgrounds,
         run_bases=run_bases,
-        picked=_picked_values(loop_values),
+        picked=picked,
         globbed=globbed,
     )
 

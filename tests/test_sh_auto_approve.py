@@ -4887,6 +4887,23 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
                     with self.subTest(command=command):
                         self.assert_refused_outright(command)
 
+    def test_an_input_redirection_that_spells_an_operator_of_zshs_extended_glob(self):
+        """With `EXTENDED_GLOB`, which a startup file can set, zsh reads an unquoted `^x` as any
+        name but `x`, and `d#` as any run of `d`: `cat < ^x/f` read `d/f`, where `d` leads out,
+        and zsh 5.9 printed it. The target was measured as the path it spells, which no glob
+        character marked, and approved with no rule. It is left in place now, as a glob is."""
+        with a_project_below_home() as project:
+            outside = project.parent / "outside"
+            outside.mkdir()
+            (outside / "f").write_text("one\n")
+            (project / "d").symlink_to(outside)
+            for command in ("cat < README.md", "cat < '^x/f'", 'cat < "d#/f"'):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: quoted, it is the name it spells")
+            for command in ("cat < d/f", "cat < ^x/f", "wc -l < ^x/f", "cat < d#/f"):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "zsh reads d/f, which leads out")
+
     def test_a_read_from_a_directory_the_shell_supplies(self):
         """After `pushd "$d"` the shell can be anywhere, and so can every program after it,
         however the words it reads are spelled (#72). One `d=src` is the one value `d` holds."""
@@ -6814,6 +6831,97 @@ class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
             ):
                 with self.subTest(command=command):
                     self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
+
+    def test_an_operator_of_zshs_extended_glob(self):
+        """With `EXTENDED_GLOB`, which a startup file can set, zsh reads an unquoted `^x` as any
+        name but `x` and `x#` as any run of `x`: `cat g/^x/id_rsa` reads `g/k/id_rsa`. Neither
+        layer read a word with no `*`, `?` or `[` as a wildcard, and both approved it with no
+        rule. A word that spells one is matched now, in the path checks alone."""
+        with self._project() as (project, home):
+            (project / "g").mkdir()
+            (project / "g" / "k").symlink_to(home / ".ssh")
+            for command in (
+                "cat src/^x/x.txt",
+                "cat src/lib#/x.txt",
+                "cat 'g/^x/id_rsa'",
+                "echo a#b c^d e~f",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: matches no link out")
+            for command in ("cat g/^x/id_rsa", "cat g/k#/id_rsa", "cat src/^x/id_rsa"):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through a link")
+
+    def test_an_operator_of_zshs_extended_glob_in_a_loop(self):
+        """zsh binds `f=d/y` in `for f in d/^x`, but the list word was a literal value, so a
+        quoted `"$f"` read `d/^x/k/id_rsa` as a path in the project. It is a glob now, as `d/*`
+        is. Here `d/y/k -> ~/.ssh`."""
+        with self._project() as (project, home):
+            (project / "d").unlink()
+            (project / "d" / "y").mkdir(parents=True)
+            (project / "d" / "y" / "k").symlink_to(home / ".ssh")
+            for command in (
+                'for f in e/^x; do cat "$f"; done',
+                'for r in HEAD~1 HEAD~2; do echo "$r"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: matches no link out")
+            for command in (
+                'for f in d/^x; do cat "$f"/k/id_rsa; done',
+                'for f in d/y#; do cat "$f"/k/id_rsa; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "zsh binds d/y, and d/y/k is ~/.ssh")
+            # A name such a list gives is one the shell splits, as a `*` list's is
+            (project / "n").mkdir()
+            (project / "n" / "x ..").write_text("one\n")
+            self.assert_allowed(
+                'for f in n/^z; do grep -r one "$f"; done', "the control: quoted, it is the name"
+            )
+            self.assert_refused_outright(
+                "for f in n/^z; do grep -r one $f; done", "zsh with SH_WORD_SPLIT reads .."
+            )
+
+    def test_a_loop_over_revisions_zsh_alone_globs(self):
+        """The flag checks read `HEAD~1` and `HEAD^` as bash does, but a list word with one
+        dropped its name from the values they read, so `main`'s approvals of these were refused.
+        Each is read as bash reads it, and as zsh may, the text before the operator followed by
+        any other: no flag. A `#` lets the character before it match nothing, as zsh 5.9 matched
+        `a#-o` against a file `-o`, and `^x` matches any name."""
+        with self._project():
+            for command in (
+                "for r in HEAD~1 HEAD~2; do git diff $r..HEAD; done",
+                'for r in HEAD~1 HEAD~2; do git diff "$r..HEAD"; done',
+                "for r in HEAD~1 HEAD~2; do git show $r:README.md; done",
+                "for r in HEAD^ HEAD^^; do git show $r:README.md; done",
+                'for r in HEAD~1; do echo "$(git show $r:README.md)"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "no match of HEAD~1 or HEAD^ is a flag")
+            for command in (
+                "for r in a#-o; do git diff $r..HEAD; done",
+                "for r in ^x; do git diff $r..HEAD; done",
+                "for r in -x^y; do git diff $r..HEAD; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "a match can be a flag")
+
+    def test_a_value_that_spells_an_operator_of_zshs_extended_glob(self):
+        """A name assigned twice is one whose values the hook doesn't read, so the credential
+        check read the value `_wildcard_assignments` gave it, which held a `*`, `?` or `[` only:
+        under `Bash(cat *)`, `f=x; f='^x'; cat $f/id_rsa` was approved where `f='^x'` alone is
+        refused, and zsh 5.9 with `extendedglob` and `globsubst` read `k/id_rsa`. Such a value is
+        one now, and so is one past `MAX_SPELLINGS`."""
+        padding = " ".join(f"a{index}" for index in range(70))
+        with self._project(), operator_rules(allow=["Bash(cat *)"]):
+            self.assert_allowed("f=x; f='^k'; cat $f/lib/x.txt", "the control: no link out")
+            for command in (
+                "f=x; f='^x'; cat $f/id_rsa",
+                "f=x; f='k#'; cat $f/id_rsa",
+                f"for f in '^x' {padding}; do cat $f/id_rsa; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command, "the rule says yes, and zsh reads k/id_rsa")
 
     def test_an_assignment_that_holds_a_wildcard(self):
         """bash globs the value of an unquoted `$f`, so `f='k*'; cat $f/id_rsa` reads
