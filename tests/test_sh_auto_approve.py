@@ -6944,6 +6944,47 @@ class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
                     self.assert_refused_outright(command, "zsh's GLOB_SUBST reads ~ as home")
             self.assert_allowed('for f in *; do grep -r PRIVATE "$f"; done', "quoted, ~ is a name")
 
+    def test_a_loop_over_a_wildcard_from_the_root_or_home(self):
+        """A glob list that starts with `/` or `~` left its variable unread, so under
+        `Bash(cat *)`, `for f in <project>/d1*; do cat $f/k/id_rsa; done` was approved. It gives
+        the paths it matches now, as a relative one does. This widens: `main` left each control
+        to the rules. Here `h -> ~` and `d1/k -> ~/.ssh`."""
+        with self._project() as (project, home):
+            (project / "h").symlink_to(home)
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            for command in (
+                f"for f in {project}/s*; do cat $f/lib/x.txt; done",
+                "for f in ~/a/b/proj/s*; do cat $f/lib/x.txt; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "reads src/lib/x.txt")
+            self.assert_no_opinion("for f in ~/a/b/proj/h*; do grep -r PRIVATE $f; done", "reads ~")
+            # bash reads `~"/a"` as the literal `~/a`, a name zsh's `GLOB_SUBST` expands again
+            for command in (
+                'for f in ~"/a/b/proj/s"*; do cat $f/lib/x.txt; done',
+                "for f in '~'/a/b/proj/s*; do cat $f/lib/x.txt; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "a match that keeps a tilde")
+            for command in (
+                f"for f in {project}/d1*; do cat $f/k/id_rsa; done",
+                "for f in ~/a/b/proj/d1*; do cat $f/k/id_rsa; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through d1/k")
+            # A name such a list gives is one the shell splits, as a relative list's is
+            (project / "x k").write_text("one\n")
+            self.assert_allowed(
+                'for f in ~/a/b/proj/x*; do cat "$f"; done', "the control: reads x k whole"
+            )
+            for command in (
+                f"for f in {project}/x*; do cat $f/id_rsa; done",
+                "for f in ~/a/b/proj/x*; do cat $f/id_rsa; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "bash splits x k, and k is ~/.ssh")
+
     def test_a_word_spelled_around_two_values_this_module_didnt_read(self):
         """`PICKED` shared its byte with `UNREAD_VALUE`, so `${a}picked$b` read as the mark, and
         Layer B took both values out with it, to read `/.ssh/id_rsa` alone. bash splits the first

@@ -1708,14 +1708,18 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
     if _carries_live_glob(token) or zsh:
         head = PATH_SPECIAL.split(expanded, 1)[0]
         directory = head.rpartition("/")[0]
-        if (
-            _glob_may_climb(expanded)
-            or expanded.startswith(("/", "~"))
-            or ".." in (expanded if zsh else directory).split("/")
+        if _glob_may_climb(expanded) or ".." in (expanded if zsh else directory).split("/"):
+            return None
+        # The pattern in which a quote's glob characters are literal, `_glob_word`, at each
+        # reading of its tildes, `_tilde_readings`; one that starts at `/` is matched from there.
+        # One that keeps a tilde, as bash reads `~"/k"*`, matches names that keep it: none to
+        # read, `LITERAL_TILDE`
+        patterns = _tilde_readings(token, parts, marked=True)
+        if any(
+            UNREAD_VALUE in pattern or LITERAL_TILDE.search(_plain(pattern)) for pattern in patterns
         ):
             return None
-        # The pattern in which a quote's glob characters are literal: `_glob_word`
-        return [PICKED + _glob_word(token, parts)]
+        return [PICKED + pattern for pattern in patterns]
     # Quoted, the word is a literal here, but bash globs it again where an unquoted `$f` uses
     # it: `for f in '.?'; do grep -r x $f; done` reads `..` in a bash older than 5.2. Placed as
     # the literal it spells, such a value would be measured below the directory it climbs from.
@@ -7188,7 +7192,10 @@ def _refuse_picks_the_shell_splits(
                         unquoted = _names_used_unquoted(segments, parts)
                     if not unquoted.intersection(bound):
                         continue
-                    names += _names_a_pattern_gives(_glob_word(word, parts), bases)
+                    # Each pattern the read scope reads it as, its tildes expanded: a list that
+                    # starts with `~` gives the paths below the home directory
+                    for pattern in _tilde_readings(word, parts, marked=True):
+                        names += _names_a_pattern_gives(pattern, bases)
                 for entry in names:
                     if SPLIT_OR_GLOBBED & set(entry):
                         raise NotReadOnly(
