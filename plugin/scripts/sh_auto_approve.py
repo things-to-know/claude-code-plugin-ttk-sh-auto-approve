@@ -1708,14 +1708,18 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
     if _carries_live_glob(token) or zsh:
         head = PATH_SPECIAL.split(expanded, 1)[0]
         directory = head.rpartition("/")[0]
-        if (
-            _glob_may_climb(expanded)
-            or expanded.startswith(("/", "~"))
-            or ".." in (expanded if zsh else directory).split("/")
+        if _glob_may_climb(expanded) or ".." in (expanded if zsh else directory).split("/"):
+            return None
+        # The pattern in which a quote's glob characters are literal, `_glob_word`, at each
+        # reading of its tildes, `_tilde_readings`; one that starts at `/` is matched from there.
+        # One that keeps a tilde, as bash reads `~"/k"*`, matches names that keep it: none to
+        # read, `LITERAL_TILDE`
+        patterns = _tilde_readings(token, parts, marked=True)
+        if any(
+            UNREAD_VALUE in pattern or LITERAL_TILDE.search(_plain(pattern)) for pattern in patterns
         ):
             return None
-        # The pattern in which a quote's glob characters are literal: `_glob_word`
-        return [PICKED + _glob_word(token, parts)]
+        return [PICKED + pattern for pattern in patterns]
     # Quoted, the word is a literal here, but bash globs it again where an unquoted `$f` uses
     # it: `for f in '.?'; do grep -r x $f; done` reads `..` in a bash older than 5.2. Placed as
     # the literal it spells, such a value would be measured below the directory it climbs from.
@@ -6705,11 +6709,12 @@ class _ShellState:
     may not wait for it, which ``curl`` reads: it runs a job behind `&`, or sits in a process
     substitution or in a command that does. A substitution's body runs in the shell around it,
     so it is read against that one's. ``picked`` holds the `PICKED` values of each name a `for`
-    list of this command's own binds to the paths a glob or `$(ls)` gives, `_picked_values`,
-    which ``values`` holds as unread: only the credential check reads them. ``globbed`` holds
-    the value of each assignment that holds a wildcard, `_wildcard_assignments`, and the
-    `PICKED` values of each loop wherever its header stands, `_wildcard_loop_values`, this
-    command's and those around it, which only the credential check reads, `_credential_values`.
+    list binds to the paths a glob or `$(ls)` gives, `_picked_values`, this command's and those
+    of the command around it for a name this one doesn't bind, which ``values`` holds as unread:
+    only the path checks read them. ``globbed`` holds the value of each assignment that holds a
+    wildcard, `_wildcard_assignments`, and the `PICKED` values of each loop wherever its header
+    stands, `_wildcard_loop_values`, this command's and those around it, which only the
+    credential check reads, `_credential_values`.
     """
 
     __slots__ = (
@@ -7269,7 +7274,10 @@ def _refuse_picks_the_shell_splits(
                         unquoted = _names_used_unquoted(segments, parts)
                     if not unquoted.intersection(bound):
                         continue
-                    names += _names_a_pattern_gives(_glob_word(word, parts), bases)
+                    # Each pattern the read scope reads it as, its tildes expanded: a list that
+                    # starts with `~` gives the paths below the home directory
+                    for pattern in _tilde_readings(word, parts, marked=True):
+                        names += _names_a_pattern_gives(pattern, bases)
                 for entry in names:
                     if SPLIT_OR_GLOBBED & set(entry):
                         raise NotReadOnly(
@@ -9363,8 +9371,14 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # a value no header spells.
     safe_names = _safe_loop_names(segments, parts, bindings, known_values) - unsettled
 
-    # The paths a glob or `$(ls)` list of this command's own gives a name
-    picked = _picked_values(loop_values)
+    # The paths a glob or `$(ls)` list gives a name, its own, and those of the command around it
+    # for a name this one doesn't bind: that one counts a use in a body, so each is settled there
+    picked = {
+        name: values
+        for name, values in (inherited.picked if inherited else {}).items()
+        if name not in own_bindings
+    }
+    picked.update(_picked_values(loop_values))
     # Where a relative word may be resolved from, worked out once for the credential check, the
     # read scope and each substitution's body. A name such a list binds is unread there, though
     # the flag checks read a word zsh alone globs as bash does, `_loop_flag_values`: zsh's `cd $d`
@@ -9409,7 +9423,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         roots=roots,
         bases=state.bases,
         splice_vars=splice_vars,
-        loop_values=loop_values,
+        loop_values={**picked, **loop_values},
         spells_escape=bool(TERMINAL_CONTROL_SPELLED.search(command)),
         settings=settings,
         backgrounds=backgrounds,
@@ -9430,6 +9444,7 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
         bindings,
         backgrounds=True,
         run_bases=run_bases,
+        picked=picked,
         globbed=globbed,
     )
     for kind, value in parts:

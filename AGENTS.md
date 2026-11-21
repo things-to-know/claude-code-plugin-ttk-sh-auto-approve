@@ -68,7 +68,7 @@ insists on its own filename, symlink to this file rather than copying it.
     - So is a wildcard an unquoted expansion puts in a word from a value the hook reads, as `$f`
       after `for f in 'k*'` (`_globbed`)
     - So is a variable a `for` list binds to a wildcard's matches or to a `$(ls)`, read as each
-      path the list can give it (`PICKED`)
+      path the list can give it (`PICKED`), in a substitution's body too
       - And each path a word glues to an option, as in `--file=$f/k/id_rsa` (`_glued_pieces`)
       - And a name an operation reads, as in `${f%/}` or `${f:-x}`, which can leave the value as
         it is (`_operand_name`)
