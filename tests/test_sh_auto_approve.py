@@ -5002,6 +5002,19 @@ class RefusesReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_refused(command)
 
+    def test_a_dot_and_a_bracket_expression(self):
+        """A `[` that no `]` closes is the character it is, so `.[x*` can't match `..`; a set is
+        one character that may be `.`, and a collating element `[...]` is one member, so
+        `.[[...]]` matches `..` in a bash with `globskipdots` off. A second `_bracket_end`, which
+        reads neither so, had replaced the one `_may_match_dot_dot` was written against: the hook
+        raised `TypeError` on `.[x*` and approved `grep -r x .[[...]]` (#123)."""
+        for command in ("cat .[x*", "ls .[x*", "echo .[x#", "cat .[x~y"):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "the control: an unclosed [ is a [")
+        for command in ("grep -r x .[[...]]", "cat .[x]*", "grep -r x .[x*/.."):
+            with self.subTest(command=command):
+                self.assert_refused(command, "may read ..")
+
     def test_a_nul_byte_is_refused_rather_than_crashing(self):
         """Bash ends a string at a NUL, so the hook and bash would read different commands."""
         self.assert_refused("cat AGENTS.md\x00 ~/.aws/credentials", "bash truncates here")

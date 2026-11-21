@@ -1519,7 +1519,7 @@ def _may_match_dot_dot(component: str) -> bool:
     index = 0
     while index < len(rest) and positions:
         char = rest[index]
-        close = _bracket_end(rest, index) if char == "[" else -1
+        close = _set_end(rest, index) if char == "[" else -1
         if char == "*":
             positions = {0, 1} if 0 in positions else positions
         elif char == "?" or close >= 0:
@@ -1531,11 +1531,14 @@ def _may_match_dot_dot(component: str) -> bool:
     return 1 in positions
 
 
-def _bracket_end(text: str, start: int) -> int:
+def _set_end(text: str, start: int) -> int:
     """The index of the `]` that closes the bracket expression at `start`, or -1.
 
     A `]` first in the set, after any `!` or `^`, is a member, and `[:punct:]`, `[=a=]` and
-    `[.a.]` inside it are one member each, whose own `]` closes nothing.
+    `[.a.]` inside it are one member each, whose own `]` closes nothing: `.[[...]]` matches `..`.
+    `_may_match_dot_dot` reads with it. `_bracket_end`, the walk's, reads `[.a.]` as it does a
+    `[` and returns None for an unclosed set: under one name, the later definition replaced the
+    earlier, and `_may_match_dot_dot` raised `TypeError` on `.[x*` (#123).
     """
     index = start + 1
     if text[index : index + 1] in ("!", "^"):
