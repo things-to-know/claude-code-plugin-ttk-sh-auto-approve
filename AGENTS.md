@@ -60,6 +60,62 @@ insists on its own filename, symlink to this file rather than copying it.
     - An operand below a value the hook didn't read isn't walked: the residual of `grep -r x "$d"`
     - A wildcard operand is matched every way a startup file can make the shell read it
       (`_glob_matches`); one it can't bound, such as `**`, is walked from its literal directory
+  - A wildcard the shell expands reads what it matches, which can be a link out, as `k*` is
+    with `k -> ~/.ssh`
+    - Both layers read each path it may match, `_glob_matches`' way, as a literal path is read,
+      through its links (`_wildcard_reach`)
+      - One in a credential store is refused outright
+    - So is a wildcard an unquoted expansion puts in a word from a value the hook reads, as `$f`
+      after `for f in 'k*'` (`_globbed`)
+    - So is a variable a `for` list binds to a wildcard's matches or to a `$(ls)`, read as each
+      path the list can give it (`PICKED`), in a substitution's body too
+      - And each path a word glues to an option, as in `--file=$f/k/id_rsa` (`_glued_pieces`)
+      - And a name an operation reads, as in `${f%/}` or `${f:-x}`, which can leave the value as
+        it is (`_operand_name`)
+        - A trim that changes the name, as `${f%1}` makes `d1` into `d`, is the residual of a
+          value the hook doesn't read, as for any other variable (#172)
+      - A name with a wildcard among its values, past `MAX_SPELLINGS` spellings of a word,
+        refuses the word outright (`_refuse_unread_picks`)
+        - At a cost: `for f in s* a0 ... a69; do echo $f; done` is refused
+      - The credential check reads each list wherever its header stands, however often the
+        name is bound, as for an assignment below (`_wildcard_loop_values`)
+    - So is a wildcard in front of a value the hook didn't read, as in `d1*/k/$g`, where a match
+      leads into a store or to a directory that holds one
+    - An assignment's value that holds a wildcard, as in `f='k*'`, only the credential check
+      reads (`_wildcard_assignments`)
+      - The read scope and the flag check read `$f` as unread
+      - Wherever the structure puts it, as after `do` or `!`
+      - An append, `f+='k*'`, as the text it adds
+        - The value it adds to is one the hook doesn't read, as in `f=d; f+='1*/k'`
+      - A copy, `g=$f`, is a value the hook doesn't read
+        - The residual of `cat $g/id_rsa` under `Bash(cat *)`
+    - And a word that spells an operator of zsh's `EXTENDED_GLOB` unquoted, `^`, `#` or a `~`
+      after its start (`ZSH_GLOB_OPERATOR`), for the path checks alone
+      - And a value that spells one, as `f=x; f='^x'` assigns, which `GLOB_SUBST` matches where
+        `$f` is unquoted (`_wildcard_value`)
+      - The flag checks read `HEAD~1` as bash does, and as zsh may, the text in front of the
+        operator followed by any other (`_zsh_glob_prefix`)
+        - So a loop over `HEAD~1` gives no flag
+        - A loop over `^x` or `a#-o`, which zsh 5.9 matched against a file `-o`, gives one, as in
+          `git diff $r..HEAD`
+        - Not where a quoted `"$r"` is the whole word, which the flag check exempts
+          (`_safe_loop_names`): the residual #147 tracks
+    - One it can't bound, `**` or a group, reaches each link below its literal directory, walked
+      as for a reader that follows links (`GLOB_AT_ANY_DEPTH`)
+      - zsh's `***` matches through a link
+      - bash's `**` with `globstar`, and zsh's `**` and `(*/)#`, match a link by its name but
+        nothing below it
+        - A reader that follows links still reads below it
+      - Each is read as `***`
+        - At a cost: `grep -r PRIVATE **/d1` is refused where a link below the literal
+          directory leads to a store
+    - An operator that matches within one component, such as `[^.]` or zsh's `^x`, is matched
+      there
+    - A glob character a quote holds is the character it is (`_glob_word`)
+    - Past `MAX_WALKED_ENTRIES` matches, or entries walked, the command is refused outright, under
+      any rule, in any program
+    - Each match costs a resolution in each layer, in time linear in each name it compares
+      (`_ComponentPattern`)
   - One approval makes a network call: a `curl` GET of one URL on a listed site
     - What leaves the machine is a URL Claude wrote, which a poisoned context can put a secret in
       - So the request goes to an exact listed host, with no userinfo, redirect, proxy or
