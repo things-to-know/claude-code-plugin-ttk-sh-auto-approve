@@ -1528,14 +1528,35 @@ def _has_bare_variable(token: str, parts: list[tuple[str, str]]) -> bool:
     )
 
 
-# Stands for one directory entry's name: no `/`, never `.` or `..`. Only the read scope
-# uses it, to say "some file inside this directory"; it never exempts a word from the flag
-# check, because a directory can hold a file called `-rf`.
-PATH_COMPONENT = "\x02entry\x02"
+# Marks a value the shell picks by matching the pattern after it against the directory: each path
+# a `for` list's wildcard matches, as `src/*` does, and each name a `$(ls)` lists, which `*` stands
+# for wherever the word is used, as no `.` or `..`. The word it ends up in is read as each path
+# that pattern matches (`_unpicked`), by both layers and the walk of a reader that follows links;
+# it never exempts a word from the flag check, because a directory can hold a file called `-rf`.
+# A byte of its own, which a command can't hold (`_classify_with`): `UNREAD_VALUE`, `\x02`, is
+# text a word can spell around, as `${a}x$b` is `\x02x\x02`.
+PICKED = "\x04"
 
-# A command substitution whose output is bare directory-entry names: `ls`, or `ls` with
-# relative directory operands and only the flags that change layout, never `-a`.
-LISTING_BODY = re.compile(r"^\s*ls(?:\s+-1)?(?:\s+[A-Za-z0-9_./-]+)*\s*$")
+
+def _unpicked(spelled: str) -> tuple[str, bool]:
+    """``spelled`` without its `PICKED` marks, and whether it had one: then the shell matches it."""
+    return spelled.replace(PICKED, ""), PICKED in spelled
+
+
+def _picked_values(loop_values: dict[str, list[str]]) -> dict[str, list[str]]:
+    """The names in ``loop_values`` whose values the shell picks, `PICKED`, with those values."""
+    return {
+        name: values
+        for name, values in loop_values.items()
+        if any(PICKED in value for value in values)
+    }
+
+
+# A command substitution whose output is bare directory-entry names: `ls` or `ls -1`, with at most
+# one operand, `.group(1)`. Any other flag prints something else: `-a` prints `..`, `-l`
+# a link's target, and `-d` the operand; and with two operands, `ls` prints a header for each. An
+# operand that is no directory prints itself, which `_loop_value_shapes` reads too.
+LISTING_BODY = re.compile(r"^\s*ls(?:\s+-1)?(?:\s+(?!-)([A-Za-z0-9_./-]+))?\s*$")
 
 
 def _glob_may_climb(path: str, *, dot_components: bool = True) -> bool:
@@ -1614,17 +1635,19 @@ def _set_end(text: str, start: int) -> int:
 def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | None:
     """What one `for`-list word contributes to the variable, for the read scope.
 
-    A literal word is itself. An unquoted glob is a name inside its literal directory. A
-    `$(ls ...)` is a bare name. Anything else -- a substitution with another body, a
-    parameter expansion, a glob that could match `.` or `..` -- is None: unresolvable.
+    A literal word is itself. An unquoted glob is each path it matches, and a `$(ls ...)` each
+    name it lists: `PICKED`, with the pattern, and `*` for the listing, with its operand too,
+    which `ls` prints where it is no directory. Anything else -- a substitution with another body,
+    a parameter expansion, a glob that could match `.` or `..` -- is None: unresolvable.
     """
     expanded = _expand(token, parts)
     whole = PLACEHOLDER.fullmatch(token)
     if whole is not None and parts[int(whole.group(1))][0] == SUBSTITUTION:
         body = parts[int(whole.group(1))][1]
-        if LISTING_BODY.match(body) and not re.search(r"\s-[A-Za-z]*a", body) and ".." not in body:
-            return [PATH_COMPONENT]
-        return None
+        listing = LISTING_BODY.match(body)
+        if listing is None or ".." in body:
+            return None
+        return [PICKED + "*"] + ([listing.group(1)] if listing.group(1) else [])
     if _carries_substitution(token, parts) or _has_bare_variable(token, parts):
         return None
     if _carries_brace_expansion(token):
@@ -1638,7 +1661,8 @@ def _loop_value_shapes(token: str, parts: list[tuple[str, str]]) -> list[str] | 
             or ".." in directory.split("/")
         ):
             return None
-        return [f"{directory}/{PATH_COMPONENT}" if directory else PATH_COMPONENT]
+        # The pattern in which a quote's glob characters are literal: `_glob_word`
+        return [PICKED + _glob_word(token, parts)]
     # Quoted, the word is a literal here, but bash globs it again where an unquoted `$f` uses
     # it: `for f in '.?'; do grep -r x $f; done` reads `..` in a bash older than 5.2. Placed as
     # the literal it spells, such a value would be measured below the directory it climbs from.
@@ -1809,8 +1833,8 @@ def _literal_loop_values(
 ) -> dict[str, list[str]]:
     """The values each `for` variable can take, for resolving it inside a path.
 
-    Wider than `_safe_loop_names`: a glob or `$(ls)` list resolves here, so `"$f"` can be
-    placed inside a directory, but it is never a reason to exempt `"$f"` from the flag check.
+    Wider than `_safe_loop_names`: a glob or `$(ls)` list resolves here, to each path it can
+    give `"$f"`, `PICKED`, but it is never a reason to exempt `"$f"` from the flag check.
     A name is left out unless the loop is the one binding of it that `_bindings` counts, and
     its list is resolvable: `for p in .; do p=~; ...` reads `~`.
     """
@@ -2176,15 +2200,16 @@ def _known_values(
 
     A name's values are known where its one binding is one this module read as literal: an
     assignment that `_literal_assignments` accepted, or a `for` header that
-    `_literal_loop_values` resolved to no `PATH_COMPONENT`. Each of those holds only a name that
+    `_literal_loop_values` resolved to no `PICKED` value. Each of those holds only a name that
     `_bindings` counts once, so the binding it read is the name's only one. The value is the
     one bash stores, before any split: `q=' -o'` holds ` -o`, which `splice_vars` keeps as the
     one word `-o`.
 
     Any other name ``bindings`` holds is unread: one bound twice, by an append, after `do`,
     `then` or `{`, by a header inside a loop's body or one that binds the name second, by a
-    builtin, or by a glob list, which a planted file name decides. `$_` is always unread: each
-    command sets it to its last word.
+    builtin, or by a glob or `$(ls)` list, which a planted file name decides, and which only the
+    path checks read, as its `PICKED` values. `$_` is always unread: each command sets it to its
+    last word.
 
     A name this command never binds is left out: the residual `_word_the_shell_decides`
     documents.
@@ -2196,7 +2221,7 @@ def _known_values(
     for segment in segments:
         if len(segment) >= 3 and segment[0] in WORD_LIST_HEADS and segment[2] == "in":
             name = _expand(segment[1], parts)
-            if name in loop_values and not any(PATH_COMPONENT in v for v in loop_values[name]):
+            if name in loop_values and name not in _picked_values(loop_values):
                 values[name] = loop_values[name]
             continue
         for word in segment:
@@ -4895,7 +4920,8 @@ def _check_command(
         _check_read_scope(program, _file_operands(program, args), args, arg_tokens, parts, scope)
     # And for a link it follows while it recurses, wherever the link is (#63)
     if program in LINK_FOLLOWERS:
-        links = _followed_links(program, args, arg_tokens, parts, scope.bases, known_values)
+        values = {**known_values, **_picked_values(scope.loop_values)}
+        links = _followed_links(program, args, arg_tokens, parts, scope.bases, values)
         # The link by its own path, which `_in_scope` resolves as the scratchpad is resolved:
         # its target alone is out of a scratchpad whose path goes through a link, as on macOS
         for link, _ in links:
@@ -6443,7 +6469,12 @@ MAX_SPELLINGS = 64
 
 
 def _spellings(
-    word: str, values: dict[str, list[str] | None], bases: list[str], *, before: bool = True
+    word: str,
+    values: dict[str, list[str] | None],
+    bases: list[str],
+    *,
+    before: bool = True,
+    picks: bool = False,
 ) -> list[str]:
     """The texts this word can be, for the credential check.
 
@@ -6454,6 +6485,14 @@ def _spellings(
 
     Without ``before``, a variable `_known_values` read values for is those values alone, as
     the read scope resolves it, `_resolve_variables`, and as `_check_cd` reads a `cd $d`.
+
+    With ``picks``, for Layer B, a name still in the word past `MAX_SPELLINGS` refuses it
+    outright where one of its values is a wildcard: `_refuse_unread_picks`.
+
+    An operation on a name, as `${f%/}`, `${f#./}` or `${f:-x}`, is a value this module didn't
+    read, and each of the name's values that is a wildcard or `PICKED` too, which it can leave as
+    it is: under `Bash(cat *)`, `for f in d1*; do cat "${f%/}/k/id_rsa"; done` read
+    `d1/k/id_rsa`, with `d1/k -> ~/.ssh`, where the loop's `$f` is refused.
     """
     texts = [word.replace(SUBSTITUTION_MARKER, UNREAD_VALUE)]
     for _ in range(8):
@@ -6472,12 +6511,54 @@ def _spellings(
                 known = values.get(name) or []
                 choices = [*known, UNREAD_VALUE] if before or not known else known
             else:
-                choices = [UNREAD_VALUE]
+                operand = _operand_name(match)
+                matched = [value for value in values.get(operand) or [] if _wildcard_value(value)]
+                choices = [*matched, UNREAD_VALUE]
             expanded += [text[: match.start()] + choice + text[match.end() :] for choice in choices]
         if len(expanded) > MAX_SPELLINGS or expanded == texts:
             break
         texts = expanded
+    if picks:
+        _refuse_unread_picks(texts, values)
     return list(dict.fromkeys(TEXT_EXPANSION.sub(UNREAD_VALUE, text) for text in texts))
+
+
+def _refuse_unread_picks(texts: list[str], values: dict[str, list[str] | None]) -> None:
+    """Refuse outright where a name `_spellings` leaves in ``texts`` has a wildcard for a value.
+
+    Such a name is read as a value this module didn't read, and a path below one is the residual
+    `_below_an_unread_value` leaves to the rules. So padding a `for` list past `MAX_SPELLINGS`
+    turned its `PICKED` values back into it: under `Bash(cat *)`, `for f in d1* a0 ... a69; do
+    cat $f/k/id_rsa; done` read `d1/k/id_rsa`, with `d1/k -> ~/.ssh`, where the loop over `d1*`
+    alone is refused. A wildcard the shell matches where an unquoted `$f` uses it, as an
+    assignment's `f='k*'`, is one too. A word that reads no store is refused with them, at a
+    cost: `for f in s* a0 ... a69; do echo $f; done`. A name an operation reads, as in `${f%/}`,
+    is one too.
+    """
+    for text in texts:
+        for match in TEXT_EXPANSION.finditer(text):
+            name = match.group(1) or match.group(2) or _operand_name(match)
+            if any(_wildcard_value(value) for value in values.get(name) or []):
+                raise NotReadOnly(f"more spellings than this module reads, of a wildcard: ${name}")
+
+
+# The name a parameter expansion's operation reads, at the start of its braces: `f` in `${f%/}`
+OPERAND_NAME = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _operand_name(match: re.Match[str]) -> str | None:
+    """The name the operation a `TEXT_EXPANSION` match spells reads, as `f` in `${f%/}`, if any.
+
+    None for a form that reads no name's value as it is, as `${#f}` and `${!f}` do, and for any
+    other `$` form.
+    """
+    found = OPERAND_NAME.match(match.group(3) or "")
+    return found.group(1) if found else None
+
+
+def _wildcard_value(value: str) -> bool:
+    """Whether the shell may match ``value`` against the directory: `PICKED`, or a wildcard."""
+    return PICKED in value or _has_wildcard(value)
 
 
 class _ShellState:
@@ -6490,10 +6571,20 @@ class _ShellState:
     `_bindings`, with the bindings of the commands around it; ``backgrounds`` whether the shell
     may not wait for it, which ``curl`` reads: it runs a job behind `&`, or sits in a process
     substitution or in a command that does. A substitution's body runs in the shell around it,
-    so it is read against that one's.
+    so it is read against that one's. ``picked`` holds the `PICKED` values of each name a `for`
+    list of this command's own binds to the paths a glob or `$(ls)` gives, `_picked_values`,
+    which ``values`` holds as unread: only the credential check reads them.
     """
 
-    __slots__ = ("backgrounds", "bases", "bindings", "run_bases", "shell_bases", "values")
+    __slots__ = (
+        "backgrounds",
+        "bases",
+        "bindings",
+        "picked",
+        "run_bases",
+        "shell_bases",
+        "values",
+    )
 
     def __init__(
         self,
@@ -6504,6 +6595,7 @@ class _ShellState:
         *,
         run_bases: list[str],
         backgrounds: bool = False,
+        picked: dict[str, list[str]] | None = None,
     ) -> None:
         self.bases = bases
         self.shell_bases = shell_bases
@@ -6511,6 +6603,7 @@ class _ShellState:
         self.values = values
         self.bindings = bindings
         self.backgrounds = backgrounds
+        self.picked = picked or {}
 
 
 def _working_directories(
@@ -6742,10 +6835,13 @@ def _refuse_credential_paths(
             readings = [(_glob_word(token, parts), target.startswith("~") or bool(prefix))] + [
                 (prefix + reading, False) for reading in _tilde_readings(target, parts, marked=True)
             ]
+            # A name a glob or `$(ls)` list binds is each path it gives, and as unread too
+            values = {**state.values, **state.picked}
             for reading, tilde in readings:
-                for marked in _spellings(reading, state.values, state.shell_bases):
-                    spelled = _plain(marked)
-                    globbed = _globbed(token, spelled)
+                for marked in _spellings(reading, values, state.shell_bases, picks=True):
+                    pattern, picked = _unpicked(marked)
+                    spelled = _plain(pattern)
+                    globbed = picked or _globbed(token, spelled)
                     if _names_a_credential(spelled, tilde=tilde, bases=bases, live_glob=globbed):
                         raise NotReadOnly(f"names a credential store: {word}")
                     # And a path glued to an option or after an `@`, which no word spells alone
@@ -6753,7 +6849,28 @@ def _refuse_credential_paths(
                         if _names_a_credential(glued, tilde=False, bases=bases, live_glob=globbed):
                             raise NotReadOnly(f"names a credential store: {word}")
                     if globbed:
-                        _refuse_wildcard_credentials(marked, tilde=tilde, bases=bases)
+                        _refuse_wildcard_credentials(pattern, tilde=tilde, bases=bases)
+                    # A list's `PICKED` value is a path the shell matched there, which it glues
+                    # whole where the word puts it: `--file=$f/k/id_rsa` is `--file=d1/k/id_rsa`,
+                    # though no name starts with `--file=`
+                    if picked:
+                        for piece, piece_tilde in _glued_pieces(pattern):
+                            _refuse_wildcard_credentials(piece, tilde=piece_tilde, bases=bases)
+
+
+def _glued_pieces(pattern: str) -> list[tuple[str, bool]]:
+    """Each path ``pattern``, a word `_glob_word` built, glues to an option, and its tilde reading.
+
+    `_glued_paths`', and the text after an `=`, read with its tilde and without, as
+    `_names_a_credential` reads `--file=y`. A quote's `GLOB_LITERAL` marks stand only in front of
+    `GLOB_CHARACTERS`, which end a short-option cluster, so the pieces start where the word's do.
+    """
+    text = REDIRECTION_PREFIX.sub("", pattern)
+    pieces = [(piece, False) for piece in _glued_paths(text)]
+    if "=" in text and not text.startswith(("/", "~", "$", UNREAD_VALUE)):
+        value = text.split("=", 1)[1]
+        pieces += [(value, True), (value, False)]
+    return pieces
 
 
 # The letters and digits of a short-option cluster that starts a word, as `-hf` in `-hf/x`
@@ -7115,9 +7232,11 @@ def _reading_scope_problem(text: str, path: str, scope: _ReadScope, *, token: st
     candidates = _resolve_variables(text, scope)
     if candidates is None:
         return "a path this module cannot resolve"
-    for spelled in candidates:
+    for marked in candidates:
+        # A value a glob or `$(ls)` list gave is matched, quoted or not, as the paths it can be
+        spelled, picked = _unpicked(marked)
         candidate = _expand_home(_plain(spelled), tilde=False)
-        if _globbed(token, candidate):
+        if picked or _globbed(token, candidate):
             if _glob_may_climb(candidate):
                 return f"a glob that may climb out of its directory: {candidate}"
             # Each path it matches, through its links, as a literal path is measured (#54)
@@ -7665,10 +7784,11 @@ def _followed_links(
 
     Each place it leads to is one of its `_resolutions`, and the links the command makes count,
     `_PLANNED_LINKS`. An operand is each of its `_spellings`, with ``values`` as `_known_values`
-    reads them, and a wildcard the shell expands is each name it matches. An operand, or a
-    working directory, below a value this module didn't read is the residual a recursive read of
-    it is, as `grep -r x "$d"`: not walked. Raises `NotReadOnly` for operands that come from
-    elsewhere, as `xargs grep -R x` takes them, and for a walk past `MAX_WALKED_ENTRIES`.
+    reads them and the `PICKED` ones a glob or `$(ls)` list gives, and a wildcard the shell
+    expands is each name it matches. An operand, or a working directory, below a value this
+    module didn't read is the residual a recursive read of it is, as `grep -r x "$d"`: not
+    walked. Raises `NotReadOnly` for operands that come from elsewhere, as `xargs grep -R x`
+    takes them, and for a walk past `MAX_WALKED_ENTRIES`.
 
     The walk reads every entry, ignore files or not, and follows each link into where it leads
     as the reader does, so a link in a directory outside the project is found too.
@@ -7688,15 +7808,15 @@ def _followed_links(
         # Each reading of the word's tildes, `_tilde_readings`, is a directory it may name, as a
         # pattern in which a quote's glob characters are literal. A wildcard is matched once the
         # shell has put each value in place: `d=a/b; ... "$d"/*`, and so is one a value puts
-        # there, where the shell globs it: `_globbed`
+        # there, where the shell globs it, `_globbed`, and one a glob or `$(ls)` list gave, `PICKED`
         patterns = [
-            pattern
+            _unpicked(marked)
             for reading in _tilde_readings(token, parts, marked=True)
-            for pattern in _spellings(reading, values, bases, before=False)
+            for marked in _spellings(reading, values, bases, before=False, picks=True)
         ]
-        for pattern in patterns:
+        for pattern, picked in patterns:
             spelled = _plain(pattern)
-            if not _globbed(token, spelled):
+            if not (picked or _globbed(token, spelled)):
                 directories.append(spelled)
                 continue
             if UNREAD_VALUE in spelled:
@@ -8269,7 +8389,7 @@ def _refuse_followed_credential_links(
                 tokens[index + 1 :],
                 parts,
                 state.shell_bases,
-                state.values,
+                {**state.values, **state.picked},
                 operands_elsewhere=elsewhere,
             )
             for link, target in links:
@@ -8736,9 +8856,9 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
 
     # Bash ends a string at a NUL byte, so a command containing one is a different command
     # to bash than to this module; and no path containing one can be resolved to check it.
-    # `UNREAD_VALUE` and `GLOB_LITERAL` have to be unforgeable for the words read with them to mean
-    # anything.
-    if any(byte in command for byte in ("\x00", UNREAD_VALUE, GLOB_LITERAL)):
+    # `UNREAD_VALUE`, `PICKED` and `GLOB_LITERAL` have to be unforgeable for the words read with
+    # them to mean anything.
+    if any(byte in command for byte in ("\x00", UNREAD_VALUE, PICKED, GLOB_LITERAL)):
         raise NotReadOnly("NUL or reserved control byte in command")
 
     # See `TERMINAL_CONTROL_BYTE`; the spelled forms are read in `_check_command`.
@@ -8890,7 +9010,13 @@ def _classify_with(command: str, depth: int, inherited: _ShellState | None) -> N
     # read scope and each substitution's body
     bases, shell_bases, run_bases = _working_directories(segments, parts, inherited, known_values)
     state = _ShellState(
-        bases, shell_bases, known_values, bindings, backgrounds=backgrounds, run_bases=run_bases
+        bases,
+        shell_bases,
+        known_values,
+        bindings,
+        backgrounds=backgrounds,
+        run_bases=run_bases,
+        picked=_picked_values(loop_values),
     )
 
     # The links an `ln` here makes, which every path below is resolved through as if they were

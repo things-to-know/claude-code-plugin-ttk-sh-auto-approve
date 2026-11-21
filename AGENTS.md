@@ -67,6 +67,16 @@ insists on its own filename, symlink to this file rather than copying it.
       - One in a credential store is refused outright
     - So is a wildcard an unquoted expansion puts in a word from a value the hook reads, as `$f`
       after `for f in 'k*'` (`_globbed`)
+    - So is a variable a `for` list binds to a wildcard's matches or to a `$(ls)`, read as each
+      path the list can give it (`PICKED`)
+      - And each path a word glues to an option, as in `--file=$f/k/id_rsa` (`_glued_pieces`)
+      - And a name an operation reads, as in `${f%/}` or `${f:-x}`, which can leave the value as
+        it is (`_operand_name`)
+        - A trim that changes the name, as `${f%1}` makes `d1` into `d`, is the residual of a
+          value the hook doesn't read, as for any other variable (#172)
+      - A name with a wildcard among its values, past `MAX_SPELLINGS` spellings of a word,
+        refuses the word outright (`_refuse_unread_picks`)
+        - At a cost: `for f in s* a0 ... a69; do echo $f; done` is refused
     - So is a wildcard in front of a value the hook didn't read, as in `d1*/k/$g`, where a match
       leads into a store or to a directory that holds one
     - One it can't bound, `**` or a group, reaches each link below its literal directory, walked

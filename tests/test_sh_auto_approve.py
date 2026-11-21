@@ -6627,6 +6627,161 @@ class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
             self.assert_no_opinion("for f in 'd*'; do cat $f/f; done", "d/f leads out")
             self.assert_refused_outright("for f in 'k*'; do grep -R PRIVATE $f; done")
 
+    def test_a_loop_list_past_the_spellings_read(self):
+        """The credential check reads a word as at most `MAX_SPELLINGS` spellings, and a name
+        still in it past them as a value it didn't read, below which a path is left to the rules.
+        So a list padded with literal words was read as no list: under `Bash(cat *)`, `for f in
+        d1* a0 ... a69; do cat $f/k/id_rsa; done` was approved, and bash 5.2 and zsh 5.9 read
+        `d1/k/id_rsa`. A name with a wildcard among its values refuses such a word outright now,
+        one that reads no store too, at a cost."""
+        padding = " ".join(f"a{index}" for index in range(70))
+        with self._project() as (project, home):
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            with operator_rules(allow=["Bash(cat *)", "Bash(echo *)", "Bash(grep *)"]):
+                self.assert_allowed(
+                    f"for f in {padding}; do cat $f/x.txt; done", "the control: no wildcard"
+                )
+                for command in (
+                    f"for f in d1* {padding}; do cat $f/k/id_rsa; done",
+                    f'for d in d1* {padding}; do grep -R PRIVATE "$d"; done',
+                    f"for f in s* {padding}; do echo $f; done",  # the cost
+                ):
+                    with self.subTest(command=command):
+                        self.assert_refused(command, "past the spellings read, of a wildcard")
+
+    def test_a_loop_value_glued_to_an_option(self):
+        """The shell matches a list's wildcard where the list stands, so after `for f in d1*`,
+        `grep --file=$f/k/id_rsa` opens `d1/k/id_rsa`. The credential check matched the whole
+        word, `--file=d1*/k/id_rsa`, as the shell matches a wildcard spelled there, and no name
+        starts with `--file=`: under `Bash(grep *)` it was approved, where `grep -fd1/k/id_rsa` is
+        refused, and bash 5.2 and zsh 5.9 read the key through `diff --from-file=$f/k/id_rsa`.
+        Each piece such a word glues to an option is matched now."""
+        with self._project() as (project, home):
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            with operator_rules(allow=["Bash(grep *)"]):
+                for command in (
+                    "for f in s*; do grep --file=$f/lib/x.txt README.md; done",
+                    "grep --file=d1*/k/id_rsa README.md",  # the shell matches the whole word
+                ):
+                    with self.subTest(command=command):
+                        self.assert_allowed(command, "the control: the rule approves this")
+                for command in (
+                    "for f in d1*; do grep --file=$f/k/id_rsa README.md; done",
+                    'for f in d1*; do grep --file="$f/k/id_rsa" README.md; done',
+                    "for f in d1*; do grep -f$f/k/id_rsa README.md; done",
+                    "for f in $(ls); do grep --file=$f/id_rsa README.md; done",
+                ):
+                    with self.subTest(command=command):
+                        self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
+
+    def test_a_loop_value_under_an_operation(self):
+        """`${f%/}`, `${f#./}` and `${f:-x}` can leave a value as it is, and the credential check
+        read each as a value it didn't read, below which a path is left to the rules: under
+        `Bash(cat *)`, `for f in d1*; do cat "${f%/}/k/id_rsa"; done` was approved, where the
+        loop's `"$f"` is refused, and bash 5.2.37 and zsh 5.9 read `d1/k/id_rsa`. Each is read as
+        each value a list's wildcard or `$(ls)` gives the name now, and as unread."""
+        padding = " ".join(f"a{index}" for index in range(70))
+        with self._project() as (project, home):
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            for command in (
+                'for f in s*; do echo "${f%/}"; done',
+                'for f in src/lib/*.txt; do echo "${f%.txt}"; done',
+                'for f in src/lib/*.txt; do echo "${f##*/}"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: matches no link out")
+            with operator_rules(allow=["Bash(cat *)", "Bash(grep *)"]):
+                self.assert_allowed(
+                    'for f in s*; do cat "${f%/}/lib/x.txt"; done', "the control: the rule says yes"
+                )
+                for command in (
+                    'for f in d1*; do cat "${f%/}/k/id_rsa"; done',
+                    'for f in d1*; do cat "${f#./}/k/id_rsa"; done',
+                    "for f in d1*; do cat ${f:-x}/k/id_rsa; done",
+                    'for f in d1*; do grep -R PRIVATE "${f%/}"; done',
+                    'for f in $(ls); do cat "${f%/}/id_rsa"; done',
+                    f'for f in d1* {padding}; do cat "${{f%/}}/k/id_rsa"; done',
+                ):
+                    with self.subTest(command=command):
+                        self.assert_refused(command, "the rule says yes, and it reads ~/.ssh")
+
+    def test_a_loop_over_a_wildcard_or_a_listing(self):
+        """A `for` list's wildcard, or a `$(ls)`, gives the variable each path it matches or each
+        name it lists. The read scope placed one name in the list's directory, by its text, and
+        the credential check read the variable as unread, so `for f in $(ls); do cat $f/id_rsa;
+        done` was approved, and `for f in d1*; do cat $f/k/id_rsa; done` under `Bash(cat *)`."""
+        with self._project() as (project, home):
+            (project / "d1").mkdir()
+            (project / "d1" / "k").symlink_to(home / ".ssh")
+            for command in (
+                "for f in src*; do cat $f/lib/x.txt; done",
+                "for f in $(ls src); do cat src/$f/x.txt; done",
+                'for d in src*; do grep -r PRIVATE "$d"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: reads through no link out")
+            for command in (
+                "for f in $(ls); do cat $f/id_rsa; done",
+                'for f in $(ls); do cat "$f"/id_rsa; done',
+                "for f in $(ls src); do cat src/$f/id_rsa; done",
+                "for f in d1*; do cat $f/k/id_rsa; done",
+                'for d in src*; do grep -R PRIVATE "$d"; done',
+                'for d in $(ls); do grep -R PRIVATE "$d"; done',
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh through a link")
+            for command in ("for f in d*; do cat $f/f; done", "for f in $(ls); do cat $f/f; done"):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "d/f leads out of the project")
+            with operator_rules(allow=["Bash(cat *)"]):
+                self.assert_allowed("for f in d*; do cat $f/f; done", "the rule approves it")
+                self.assert_refused("for f in d1*; do cat $f/k/id_rsa; done", "the rule says yes")
+
+    def test_a_listing_that_prints_more_than_names(self):
+        """`$(ls ...)` was read as the names of a directory's entries whatever flags and operands
+        it had. `ls -l` prints a link's target, `ls -d` and `ls FILE` the operand, and `ls a b` a
+        header for each: these are no listing now, and a single operand is a value too. The
+        project's `k` is gone, which any name `$(ls)` gives at the top could be."""
+        with self._project() as (project, home):
+            (project / "k").unlink()
+            (project / "a" / "b").mkdir(parents=True)
+            (project / "a" / "b" / "k").symlink_to(home / ".ssh")
+            (project / "a" / "b" / "key").symlink_to(home / ".ssh" / "id_rsa")
+            for command in (
+                "for f in $(ls src); do cat src/$f/x.txt; done",
+                "for f in $(ls -1 src); do cat src/$f/x.txt; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "the control: the names of src/")
+            for command in (
+                "for f in $(ls -l src); do cat $f/id_rsa; done",
+                "for f in $(ls -d a/b); do cat $f/k/id_rsa; done",
+                "for f in $(ls a/b src); do cat $f; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_no_opinion(command, "prints more than names")
+            self.assert_refused_outright(
+                "for f in $(ls a/b/key); do cat $f; done", "prints a/b/key, the key"
+            )
+
+    def test_a_word_spelled_around_two_values_this_module_didnt_read(self):
+        """`PICKED` shared its byte with `UNREAD_VALUE`, so `${a}picked$b` read as the mark, and
+        Layer B took both values out with it, to read `/.ssh/id_rsa` alone. bash splits the first
+        command's word into `picked` and `~/.ssh/id_rsa`. A command can't spell the mark."""
+        with self._project(), operator_rules(allow=["Bash(cat *)"]):
+            self.assert_allowed("cat ${a}picked$b/README.md", "the control: the rule approves this")
+            for command in (
+                'b=" $HOME"; cat ${a}picked$b/.ssh/id_rsa',
+                "cat ${a}picked${b}/.ssh/id_rsa",
+                "cat $(pwd)picked$(pwd)/.ssh/id_rsa",
+                f"cat {hook.PICKED}README.md",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command, "reads ~/.ssh, or spells the mark")
+
     def test_a_link_the_command_makes(self):
         """#79's links count: `j` isn't there when the hook runs, as a name the wildcard matches
         or as the one it spells, which bash leaves where the wildcard matches nothing."""
