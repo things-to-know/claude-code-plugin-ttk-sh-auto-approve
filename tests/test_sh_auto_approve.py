@@ -7126,6 +7126,29 @@ class ReadsWhatAWildcardMatches(Verdicts, unittest.TestCase):
                 with self.subTest(command=command):
                     self.assert_refused_outright(command, "bash splits x k, and k is ~/.ssh")
 
+    def test_a_name_on_the_disk_that_holds_a_reserved_byte(self):
+        r"""A directory `a\\x02b` reads as one below a value this module didn't read, whose links
+        a walk skips as the residual, so with `a\\x02b/kk -> ~/.ssh`, `grep -R PRIVATE *` was
+        approved with no rule, where `grep -R PRIVATE .` was refused. A cloned repository can
+        hold such a name: one that holds a byte this module reserves refuses the command."""
+        with self._project() as (project, home):
+            for link in ("k", "d", "src/lib2"):
+                (project / link).unlink()
+            (project / "g").mkdir()
+            self.assert_allowed("grep -R PRIVATE *", "the control: no link out, no such name")
+            for byte in ("\x02", "\x04", "\x05"):
+                (project / f"a{byte}b").mkdir()
+                (project / f"a{byte}b" / "kk").symlink_to(home / ".ssh")
+                for command in (
+                    "grep -R PRIVATE *",
+                    "grep -R PRIVATE a*",
+                    'for d in $(ls); do grep -R PRIVATE "$d"; done',
+                ):
+                    with self.subTest(byte=byte, command=command):
+                        self.assert_refused_outright(command, "reads ~/.ssh through kk")
+                self.assert_allowed("grep -R PRIVATE g", "the control: below g, no such name")
+                shutil.rmtree(project / f"a{byte}b")
+
     def test_a_word_spelled_around_two_values_this_module_didnt_read(self):
         """`PICKED` shared its byte with `UNREAD_VALUE`, so `${a}picked$b` read as the mark, and
         Layer B took both values out with it, to read `/.ssh/id_rsa` alone. bash splits the first
