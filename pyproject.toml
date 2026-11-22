@@ -30,6 +30,9 @@ source = ["plugin/scripts"]
 # Also measure the hooks the tests run as separate processes, as Claude Code does, `-I` included.
 # Each process writes its own `.coverage.*` file, which `coverage combine` merges.
 patch = ["subprocess"]
+# Not the copy of another hook that `tools/tests_against.py` runs from beside the hook and then
+# removes: `coverage report` fails on a file it measured and can no longer read
+omit = ["plugin/scripts/_tests_against_*.py"]
 
 [tool.coverage.report]
 # The line numbers no test runs, and each branch no test takes, as `<line>->exit` or
