@@ -3937,6 +3937,9 @@ def _check_gh_read(args: list[str], rewritten: list[bool]) -> None:
     rest_rewritten = rewritten[2:]
     positionals: list[str] = []
     query_start = len(rest)  # where the words after a search's `--` begin
+    # A `-R` the hook can't vouch for, left to the rules once the walk has read the words after
+    # it: the walk reads a `--jq` there, and the `_check_gh_jq` scan would misread `-Hfeat/sql-env`
+    repo_reason = ""
     index = 0
     while index < len(rest):
         start = index
@@ -3996,7 +3999,9 @@ def _check_gh_read(args: list[str], rewritten: list[bool]) -> None:
                 f"gh given a word that is expanded or substituted: {value}",
             )
         if flag in ("-R", "--repo") and not GH_REPO_NAME.match(value):
-            raise NoOpinion(f"gh repository not in OWNER/REPO form: {value}")
+            repo_reason = repo_reason or f"gh repository not in OWNER/REPO form: {value}"
+    if repo_reason:
+        raise NoOpinion(repo_reason)
     if any(rest_rewritten[query_start:]):
         raise NoOpinion("gh search query with a word the shell rewrites")
     if max_positionals != GH_SEARCH_QUERY and len(positionals) > max_positionals:

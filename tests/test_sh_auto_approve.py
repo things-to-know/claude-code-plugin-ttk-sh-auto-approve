@@ -10226,6 +10226,32 @@ class RefusesGhJqThatReadsTheEnvironment(Verdicts, unittest.TestCase):
             self.assert_allowed("gh pr view 3 --web --jq '.title'", "the control")
             self.assert_refused("gh pr view 3 --web --jq '$ENV.GH_TOKEN'", "the rule says yes")
 
+    def test_a_repository_not_in_owner_repo_form_does_not_hide_the_filter(self):
+        """`-R host/o/r` leaves the command to the rules once the walk has read the words after
+        it. A filter after it was left to the rules, where the same flags the other way round
+        were refused outright. The walk reads them, not the scan, which would take a glued
+        value holding a `q`, as in `-Hfeat/sql-env`, for a `-q` filter."""
+        for repo in ("-R h/o/r", "--repo=h/o/r"):
+            with self.subTest(repo=repo):
+                self.assert_no_opinion(f"gh issue view 1 {repo} --jq '.title'", "the control")
+                self.assert_refused_outright(f"gh issue view 1 {repo} --jq '$ENV.GH_TOKEN'")
+        with operator_rules(allow=["Bash(gh issue view *)"]):
+            self.assert_allowed("gh issue view 1 -R h/o/r --jq '.title'", "the control")
+            self.assert_refused(
+                "gh issue view 1 -R h/o/r --jq '$ENV.GH_TOKEN'", "the rule says yes"
+            )
+        with operator_rules(allow=["Bash(gh pr list *)", "Bash(gh issue list *)"]):
+            for command in (
+                "gh pr list -R ghe.example.com/o/r -Hfeat/sql-env",
+                "gh issue list -R ghe.example.com/o/r -lsql-env",
+            ):
+                with self.subTest(command=command):
+                    self.assert_allowed(command, "a glued value that holds a `q` is no filter")
+            self.assert_refused(
+                "gh pr list -R ghe.example.com/o/r --json title --jq '$ENV.GH_TOKEN'",
+                "the rule says yes",
+            )
+
 
 # ======================================================================================
 # Part 14 -- The operator's own rules: the second tier
