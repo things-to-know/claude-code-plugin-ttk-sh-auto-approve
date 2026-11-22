@@ -28,6 +28,12 @@ escaped as ``tools/explain.py --transcript`` prints them:
 A last line counts the commands. For a refactor, the count must be 0; for any other hook change,
 the lines are the change's effect, to list in its pull request.
 
+A path that differs from run to run, or that names this machine, prints as a placeholder: each
+temporary directory the run makes, through ``tempfile.mkdtemp``, which ``TemporaryDirectory``
+calls, as ``<tmp>``, and the checkout as ``<project>``. So 2 runs print the same verdict the
+same way, and the lines can go in a public pull request as they are. Lines that read the same
+then are listed once, and their commands counted once.
+
 The earlier hook is ``--base``, a git revision whose ``plugin/scripts/sh_auto_approve.py`` is
 read, or ``--before``, a file.
 """
@@ -40,10 +46,12 @@ import contextlib
 import importlib.util
 import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
 
@@ -53,6 +61,11 @@ HOOK_PATH = "plugin/scripts/sh_auto_approve.py"
 TESTS_PATH = "tests/test_sh_auto_approve.py"
 # The variable the hook's tests load the hook from
 HOOK_ENV = "SH_AUTO_APPROVE_HOOK"
+# What a line prints in place of a temporary directory the run made, and of the checkout
+TEMPORARY = "<tmp>"
+CHECKOUT = "<project>"
+# A character that continues a file name: a path followed by one names another file
+NAME_CHARACTER = r"[\w.@%+=,-]"
 
 # `-I` keeps this script's directory off `sys.path`
 sys.path.insert(0, str(TOOLS))
@@ -150,6 +163,43 @@ def run_tests(path: Path, name: str, asked: Asked, *, answer_before: bool) -> li
     return list(dict.fromkeys(failed))
 
 
+@contextlib.contextmanager
+def recording_temporary_directories() -> Iterator[set[str]]:
+    """Each directory ``tempfile.mkdtemp`` makes in the block, as it gives it and resolved.
+
+    ``tempfile.TemporaryDirectory`` makes its directory through it too.
+    """
+    made: set[str] = set()
+    original = tempfile.mkdtemp
+
+    def recorded(*args: object, **kwargs: object) -> str | bytes:
+        path = original(*args, **kwargs)
+        # Absolute since Python 3.12; resolved too, as a test that resolves it spells it
+        if isinstance(path, str):
+            made.update({path, str(Path(path).resolve())})
+        return path
+
+    tempfile.mkdtemp = recorded
+    try:
+        yield made
+    finally:
+        tempfile.mkdtemp = original
+
+
+def placeholders(temporary: set[str]) -> Callable[[str], str]:
+    """What writes each path in ``temporary`` as ``<tmp>``, and the checkout as ``<project>``.
+
+    The longest path is replaced first, so a directory made inside another is one placeholder,
+    and a path only where its last name ends: ``<tmp>x`` would be another file. ``ROOT`` is
+    resolved already.
+    """
+    names = dict.fromkeys(temporary, TEMPORARY)
+    names[str(ROOT)] = CHECKOUT
+    paths = "|".join(map(re.escape, sorted(names, key=len, reverse=True)))
+    pattern = re.compile(f"(?:{paths})(?!{NAME_CHARACTER})")
+    return lambda text: pattern.sub(lambda match: names[match.group(0)], text)
+
+
 def in_repository(path: Path) -> str:
     """``path`` relative to the git repository that holds it, as ``git show`` reads it."""
     resolved = path.resolve()
@@ -191,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # The tests load the later hook from there
     os.environ[HOOK_ENV] = str(args.after.resolve())
-    with tempfile.TemporaryDirectory() as scratch:
+    with recording_temporary_directories() as made, tempfile.TemporaryDirectory() as scratch:
         # (the tests, what they are called on stderr, whether they get the earlier verdicts)
         suites = [(args.tests, str(args.tests), False)]
         if args.base is not None:
@@ -214,10 +264,16 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
 
+    rename = placeholders(made)
+    # (decision before, decision after, command): the reason after, each as the line prints it
+    changes: dict[tuple[str, str, str], str] = {}
     for (old_decision, new_decision, command), new_reason in asked.changes.items():
+        changes.setdefault((old_decision, new_decision, rename(command)), rename(new_reason))
+    for (old_decision, new_decision, command), new_reason in changes.items():
         print(old_decision, new_decision, *map(explain.escaped, (new_reason, command)), sep="\t")
-    changed = len({command for _, _, command in asked.changes})
-    print(f"{changed} of {len(asked.commands)} verdicts changed")
+    changed = len({command for _, _, command in changes})
+    commands = {rename(command) for command in asked.commands}
+    print(f"{changed} of {len(commands)} verdicts changed")
     return 0
 
 
