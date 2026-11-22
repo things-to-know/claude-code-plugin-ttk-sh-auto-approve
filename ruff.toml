@@ -6,7 +6,7 @@
 line-length = 100
 
 # The oldest Python the hook supports, and the oldest in the CI matrix
-target-version = "py312"
+target-version = "py313"
 
 [lint]
 # Every rule, less those below, each with the reason it doesn't fit this repository

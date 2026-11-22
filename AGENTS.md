@@ -268,7 +268,7 @@ insists on its own filename, symlink to this file rather than copying it.
   hook's environment.
 - **Python version**:
   - The hook runs on whatever `python3` is first on the user's `PATH`, and stays silent below
-    `MINIMUM_PYTHON` (3.12) or outside Linux and macOS
+    `MINIMUM_PYTHON` (3.13) or outside Linux and macOS
   - Keep `MINIMUM_PYTHON` in the CI matrix, and in the Makefile's `TEST_PYTHON_VERSIONS`
 
 ## Rules for the newline hook
@@ -317,8 +317,8 @@ version, so CI runs `ci/validate-plugin.sh`, which fails on every other warning.
   - Python version testing:
     - CI tests every Python version in its matrix
     - `make test` runs your `python3`
-    - For a failure CI shows on one version: `make test PYTHON="$(uv python find 3.12)"`, after
-      `uv python install 3.12` if that version is missing
+    - For a failure CI shows on one version: `make test PYTHON="$(uv python find 3.13)"`, after
+      `uv python install 3.13` if that version is missing
   - zsh: `make test` skips `DifferentialAgainstZsh` when `zsh` isn't on `PATH`. CI installs zsh
     and sets `SH_AUTO_APPROVE_REQUIRE_ZSH=1`, which turns that skip into a failure.
   - `make test-coverage` runs the tests under Coverage.py and lists, for each hook, the lines and

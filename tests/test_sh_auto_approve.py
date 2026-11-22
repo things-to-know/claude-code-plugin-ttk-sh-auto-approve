@@ -12379,10 +12379,10 @@ class HookProcessRobustness(HookProcess, unittest.TestCase):
                 self.fail("the hook blocked on a settings path that never returns")
 
     def test_a_rule_pattern_that_is_expensive_to_match(self):
-        """A glob becomes a regexp somewhere. `fnmatch.translate` on Python 3.12 emits
-        atomic groups and is safe; a hand-rolled `replace('*', '.*')` is not, and twelve
-        stars against a four-hundred-character command takes minutes -- measured, not
-        estimated.
+        """A glob becomes a regexp somewhere. `fnmatch.translate` on every Python in CI's
+        matrix emits atomic groups and is safe; a hand-rolled `replace('*', '.*')` is not,
+        and twelve stars against a four-hundred-character command takes minutes -- measured,
+        not estimated.
 
         The pattern goes in `deny`, because a deny rule is consulted for every command
         and an allow rule may not be.

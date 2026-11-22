@@ -233,7 +233,7 @@ class EnsureFinalNewline(unittest.TestCase):
         event = json.dumps({"tool_name": "Write", "tool_input": {"file_path": str(path)}})
         unsupported = (
             unittest.mock.patch.object(sys, "platform", "win32"),
-            unittest.mock.patch.object(sys, "version_info", (3, 11)),
+            unittest.mock.patch.object(sys, "version_info", (3, 12)),
         )
         with unittest.mock.patch.dict(os.environ, self.env, clear=True):
             for patch in unsupported:
