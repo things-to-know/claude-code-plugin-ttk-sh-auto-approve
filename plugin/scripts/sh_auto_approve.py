@@ -618,6 +618,11 @@ DANGEROUS_ENV_VARS = {
     # Where zsh loads a module from, and it loads some on demand: expanding `$commands` loads
     # `zsh/parameter`. zsh ties it to `module_path`, which the upper-casing covers
     "MODULE_PATH",
+    # Names under which zsh holds another value than the one a command binds: the first 3
+    # characters for `histchars`, so `envx` is `env`, and the last pipeline's statuses for
+    # `pipestatus`. The hook would read the value as bound
+    "HISTCHARS",
+    "PIPESTATUS",
 }
 
 # `aws` read operations pattern
@@ -2840,7 +2845,8 @@ def _names_the_environment(name: str) -> bool:
     `PATH` picks the program a word runs, `HOME` where git and the vendor CLIs read their
     config, `IFS` how every later expansion splits, which a command may set by assigning the
     name or by looping over it. The check upper-cases the name, so zsh's `path`, tied to `PATH`,
-    is one too.
+    is one too. So are zsh's `histchars` and `pipestatus`, which hold another value than the one
+    bound, where the hook would read the value as bound.
     """
     return (
         name.upper() in DANGEROUS_ENV_VARS

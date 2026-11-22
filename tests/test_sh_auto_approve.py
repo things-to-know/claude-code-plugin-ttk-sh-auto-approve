@@ -7705,6 +7705,30 @@ class RefusesControlOfTheEnvironmentAndTheProgram(Verdicts, unittest.TestCase):
         # approved it
         self.assert_refused_outright("set -A module_path .; echo $commands", "binds it in zsh")
 
+    def test_zsh_holds_another_value_under_histchars_and_pipestatus(self):
+        """zsh keeps the first 3 characters of what `histchars` is bound to, so `envx` is `env`, a
+        filter that prints the environment, and `pipestatus` holds the last pipeline's statuses
+        whatever a command binds it to. The hook would read each value as bound.
+        `DifferentialAgainstZsh.test_a_lowercase_special_parameter_in_zsh` asks zsh."""
+        self.assert_allowed('f=envx; gh issue view 72 --json title --jq "$f"', "the control")
+        self.assert_allowed("true | false; echo ${pipestatus[1]}", "the control: a read binds none")
+        for command, why in (
+            (
+                'histchars=envx; gh issue view 72 --json title --jq "$histchars"',
+                "hands gh `envx`, but zsh `env`",
+            ),
+            ("pipestatus=72; false; gh issue view $pipestatus", "views 72, but zsh views 1"),
+            (
+                'for histchars in envx; do gh issue view 72 --json title --jq "$histchars"; done',
+                "hands gh `envx`, but zsh `env`",
+            ),
+            ("for pipestatus in 72; do false; gh issue view $pipestatus; done", "views 72, not 1"),
+            ("for q pipestatus in a 72; do true; done", "rejects it, but zsh binds it"),
+        ):
+            with self.subTest(command=command):
+                self.assert_refused(command, why)
+        self.assert_refused_outright("set -A pipestatus 72; gh issue view $pipestatus")
+
     def test_a_bare_assignment_persists_in_the_session(self):
         """The segment is skipped, `checked` is still 1 from the `ls`, and the variable
         is set for everything that follows in that session."""
@@ -11535,6 +11559,47 @@ class DifferentialAgainstZsh(unittest.TestCase):
                     continue
                 self.assertTrue(tried, "zsh tried no plant: a dead case")
                 self.assertFalse(hook.is_read_only(command), f"approved {command!r}")
+
+    # Under some of its special parameters zsh holds another value than the one a command binds:
+    # the first 3 characters under `histchars`, the last pipeline's statuses under `pipestatus`.
+    # Each binding is asked of every special parameter with a lower-case name, as the hook
+    # refuses a name with a capital letter, and of `n`, the control
+    SPECIAL_PARAMETER_BINDINGS = ('{name}=7200; false; gh issue view "${name}"',)
+
+    def test_a_lowercase_special_parameter_in_zsh(self):
+        """Where zsh hands `gh` another word than the one bound, the hook approves nothing.
+
+        `gh` is a function that prints its words. zsh refuses to bind a read-only parameter,
+        or a scalar to an associative one, and runs nothing after that: no word to compare.
+        """
+        gh = 'gh() { print -r -- "$@" }'
+        rewritten = set()
+        with scratch_tree() as root:
+            listed = run_in_zsh(
+                "zmodload zsh/parameter; print -l -- ${(k)parameters[(R)*special*]}", root
+            ).stdout.split()
+            names = sorted(n for n in listed if hook.LOOP_NAME.match(n) and n == n.lower())
+            for binding in self.SPECIAL_PARAMETER_BINDINGS:
+                control = binding.format(name="n")
+                self.assertEqual(
+                    "issue view 7200\n",
+                    run_in_zsh(f"{gh}; {control}", root).stdout,
+                    "zsh ran no gh for a plain name: a dead control",
+                )
+                self.assertTrue(hook.is_read_only(control), f"refused the control {control!r}")
+                for name in names:
+                    command = binding.format(name=name)
+                    with self.subTest(command=command):
+                        self.assertIsNone(is_corpus_safe(command))
+                        handed = run_in_zsh(f"{gh}; {command}", root).stdout
+                        if handed in ("", "issue view 7200\n"):
+                            continue
+                        rewritten.add(name)
+                        self.assertFalse(
+                            hook.is_read_only(command),
+                            f"approved {command!r}, and zsh hands gh: {handed.strip()}",
+                        )
+        self.assertLessEqual({"histchars", "pipestatus"}, rewritten, "zsh kept both: a dead case")
 
     # #61: zsh replaces an unquoted `=ls` with the path of `ls`, and bash reads a file named
     # `=ls`, which the tree doesn't hold. They change nothing, so each is told by what it prints
