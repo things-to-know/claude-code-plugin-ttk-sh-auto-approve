@@ -47,9 +47,9 @@ from a command that prompted in a real session.
           RefusalIsMonotonicUnderComposition, MatchesTheHostsOwnCaution
      5  Commands observed prompting in real sessions
           ObservedCommandsStayApproved, AllowsALoopVariableBoundToLiterals,
-          SplicesFlagsFromALiteralAssignment, AllowsACopyIntoTheScratchDirectory,
-          AllowsAQuotedDateWhoseOutputIsUnsigned, TheWideningsHaveAnEdge,
-          ApprovesCurlOnAListedSite, CurlStopsAtTheListedSites
+          ReadsGhOnEachTurnOfALoop, SplicesFlagsFromALiteralAssignment,
+          AllowsACopyIntoTheScratchDirectory, AllowsAQuotedDateWhoseOutputIsUnsigned,
+          TheWideningsHaveAnEdge, ApprovesCurlOnAListedSite, CurlStopsAtTheListedSites
      6  Lexing, quoting, and where a command ends
           RefusesShellSyntaxTheLexerMisreads, RefusesPunctuationThatBashWouldReject,
           ResolvesQuotingBeforeLexing, RefusesQuotingBashReadsDifferently,
@@ -249,6 +249,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import math
 import os
 import platform
 import random
@@ -2561,6 +2562,239 @@ class AllowsALoopVariableBoundToLiterals(Verdicts, unittest.TestCase):
         self.assert_refused(
             "for f in a.md; do sed -i 's/a/b/' \"$f\"; done", "-i still edits in place"
         )
+
+
+class ReadsGhOnEachTurnOfALoop(Verdicts, unittest.TestCase):
+    """`for n in 72 69; do gh issue view $n; done` and the edge of reading it (#101).
+
+    `gh` reads every word whole, and left one the shell rewrites to the operator's rules, so a
+    loop over issue numbers prompted where the same reads written out did not. Where each word
+    the shell rewrites is a whole-word use of a name that a `for` header binds to literal
+    words, none starting with `-`, the hook reads the command once for each value, with the
+    value in its place, as it reads one written out. Each refusal sits beside a control approved
+    under the same setup:
+
+    * **the use is the whole word** -- a glued `o/$r` stays a word the hook doesn't read;
+    * **an unquoted use holds one word under both shells** -- every value has only the
+      characters `UNQUOTED_LOOP_VALUE` lists, so neither bash's splitting and globbing nor
+      zsh's `sh_word_split`, `glob_subst` and `extended_glob`, which a startup file can set,
+      change it; `"$n"` is the value as it is, whatever the list spells;
+    * **the list is literal, and every binding of the name** -- as for
+      `AllowsALoopVariableBoundToLiterals`, and no header word is one zsh may glob, such as
+      `.title^`, whose value no one read;
+    * **each turn passes** -- a value is read where it stands, so a flag, a URL or a second
+      operand is no-opinion, and a filter that reads the environment is refused outright on
+      whichever turn holds it, or past the turns the hook reads.
+    """
+
+    def test_the_loops_that_prompted(self):
+        self.assert_allowed("gh issue view 72; gh issue view 69", "the control, written out")
+        for command in (
+            "for n in 72 69; do gh issue view $n; done",
+            'for n in 72 69; do gh issue view "$n"; done',
+            "for n in 72 69; do gh issue view ${n}; done",
+            'for n in 72 69; do gh issue view "${n}"; done',
+            "for n in 72 69; do gh pr view $n --json title; done",
+            "for n in 111 112 113; do gh pr view $n -R o/r --json title,state; done",
+            "for q in hook scratchpad; do gh search issues $q; done",
+            'for r in o/a o/b; do gh pr list -R "$r" --state all; done',
+            "for n in 72; do timeout 5 gh issue view $n; done",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "each turn is a read written out")
+
+    def test_a_value_is_read_where_it_stands(self):
+        self.assert_allowed("for n in 72 69; do gh issue view $n; done", "the control")
+        for command, why in (
+            ("for n in 72 -R; do gh issue view $n; done", "a value that starts with `-`"),
+            (
+                "for n in 72 https://example.com/o/r/issues/1; do gh issue view $n; done",
+                "a URL carries a host of its own",
+            ),
+            ("for r in o/r host/o/r; do gh pr list -R $r; done", "HOST/OWNER/REPO"),
+            ("for n in 72; do gh issue view $n $n; done", "a second operand"),
+            ("for n in 72; do gh pr view $n --web; done", "a flag the table doesn't list"),
+            ("for n in 72; do gh pr merge $n; done", "a subcommand left to the rules"),
+        ):
+            with self.subTest(command=command):
+                self.assert_no_opinion(command, why)
+
+    def test_a_value_is_read_as_the_group_or_the_verb_too(self):
+        """A turn is read as written out whichever word the value is, so a group or a verb the
+        table doesn't list is left to the rules: `gh api` among them, which #183 tracks."""
+        for command in (
+            "for g in issue pr; do gh $g view 72; done",
+            "for v in view; do gh issue $v 72; done",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "each turn is a read written out")
+        for command, why in (
+            ("for g in api; do gh $g repos/o/r/issues/1; done", "`gh api` is no turn's read"),
+            ("for g in issue api; do gh $g view 72; done", "one turn's group is `api`"),
+            ("for v in view close; do gh issue $v 72; done", "one turn's verb is a write"),
+        ):
+            with self.subTest(command=command):
+                self.assert_no_opinion(command, why)
+        self.assert_refused_outright(
+            "for g in api; do gh $g repos/o/r/issues/1 --jq '$ENV.GH_TOKEN'; done"
+        )
+
+    def test_an_unquoted_use_holds_one_word_under_both_shells(self):
+        """bash splits and globs an unquoted value, and zsh does too under `sh_word_split` and
+        `glob_subst`, where `=ls`, `<1-20>` and `(a|b)` are the path of `ls` and file names, and
+        with `extended_glob`, `a#b` too: zsh 5.9 matched `a#--jq` against a file `--jq`."""
+        for value in ("'a b'", "'*'", "'[ab]'", "'=ls'", "'<1-20>'", "'(a|b)'", "'a#b'", "''"):
+            quoted = f'for q in hook {value}; do gh search issues "$q" crash; done'
+            unquoted = f"for q in hook {value}; do gh search issues $q crash; done"
+            with self.subTest(value=value):
+                self.assert_allowed(quoted, "the control: quoted, the value as it is")
+                self.assert_no_opinion(unquoted)
+
+    def test_only_a_whole_word_use_is_read(self):
+        self.assert_allowed("for r in o/a o/b; do gh repo view $r; done", "the control")
+        for command in (
+            "for r in a b; do gh repo view o/$r; done",
+            'for r in a b; do gh repo view "o/$r"; done',
+            "for n in 72; do gh issue view $n$n; done",
+            "for n in 72; do gh issue view ${=n}; done",
+            'for n in 72; do gh issue view "\\$n"; done',
+            "for n in 72; do gh issue view $n -R $r; done",
+        ):
+            with self.subTest(command=command):
+                self.assert_no_opinion(command, "a word the shell rewrites that is no loop's")
+
+    def test_the_list_is_literal_and_every_binding_of_the_name(self):
+        self.assert_allowed("for n in 72; do gh issue view $n; done", "the control")
+        for command in (
+            "for n in 72; do n=-w; gh issue view $n; done",
+            "for n in 72; do gh issue view $n; n=-w; done",
+            "gh issue view $n; for n in 72; do true; done",
+            'for n in "$(echo 72)"; do gh issue view $n; done',
+        ):
+            with self.subTest(command=command):
+                self.assert_no_opinion(command, "a value no header spells")
+        for command in (
+            "for n in 72; do true; done; gh issue view $n",
+            'for n in 72 69; do true; done; gh issue view "$n"',
+            "for n in 72; do gh issue view $n; done; gh issue view $n",
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "after `done` the name holds a value the list spells")
+        self.assert_no_opinion("for n in 72 -w; do true; done; gh issue view $n")
+        self.assert_refused_outright(
+            "for n in 72; do true; done; gh issue view $n --jq '$ENV.GH_TOKEN'"
+        )
+        self.assert_no_opinion(
+            "for n in 72; do gh issue view $n; done; for n in 69; do gh issue view $n; done",
+            "the residual: each header spells its values, but a name two bind is read by neither",
+        )
+
+    def test_a_header_word_zsh_may_glob_gives_no_value_to_read(self):
+        """With `extended_glob`, which a startup file can set, zsh 5.9 bound `f` in
+        `for f in .title^` to a file `.title,env`, a filter that prints the environment."""
+        self.assert_allowed(
+            'for f in .title; do gh issue view 72 --json title --jq "$f"; done', "the control"
+        )
+        self.assert_refused_outright(
+            'for f in .title^; do gh issue view 72 --json title --jq "$f"; done'
+        )
+        self.assert_allowed(
+            "for q in 'hook^'; do gh search issues \"$q\"; done", "the control: a quoted header"
+        )
+        self.assert_no_opinion('for q in hook^; do gh search issues "$q"; done')
+
+    def test_a_filter_that_reads_the_environment_is_refused_on_any_turn(self):
+        """A turn left to the rules does not stand in front of one refused outright, and neither
+        do more turns than the hook reads."""
+        numbers = " ".join(str(n) for n in range(hook.MAX_WORD_SHAPES + 1))
+        too_many = f"for n in {numbers}; do gh issue view $n --jq '$ENV.GH_TOKEN'; done"
+        self.assert_allowed(
+            'for f in .title .body; do gh issue view 72 --json title,body --jq "$f"; done',
+            "the control: each filter is read",
+        )
+        for command in (
+            "for n in 72; do gh issue view $n --jq '$ENV.GH_TOKEN'; done",
+            "for f in .title '$ENV.GH_TOKEN'; do gh issue view 72 --json title --jq \"$f\"; done",
+            (
+                "for f in .title '$ENV.GH_TOKEN'; do"
+                ' gh issue view https://example.com/o/r/issues/1 --json title --jq "$f"; done'
+            ),
+            too_many,
+        ):
+            with self.subTest(command=command):
+                self.assert_refused_outright(command)
+        with operator_rules(allow=["Bash(gh issue view *)"]):
+            self.assert_allowed("gh issue view $x", "the control: the rule applies")
+            for command in (
+                "for n in 72; do gh issue view $n --jq '$ENV.GH_TOKEN'; done",
+                too_many,
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused(command, "the rule says yes")
+
+    def test_too_many_turns_are_not_read(self):
+        numbers = " ".join(str(n) for n in range(hook.MAX_WORD_SHAPES + 1))
+        self.assert_allowed(
+            f"for n in {numbers[: numbers.rindex(' ')]}; do gh issue view $n; done", "the control"
+        )
+        self.assert_no_opinion(f"for n in {numbers}; do gh issue view $n; done")
+
+    def test_two_loops_names_are_read_in_every_combination(self):
+        """`gh pr view $n -R $r` after a loop that binds `r`, in one that binds `n`: one turn for
+        each pair of values, whichever the shell runs."""
+        after = "do true; done; for n in 1 2; do"
+        for command in (
+            f"for r in o/a o/b; {after} gh pr view $n -R $r; done",
+            f'for r in o/a o/b; {after} gh pr view "$n" -R "$r" --json title; done',
+            f'for f in .title .body; {after} gh issue view $n --json title,body --jq "$f"; done',
+        ):
+            with self.subTest(command=command):
+                self.assert_allowed(command, "each pair is a read written out")
+        self.assert_no_opinion(
+            f"for r in o/a h/o/b; {after} gh pr view $n -R $r; done",
+            "HOST/OWNER/REPO in one pair",
+        )
+        self.assert_refused_outright(
+            f"for f in .title '$ENV.GH_TOKEN'; {after}"
+            ' gh issue view $n --json title --jq "$f"; done'
+        )
+        # `MAX_WORD_SHAPES` bounds the pairs, not each list
+        side = math.isqrt(hook.MAX_WORD_SHAPES)
+        numbers = " ".join(str(n) for n in range(side))
+        repos = " ".join(f"o/r{n}" for n in range(side + 1))
+        loop = f"do true; done; for n in {numbers}; do gh pr view $n -R $r"
+        self.assert_allowed(f"for r in {repos[: repos.rindex(' ')]}; {loop}; done", "the control")
+        self.assert_no_opinion(f"for r in {repos}; {loop}; done")
+        self.assert_refused_outright(f"for r in {repos}; {loop} --jq '$ENV.GH_TOKEN'; done")
+
+    def test_a_deny_rule_reads_each_turn(self):
+        """A deny rule is matched against the text as written, `gh issue view $n`, which names
+        no value, so each turn is matched too, as `gh` and its words. A wrapper such as
+        `timeout 5` is not part of that text: the loop is refused where `timeout 5 gh issue
+        view 72`, written out, is not. So is a use after `done` for a value the name no longer
+        holds, as a `break` can leave any value of the list."""
+        rules = [
+            "Bash(gh issue view 72*)",
+            "Bash(gh repo view o/secret*)",
+            "Bash(gh pr list --search secret*)",
+        ]
+        with operator_rules(deny=rules):
+            self.assert_refused_outright("gh issue view 72", "the control: the rule applies")
+            self.assert_allowed(
+                "for n in 71 73; do gh issue view $n; done", "the control: no turn the rule names"
+            )
+            for command in (
+                "for n in 72; do gh issue view $n; done",
+                'for n in 71 72; do gh issue view "$n"; done',
+                "for n in 72; do true; done; gh issue view $n",
+                "for r in o/secret o/a; do true; done; gh repo view $r",
+                "for r in o/a o/secret; do gh repo view $r; done",
+                "for q in secret; do gh pr list --search $q; done",
+                "for r in o/a o/secret; do true; done; for n in 1 2; do gh repo view $r; done",
+                "for n in 72; do timeout 5 gh issue view $n; done",
+            ):
+                with self.subTest(command=command):
+                    self.assert_refused_outright(command)
 
 
 class SplicesFlagsFromALiteralAssignment(Verdicts, unittest.TestCase):
@@ -11590,7 +11824,10 @@ class DifferentialAgainstZsh(unittest.TestCase):
     # the first 3 characters under `histchars`, the last pipeline's statuses under `pipestatus`.
     # Each binding is asked of every special parameter with a lower-case name, as the hook
     # refuses a name with a capital letter, and of `n`, the control
-    SPECIAL_PARAMETER_BINDINGS = ('{name}=7200; false; gh issue view "${name}"',)
+    SPECIAL_PARAMETER_BINDINGS = (
+        '{name}=7200; false; gh issue view "${name}"',
+        'for {name} in 7200; do false; gh issue view "${name}"; done',
+    )
 
     def test_a_lowercase_special_parameter_in_zsh(self):
         """Where zsh hands `gh` another word than the one bound, the hook approves nothing.
