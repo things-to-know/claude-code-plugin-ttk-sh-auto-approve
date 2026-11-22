@@ -142,10 +142,35 @@ insists on its own filename, symlink to this file rather than copying it.
   - The hook reads `gh api` GETs itself
   - It reads these subcommands itself, flag by flag (`GH_READ_SPECS`): `pr view|list|diff|checks`,
     `run list|view`, `issue view|list`, `repo view` and `search issues|prs`
+    - With a whole-word `$n` or `"$n"` that a `for` loop over literal words binds, once for each
+      value (`_gh_loop_turns`)
+      - Only where every word the shell rewrites is such a use
+        - Beside a `$x` no loop binds, the command is read as written
+          - So a `--jq "$f"` there is refused outright
+      - An unquoted `$n` only where every value is one word under both shells
+        (`UNQUOTED_LOOP_VALUE`): `for q in 'a b' c` is not read
+      - Not where a header word is one zsh may glob, as `.title^` with `EXTENDED_GLOB`
+      - Nor past `MAX_WORD_SHAPES` turns, where the command is read as written
+      - A deny rule that matches a turn, `gh` and its words, refuses the command, as it refuses
+        the turn written out (`_check_gh_turns`)
+        - Only a deny rule in the project's 2 settings files: the hook reads no Bash rule from
+          the user's or the managed settings (#181)
+        - No ask rule: the hook leaves a Bash ask rule to Claude Code, which has the text as
+          written (#181)
+        - Not one that spells a wrapper in front of `gh`, such as `timeout 5` (#181)
+        - Not in a loop the hook reads as written, as past `MAX_WORD_SHAPES` turns (#181)
+        - Not one that matches a value an assignment sets, as in `n=72; gh issue view $n`: a
+          deny rule is matched against the text as written (#181)
+        - After the loop's `done`, each value of its list is matched, though the name holds one
+          - A `break` can leave any of them
+          - At a cost: `for r in o/secret o/a; do true; done; gh repo view $r` is refused under
+            a deny rule for `o/secret`
   - It leaves any other subcommand, and a flag the table doesn't list, to the operator's rules
     - Read-only ones too, such as `gh pr status`, `gh repo list` and `gh search code`
   - A `--jq` that reads the environment, or that the shell rewrites, is refused, which no rule
     overturns
+    - Except a loop variable it reads as above, within those limits: each value is read as the
+      filter
   - Operators can drop native `Bash(gh ... view|list *)` allow rules for the subcommands the hook
     reads
     - A native rule still approves `--jq '$ENV.GH_TOKEN'`, and only a native deny rule stops that
