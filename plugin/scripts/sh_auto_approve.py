@@ -69,8 +69,8 @@ Hardened against:
 - Command substitution whose body or position cannot be vouched for, and every other
     spelling of it: backticks, process substitution, the Bash 5.3 ``${ ...; }`` forms
 - Dynamic linker/environment variable injection (LD_PRELOAD, PATH, BASH_ENV, etc.)
-- Program path spoofing: a non-bare executable, and a program name that is quoted,
-    escaped or expanded rather than written
+- Program path spoofing: a non-bare executable other than the system's ``grep`` and ``find``,
+    and a program name that is quoted, escaped or expanded rather than written
 - Embedded DSL exploits in ``sed``, ``awk``, ``gawk``, including ``@include`` inside the program
 - Parameter-shifting bypasses and mutating subcommands in ``git``, ``aws``, and ``gcloud``, plus the
     flags that move where a call goes or who it goes as (``--endpoint-url``, ``--git-dir``,
@@ -187,7 +187,8 @@ GIT_POINTER_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 # How long `ps` may take to print Claude Code's command line on macOS, where there is no /proc
 PARENT_COMMAND_LINE_TIMEOUT = 5.0
 
-# Base programs that only ever read. Must be invoked by bare name (no slashes).
+# Base programs that only ever read. Must be invoked by bare name (no slashes), except the system's
+# `grep` by its path (`SYSTEM_PROGRAM_PATHS`).
 READ_ONLY = {
     "basename",
     "cat",
@@ -1990,7 +1991,8 @@ def _refuse_binding(name: str) -> None:
 
 
 # The words in front of a builtin that still run it as one: `builtin read p` reads into `p`.
-# `command` is one too, which `_check_command_builtin` refuses outright.
+# `command` is one too, which `_check_command_builtin` refuses outright, except before `grep` or
+# `find` (`COMMAND_RUNS`).
 PRECOMMANDS = frozenset({"builtin", "noglob", "nocorrect"})
 
 # The builtins of bash and zsh that bind the names their operands give, as `read p`,
@@ -4519,6 +4521,9 @@ def _may_exist(path: str) -> bool:
 def _check_find(args: list[str]) -> None:
     """Validate find: prevent root traversal, execution, deletion, and file writing.
 
+    In Claude Code's Bash tool `find` is a function that runs the bfs embedded in Claude Code,
+    which deletes with `-rm` as with `-delete`: bfs 4.1.1's `--help` lists them together.
+
     A wildcard inside `-name '*.md'` is an argument find matches for itself and the shell
     never touches. Refusing it cost every `-name` and `-path` pattern and bought nothing, so
     only a wildcard the shell will expand is refused, in `_check_command`.
@@ -4530,8 +4535,63 @@ def _check_find(args: list[str]) -> None:
             ("-exec", "-delete", "-ok", "-fprint", "-fprintf", "-fls")
         ):
             raise NotReadOnly(f"find writing flag: {arg}")
+        if arg == "-rm":
+            raise NotReadOnly("find writing flag: -rm, which bfs reads as -delete")
         if arg == "-printf" and _exceeds_width_cap(args[index + 1 : index + 2]):
             raise NotReadOnly(f"find -printf field wider than {PRINTF_WIDTH_CAP}")
+
+
+# ugrep's options that run a program, write a file, or take options or the paths to search from
+# a file, by their long names, from ugrep 7.8.4's `--help`. In Claude Code's Bash tool `grep` is
+# a function that runs the ugrep embedded in Claude Code, and a startup file's alias can make it
+# ugrep as well. The function hands each of them to GNU grep, where it fails, except `--from` and
+# `--query`. GNU grep has none of them, and ugrep reads no abbreviation of a long option.
+UGREP_REFUSED_OPTIONS = {
+    "--config": "takes its options from a file",
+    "--filter": "runs a program on each file it searches",
+    "--filter-magic-label": "picks the files a --filter runs on",
+    "--from": "searches each path a file lists, which no word of the command names",
+    "--pager": "runs a program on its output",
+    "--query": "starts an interactive search that can run --view",
+    "--save-config": "writes a file",
+    "--view": "names the program --query runs",
+}
+
+# The names a command may run ugrep by, for `_check_grep`
+GREP_NAMES = frozenset({"grep", "egrep", "fgrep"})
+
+
+def _check_grep(args: list[str]) -> None:
+    """Refuse ugrep's options in `UGREP_REFUSED_OPTIONS`, and `-Q`, `--query` in short.
+
+    `---FILE` is `--config=FILE`. A word that the flag before it takes, as in `-e --from`, is not
+    read as an option, nor any word after `--`. A word the shell builds is not read either, as for
+    any program `EXPANSION_UNSAFE` leaves out: `PolicyStillUndecided` in the tests records that
+    residual.
+    """
+    spec = READER_SPECS["grep"]
+    values = spec["values"] | spec["files"]
+    takes_next = False
+    for arg in args:
+        if takes_next:
+            takes_next = False
+            continue
+        if arg == "--":
+            return
+        if not arg.startswith("-") or arg == "-":
+            continue
+        if arg.startswith("---"):
+            raise NotReadOnly(f"ugrep's ---FILE, which is --config=FILE: {arg}")
+        if arg.startswith("--"):
+            name, equals, _ = arg.partition("=")
+            if name in UGREP_REFUSED_OPTIONS:
+                raise NotReadOnly(f"ugrep's {name}, which {UGREP_REFUSED_OPTIONS[name]}: {arg}")
+            takes_next = not equals and name in values
+            continue
+        letters = _short_letters(arg, values)
+        if "Q" in letters:
+            raise NotReadOnly(f"ugrep's -Q, which {UGREP_REFUSED_OPTIONS['--query']}: {arg}")
+        takes_next = len(letters) == len(arg) - 1 and f"-{letters[-1]}" in values
 
 
 def _check_jq(args: list[str]) -> None:
@@ -4754,7 +4814,8 @@ def _check_command_builtin(args: list[str]) -> None:
     """Validate the ``command`` builtin: ``command -v NAME...`` and nothing else.
 
     ``-v`` prints how each name resolves, as ``which`` does. Without it ``command`` runs its
-    operand with functions bypassed, so ``command rm -rf build/`` is ``rm``.
+    operand with functions bypassed, so ``command rm -rf build/`` is ``rm``. ``command grep`` and
+    ``command find`` never reach this: ``_check_command`` reads them as ``grep`` and ``find``.
     zsh reads ``command -v`` as ``whence``, which tells no more than zsh's own ``which``.
 
     ``-V`` is left out because it **prints a function's whole body**.
@@ -4866,6 +4927,18 @@ WRAPPERS = {
 # `timeout timeout timeout ...` parses; it just has nothing to say.
 MAX_WRAPPER_DEPTH = 4
 
+# The system's own `grep` and `find`, by the paths Linux and macOS install them at, read as the bare
+# names. In Claude Code's Bash tool `grep` and `find` are functions that run the ugrep and bfs
+# embedded in Claude Code, so a path, or `command`, is how a command reaches the system's. Any
+# other program path stays the operator's rules' to grant.
+SYSTEM_PROGRAM_PATHS = {
+    f"{directory}/{name}": name for directory in ("/usr/bin", "/bin") for name in ("grep", "find")
+}
+
+# What `command NAME ...` may run, read as `NAME ...`: `command` skips the shell's functions, and so
+# reaches the system's program as its path does
+COMMAND_RUNS = frozenset({"grep", "find"})
+
 # Explicit dispatch table mapping programs to their dedicated validator functions
 PROGRAM_VALIDATORS = {
     "aws": _check_aws,
@@ -4973,6 +5046,8 @@ def _check_command(
             spliced.append(False)
 
     # Path spoofing check: program must be a bare command name (e.g. 'ls', not './ls' or '/tmp/ls')
+    # The exceptions are the system's `grep` and `find`, read as the bare names
+    program = SYSTEM_PROGRAM_PATHS.get(program, program)
     if "/" in program or "\\" in program:
         raise NoOpinion(f"non-bare program path: {program}")
 
@@ -5023,6 +5098,14 @@ def _check_command(
     # sites the project lists, and whether the shell may not wait for the command.
     if program == "curl":
         _check_curl(args, _rewritten_words(arg_tokens, live_globs, parts), spliced, scope)
+        return
+
+    # `command grep` and `command find` run the system's program, as its path does: `command`
+    # skips the shell's functions, Claude Code's `grep` and `find` among them. What it runs is
+    # checked in its place, as a wrapper's command is, before the word checks below read the
+    # words as `command`'s. Every other form of `command` is `_check_command_builtin`'s.
+    if program == "command" and words[1:2] and words[1] in COMMAND_RUNS:
+        _check_command(words[1:], parts, depth + 1, safe_names, splice_vars, scope, known_values)
         return
 
     # A wrapper's own arguments are not the command; what it runs is checked in its place.
@@ -5119,6 +5202,10 @@ def _check_command(
                 f"bash may split or glob {expansion} where {program} gets it: "
                 f"{_expand(word, parts)}"
             )
+
+    # ugrep's options, as written, under each name `grep` may run ugrep by; see `_check_grep`
+    if program in GREP_NAMES:
+        _check_grep(args)
 
     # Fail-closed dispatch: either a dedicated validator, a purely read-only program, or reject
     if program in PROGRAM_VALIDATORS:
