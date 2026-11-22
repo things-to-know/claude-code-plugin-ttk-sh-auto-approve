@@ -43,7 +43,8 @@ from a command that prompted in a real session.
      3  The suite checking itself
           SuiteIntegrity, CorpusIsSafeToExecute
      4  Baseline verdicts
-          ApprovesReadOnly, ReadsTheRemotesARepositoryConfigures, RefusesAnythingElse,
+          ApprovesReadOnly, ReadsTheRemotesARepositoryConfigures,
+          ReadsWhatARepositoryHasGitRun, RefusesAnythingElse,
           RefusalIsMonotonicUnderComposition, MatchesTheHostsOwnCaution
      5  Commands observed prompting in real sessions
           ObservedCommandsStayApproved, AllowsALoopVariableBoundToLiterals,
@@ -101,8 +102,7 @@ from a command that prompted in a real session.
     17  The hook as a process
           HookProtocol, HookProcessRobustness
     18  Policy decisions, recorded as tests
-          PolicyAlreadyDecidedToRefuse, PolicyStillUndecided,
-          ObservedCommandsNotMadeToPass
+          PolicyAlreadyDecidedToRefuse, ObservedCommandsNotMadeToPass
 
 `SuiteIntegrity` fails if this list and the file's classes disagree. The one unconditionally
 skipped class is in part 18.
@@ -313,6 +313,26 @@ SCRATCH = f"/tmp/claude-1000/-home-dir1-dir2/{SESSION_ID}/scratchpad"
 # Another session's, the same but for the id
 OTHER_SCRATCH = SCRATCH.replace(SESSION_ID, "00000000-0000-4000-8000-000000000001")
 hook._SCRATCHPAD_DIR = SCRATCH
+
+# Before it approves a git command, the hook asks git which config keys the repository sets
+# and where its hooks are (`_check_git_repository`). Most cases here run in this checkout,
+# whose config is the machine's: `actions/checkout` sets `gc.auto` in CI's, and a developer's
+# may hold any key. So, as for the rule file above, git answers those 2 questions as it does
+# where there is no repository, unless a case builds one: `remotes_configured` asks git itself.
+REAL_RUN_GIT = hook._run_git_uncached
+
+
+def _git_outside_a_repository(directory: str, args: tuple[str, ...]) -> tuple[int, str] | None:
+    if not Path(directory).is_dir():
+        return None  # as git itself: it can't run in a directory that isn't there
+    if args[:2] == ("config", "--list"):
+        return 0, ""
+    if args[:2] == ("rev-parse", "--git-path"):
+        return 128, ""
+    return REAL_RUN_GIT(directory, args)
+
+
+hook._run_git_uncached = _git_outside_a_repository
 
 # --------------------------------------------------------------------------------------
 # The open-findings register
@@ -651,6 +671,7 @@ def remotes_configured(
             unittest.mock.patch.dict(os.environ),
             unittest.mock.patch.object(hook, "REPO_ROOT", project),
             unittest.mock.patch.object(hook, "_SESSION_CWD", None),
+            unittest.mock.patch.object(hook, "_run_git_uncached", REAL_RUN_GIT),
         ):
             for name in [name for name in os.environ if name.startswith("GIT_")]:
                 del os.environ[name]
@@ -1410,7 +1431,8 @@ class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
             self.assert_allowed("git remote show origin", "contacts origin")
 
     def test_git_is_asked_once_per_command(self):
-        """Once for the URL and once for the `vcs` lookup, however many calls name the remote."""
+        """Once for the URL and once for the `vcs` lookup, however many calls name the remote,
+        and once each for the repository's config keys and its hooks directory."""
         with (
             remotes_configured(self.ORIGIN),
             unittest.mock.patch.object(
@@ -1418,11 +1440,11 @@ class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
             ) as run,
         ):
             self.assert_allowed("git ls-remote origin; git remote show origin", "the control")
-            self.assertEqual(2, run.call_count)
+            self.assertEqual(4, run.call_count)
             run.reset_mock()
             # Through `-C`, each call's scope is `_directory_scope`'s, which shares git's answers
             self.assert_allowed("git -C . ls-remote origin; git -C . remote show origin")
-            self.assertEqual(2, run.call_count)
+            self.assertEqual(4, run.call_count)
 
     def test_a_name_no_remote_has_is_a_path(self):
         with remotes_configured(self.ORIGIN):
@@ -1774,6 +1796,327 @@ class ReadsTheRemotesARepositoryConfigures(Verdicts, unittest.TestCase):
             self.assertIsNone(hook._check_command(["git", "log"], []))
             with self.assertRaises(hook.NoOpinion):
                 hook._check_command(["git", "ls-remote", "origin"], [])
+
+
+@unittest.skipUnless(GIT, "needs git on PATH")
+class ReadsWhatARepositoryHasGitRun(Verdicts, unittest.TestCase):
+    """#104: a repository's config can name a program a read runs, as `core.fsmonitor` does for
+    `git status`, and so can its hooks directory. So a git command is read only where every key
+    the repository sets is one `GIT_CONFIG_KEYS` vouches for, and no hook of `GIT_READ_HOOKS` is
+    in its hooks directory. Each refusal sits beside its control, in the same repository built
+    the same way but for the key or the hook."""
+
+    ORIGIN = '[remote "origin"]\n\turl = ssh://git@example.com/x.git\n'
+    # What `git init` and a clone write, with an identity
+    PLAIN = (
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n"
+        "\tlogallrefupdates = true\n"
+        '[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n'
+        "[user]\n\tname = A\n\temail = a@example.com\n"
+    )
+    READS = ("git status", "git diff", "git log -1", "git --version")
+
+    def test_a_key_that_names_a_program(self):
+        """Each of these has git run a program under some read: #104's table and comments.
+        Whatever the command, since which read runs which is git's to change."""
+        with remotes_configured(self.PLAIN + self.ORIGIN):
+            for command in self.READS:
+                self.assert_allowed(command, "the control: keys that name no program")
+        for key in (
+            "[core]\n\tfsmonitor = /x/run\n",
+            "[core]\n\tpager = /x/run\n",
+            "[core]\n\tworktree = /x\n",
+            "[gpg]\n\tprogram = /x/run\n[log]\n\tshowSignature = true\n",
+            "[diff]\n\texternal = /x/run\n",
+            '[diff "t"]\n\ttextconv = /x/run\n',
+            '[filter "t"]\n\tclean = /x/run\n',
+            "[alias]\n\tst = !/x/run\n",
+            "[a]\n\tkeyALaterGitAdds = 1\n",
+        ):
+            with self.subTest(key=key), remotes_configured(self.PLAIN + self.ORIGIN + key):
+                for command in self.READS:
+                    self.assert_no_opinion(command, "the repository names a program")
+
+    def test_the_reason_names_the_key(self):
+        with (
+            remotes_configured(self.PLAIN + '[diff "a.b"]\n\ttextconv = /x/run\n'),
+            self.assertRaisesRegex(hook.NoOpinion, r"not known to be inert: diff\.a\.b\.textconv$"),
+        ):
+            hook._classify("git show")
+
+    def test_a_key_an_included_file_sets(self):
+        """git lists a key from an `include.path` file as the repository's own."""
+        include = "[include]\n\tpath = more.config\n"
+        with remotes_configured(self.PLAIN + include) as project:
+            (project / ".git" / "more.config").write_text("[user]\n\tname = B\n")
+            self.assert_allowed("git log -1", "the control: the file names no program")
+            (project / ".git" / "more.config").write_text("[core]\n\tpager = /x/run\n")
+            self.assert_no_opinion("git log -1", "the file names a pager")
+
+    def test_a_key_the_worktree_config_sets(self):
+        """With `extensions.worktreeConfig`, git reads `config.worktree` too, which `git config
+        --local` doesn't list."""
+        extension = "[extensions]\n\tworktreeConfig = true\n"
+        with remotes_configured(self.PLAIN + extension) as project:
+            self.assert_allowed("git diff", "the control: the extension alone")
+            (project / ".git" / "config.worktree").write_text("[user]\n\tname = B\n")
+            self.assert_allowed("git diff", "the control: a worktree key that names no program")
+            (project / ".git" / "config.worktree").write_text("[diff]\n\texternal = /x/run\n")
+            self.assert_no_opinion("git diff", "the worktree's config names a program")
+
+    def test_a_linked_worktree_reads_the_shared_config(self):
+        with remotes_configured(self.PLAIN, worktree=True):
+            self.assert_allowed("git status", "the control")
+        with remotes_configured(self.PLAIN + "[core]\n\tfsmonitor = /x/run\n", worktree=True):
+            self.assert_no_opinion("git status", "set in the common directory")
+
+    def test_a_key_that_names_a_program_to_reach_a_remote(self):
+        """`core.sshCommand`, `core.gitProxy` and `remote.<name>.uploadpack` are run to contact
+        a remote, so only a command that contacts one is left to the rules."""
+        contacting = ("git ls-remote origin", "git ls-remote", "git remote show origin")
+        local = ("git status", "git ls-remote --get-url origin", "git remote show -n origin")
+        with remotes_configured(self.PLAIN + self.ORIGIN):
+            for command in contacting:
+                self.assert_allowed(command, "the control: no such key")
+        for key in (
+            "[core]\n\tsshCommand = ssh -i key\n",
+            "[core]\n\tgitProxy = /x/run\n",
+            '[remote "origin"]\n\tuploadpack = /x/run\n',
+        ):
+            with self.subTest(key=key), remotes_configured(self.PLAIN + self.ORIGIN + key):
+                for command in contacting:
+                    self.assert_no_opinion(command, "git runs the program to reach origin")
+                for command in local:
+                    self.assert_allowed(command, "contacts no remote")
+
+    def test_a_url_rewrite_is_read_where_the_remote_is(self):
+        """`url.<base>.insteadOf` names no program, and `_check_git_remote_reach` reads the URL
+        it makes."""
+        rewrite = '[url "/srv/mirror/"]\n\tinsteadOf = ssh://git@example.com/\n'
+        with remotes_configured(self.PLAIN + self.ORIGIN + rewrite):
+            self.assert_allowed("git status", "contacts no remote")
+            self.assert_no_opinion("git ls-remote origin", "rewritten to a path")
+
+    def test_a_key_is_cut_at_its_first_and_last_dot(self):
+        vouched = hook._git_config_key_vouched
+        for key in ("core.bare", "branch.a.b.merge", "remote.o.url", "branch..remote"):
+            self.assertTrue(vouched(key, contacts_a_remote=True), key)
+        for key in (
+            "core.x.bare",
+            "branch.merge",
+            "remote.o.sshcommand",
+            "branch.core.fsmonitor",
+            "core.sshcommand",
+            "remote.o.uploadpack",
+            "",
+        ):
+            self.assertFalse(vouched(key, contacts_a_remote=True), key)
+        for key in ("core.sshcommand", "core.gitproxy", "remote.o.uploadpack"):
+            self.assertTrue(vouched(key, contacts_a_remote=False), key)
+
+    def test_a_hook_a_read_runs(self):
+        """`git status` runs `post-index-change`, from `.git/hooks` with no key set at all."""
+        with remotes_configured(self.PLAIN) as project:
+            hooks = project / ".git" / "hooks"
+            hooks.mkdir()
+            (hooks / "pre-commit").write_text("#!/bin/sh\n")
+            (hooks / "post-index-change.sample").write_text("#!/bin/sh\n")
+            for command in self.READS:
+                self.assert_allowed(command, "the control: hooks no read runs")
+            (hooks / "post-index-change").write_text("#!/bin/sh\n")
+            with self.assertRaisesRegex(hook.NoOpinion, "a hook of the repository: post-index-"):
+                hook._classify("git status")
+            for command in self.READS:
+                self.assert_no_opinion(command, "whatever the command, as for a key")
+
+    def test_a_hooks_directory_the_repository_names(self):
+        """`core.hooksPath` moves the hooks, relative to the top of the working tree: husky
+        sets it, to a directory with no `post-index-change`."""
+        with remotes_configured(self.PLAIN + "[core]\n\thooksPath = .husky/_\n") as project:
+            (project / ".husky" / "_").mkdir(parents=True)
+            (project / ".husky" / "_" / "pre-commit").write_text("#!/bin/sh\n")
+            (project / "src").mkdir()
+            # No longer where git looks
+            (project / ".git" / "hooks").mkdir()
+            (project / ".git" / "hooks" / "post-index-change").write_text("#!/bin/sh\n")
+            self.assert_allowed("git status", "the control: no such hook where git looks")
+            with unittest.mock.patch.object(hook, "_SESSION_CWD", str(project / "src")):
+                self.assert_allowed("git status", "the control, from a subdirectory")
+            (project / ".husky" / "_" / "post-index-change").write_text("#!/bin/sh\n")
+            self.assert_no_opinion("git status", "the directory holds the hook")
+            with unittest.mock.patch.object(hook, "_SESSION_CWD", str(project / "src")):
+                self.assert_no_opinion("git status", "found from a subdirectory too")
+
+    def test_a_hooks_directory_the_operator_names(self):
+        """The user's config is the operator's own, and so is a hooks directory it names. The
+        repository's `core.hooksPath` comes after it, and wins."""
+        with tempfile.TemporaryDirectory() as hooks:
+            Path(hooks, "post-index-change").write_text("#!/bin/sh\n")
+            theirs = f"[core]\n\thooksPath = {hooks}\n[core]\n\tfsmonitor = /x/run\n"
+            with remotes_configured(self.PLAIN, global_config=theirs) as project:
+                self.assert_allowed("git status", "the operator's hook, and their fsmonitor")
+                (project / ".git" / "hooks").mkdir()
+                (project / ".git" / "hooks" / "post-index-change").write_text("#!/bin/sh\n")
+                self.assert_allowed("git status", "git no longer looks in .git/hooks")
+            mine = "[core]\n\thooksPath = hk\n"
+            with remotes_configured(self.PLAIN + mine, global_config=theirs) as project:
+                (project / "hk").mkdir()
+                self.assert_allowed("git status", "the control: the repository's, with no hook")
+                (project / "hk" / "post-index-change").write_text("#!/bin/sh\n")
+                self.assert_no_opinion("git status", "the repository's directory, with the hook")
+
+    def test_config_from_the_environment_is_the_operators(self):
+        environment = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "/x/run",
+        }
+        with (
+            remotes_configured(self.PLAIN),
+            unittest.mock.patch.dict(os.environ, environment),
+        ):
+            self.assert_allowed("git status", "set where Claude Code was started")
+        with remotes_configured(self.PLAIN + "[core]\n\tfsmonitor = /x/run\n"):
+            self.assert_no_opinion("git status", "the control: the same key, the repository's")
+
+    def test_the_repository_git_runs_in(self):
+        """Read from where git runs: the `-C` directory, a `cd` target, the session's working
+        directory. Not from the project, where the shell is elsewhere."""
+        with remotes_configured(self.PLAIN) as project:
+            git_directory_at(project / "clean" / ".git", self.PLAIN)
+            git_directory_at(project / "nested" / ".git", "[core]\n\tfsmonitor = /x/run\n")
+            (project / "nested" / "src").mkdir()
+            for refused, control in (
+                ("git -C nested status", "git -C clean status"),
+                ("git -C nested/src log -1", "git -C clean log -1"),
+                ("cd ./nested && git status", "cd ./clean && git status"),
+                ("git status && cd ./nested && ls", "git status && cd ./clean && ls"),
+                ('echo "$(git -C nested status)"', 'echo "$(git -C clean status)"'),
+                ("timeout 5 git -C nested status", "timeout 5 git -C clean status"),
+            ):
+                with self.subTest(refused=refused):
+                    self.assert_allowed(control, "a repository with plain keys")
+                    self.assert_no_opinion(refused, "git runs in the nested repository")
+            with unittest.mock.patch.object(hook, "_SESSION_CWD", str(project / "nested")):
+                self.assert_no_opinion("git status", "the shell is in the nested repository")
+                self.assert_allowed(f"git -C {project} status", "git runs in the project")
+            with unittest.mock.patch.object(hook, "_SESSION_CWD", str(project / "clean")):
+                self.assert_allowed("git status", "the control")
+
+    def test_a_repository_in_the_scratchpad(self):
+        """The `Write` tool builds one there with no prompt, and the scratchpad is a read root."""
+        with remotes_configured(self.PLAIN) as project:
+            scratch = project.parent / "scratch" / "scratchpad"
+            git_directory_at(scratch / "clean" / ".git", self.PLAIN)
+            git_directory_at(scratch / "r" / ".git", "[core]\n\tfsmonitor = /x/run\n")
+            with with_scratchpad_dir(str(scratch)):
+                self.assert_allowed(f"git -C {scratch}/clean status", "the control")
+                self.assert_no_opinion(f"git -C {scratch}/r status", "names a program")
+                self.assert_no_opinion(f"git -C {scratch}/r log -1", "the same")
+
+    def test_where_there_is_no_repository(self):
+        with (
+            remotes_configured(self.PLAIN),
+            tempfile.TemporaryDirectory() as directory,
+            unittest.mock.patch.object(hook, "REPO_ROOT", Path(directory)),
+        ):
+            self.assert_allowed("git --version", "no config of a repository's to read")
+            self.assert_allowed("git diff --no-index a b", "the same")
+
+    def test_a_directory_outside_the_read_roots_is_not_asked(self):
+        with (
+            remotes_configured(self.PLAIN) as project,
+            unittest.mock.patch.object(
+                hook, "_run_git_uncached", wraps=hook._run_git_uncached
+            ) as run,
+        ):
+            (project / "docs").mkdir()
+            self.assert_allowed("git status && cd ./docs && ls", "the control")
+            self.assertEqual(4, run.call_count, "the keys and the hooks, from each directory")
+            run.reset_mock()
+            self.assert_no_opinion("git status && cd /etc && ls", "git may run in /etc")
+            self.assert_no_opinion("git -C /etc status", "the same, by -C")
+            run.assert_not_called()
+
+    def test_where_git_cannot_answer(self):
+        """No `git` on `PATH`, one that does not finish or fails, a list that is not pairs, and
+        a hooks directory that is not one line: each is no opinion."""
+        real_run = subprocess.run
+
+        def answering(stdout: bytes, returncode: int = 0, subcommand: str = "config"):
+            def run(command, **kwargs):
+                if subcommand in command:
+                    return subprocess.CompletedProcess(command, returncode, stdout, b"")
+                return real_run(command, **kwargs)
+
+            return run
+
+        with remotes_configured(self.PLAIN):
+            self.assert_allowed("git status", "the control")
+            for patch in (
+                unittest.mock.patch("shutil.which", return_value=None),
+                unittest.mock.patch(
+                    "subprocess.run", side_effect=subprocess.TimeoutExpired("git", 5.0)
+                ),
+                unittest.mock.patch("subprocess.run", side_effect=answering(b"", 129)),
+                unittest.mock.patch("subprocess.run", side_effect=answering(b"local\0")),
+                unittest.mock.patch("subprocess.run", side_effect=answering(b"local\0a.b")),
+                unittest.mock.patch("subprocess.run", side_effect=answering(b"\xff\0a.b\0")),
+                unittest.mock.patch("subprocess.run", side_effect=answering(b"later\0a.b\0")),
+                unittest.mock.patch(
+                    "subprocess.run", side_effect=answering(b"a\nb\n", subcommand="rev-parse")
+                ),
+                unittest.mock.patch(
+                    "subprocess.run", side_effect=answering(b"", subcommand="rev-parse")
+                ),
+                # git lists the repository's keys, and then finds no repository
+                unittest.mock.patch(
+                    "subprocess.run", side_effect=answering(b"", 128, subcommand="rev-parse")
+                ),
+            ):
+                with self.subTest(patch=patch), patch:
+                    self.assert_no_opinion("git status", "git gave no answer to use")
+
+    @needs_bash
+    def test_asking_git_runs_no_program_the_config_names(self):
+        """The pin #104 asks for: the hook's own questions start nothing, where `git status`
+        does. The program only makes a file in the test's directory."""
+        with remotes_configured(self.PLAIN) as project:
+            (project / ".git").rename(project / "made-of-files")
+            subprocess.run([GIT, "init", "-q", str(project)], check=True, timeout=10)
+            (project / "f").write_text("one\n")
+            subprocess.run([GIT, "-C", str(project), "add", "f"], check=True, timeout=10)
+            marker = project.parent / "ran"
+            program = project.parent / "program"
+            program.write_text(f"#!{BASH}\necho ran > {shlex.quote(str(marker))}\nexit 1\n")
+            program.chmod(0o755)
+            self.assert_allowed("git status", "the control: git's own keys")
+            subprocess.run(
+                [GIT, "-C", str(project), "config", "core.fsmonitor", str(program)],
+                check=True,
+                timeout=10,
+            )
+            self.assert_no_opinion("git status", "the repository names the program")
+            # Each question by itself too: the key stops the hook before it asks the second
+            listed = hook._run_git_uncached(
+                str(project), ("config", "--list", "--show-scope", "--name-only", "-z")
+            )
+            self.assertIn("local\0core.fsmonitor\0", listed[1])
+            hooks = hook._run_git_uncached(str(project), ("rev-parse", "--git-path", "hooks"))
+            self.assertEqual((0, ".git/hooks\n"), hooks)
+            self.assertFalse(marker.exists(), "the hook's questions ran the program")
+            subprocess.run(
+                [GIT, "-C", str(project), "status"], capture_output=True, check=False, timeout=10
+            )
+            self.assertTrue(marker.exists(), "the control: git status runs it")
+
+    def test_what_the_module_cannot_vouch_for_is_the_operators_to_grant(self):
+        with remotes_configured(self.PLAIN + "[core]\n\tfsmonitor = /x/run\n"):
+            self.assert_no_opinion("git status", "the control: no rule")
+            with operator_rules(allow=["Bash(git status)"]):
+                self.assert_allowed("git status", "granted by the rule")
+                self.assert_no_opinion("git log -1", "not what the rule names")
+                self.assert_refused_outright("git status --output=x", "a write stays one")
 
 
 class RefusesAnythingElse(Verdicts, unittest.TestCase):
@@ -2260,17 +2603,24 @@ class MatchesTheHostsOwnCaution(Verdicts, unittest.TestCase):
         """`-C` takes the next word as its directory, and a glob there that matches two
         entries is two words: beside `c/` and `clean`, `git -C c* status -fdx :/` is
         `git -C c clean status -fdx :/`, and git runs `clean`. Quoted, it is the directory it
-        spells."""
-        for refused, control in (
-            ("git -C c* status -fdx :/", "git -C c status -fdx :/"),
-            ("git -C c* log -1", "git -C 'c*' log -1"),
-            ("git -C c? status", "git -C c status"),
-            ("git -C [ac]lean status -fdx :/", "git -C '[ac]lean' status"),
-            ("git -C doc* log -1", "git -C docs log -1"),
-        ):
-            with self.subTest(command=refused):
-                self.assert_allowed(control, "the control")
-                self.assert_refused(refused, "beside c/ and clean, git runs clean")
+        spells. Each directory is there: git is asked from it, about the repository it finds."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_glob_") as directory:
+            project = Path(os.path.realpath(directory))
+            for name in ("c", "c*", "[ac]lean", "docs"):
+                (project / name).mkdir()
+            for refused, control in (
+                ("git -C c* status -fdx :/", "git -C c status -fdx :/"),
+                ("git -C c* log -1", "git -C 'c*' log -1"),
+                ("git -C c? status", "git -C c status"),
+                ("git -C [ac]lean status -fdx :/", "git -C '[ac]lean' status"),
+                ("git -C doc* log -1", "git -C docs log -1"),
+            ):
+                with (
+                    self.subTest(command=refused),
+                    unittest.mock.patch.object(hook, "REPO_ROOT", project),
+                ):
+                    self.assert_allowed(control, "the control")
+                    self.assert_refused(refused, "beside c/ and clean, git runs clean")
 
     def test_file_with_path_opening_flags(self):
         self.assert_refused("file -m /tmp/magic a.md", "opens /tmp/magic")
@@ -9371,15 +9721,22 @@ class RefusesGitReadsOutsideTheWorkingDirectories(Verdicts, unittest.TestCase):
         worktree in the scratchpad, as `git worktree add <scratchpad>/base HEAD` makes, from its
         `-C` directory or from the session's. The read scope places a path there as it does in
         the project. Each set of approvals sits beside a path that climbs out of the
-        scratchpad, under the same setup."""
-        base = f"{SCRATCH}/base"
-        for revisions in ("HEAD~1", "HEAD^ HEAD", "HEAD:AGENTS.md", "@{u}", "main...HEAD"):
-            with self.subTest(revisions=revisions):
-                self.assert_allowed(f"git -C {base} diff {revisions}", "revisions in a worktree")
-        self.assert_no_opinion(f"git -C {base} diff --no-index ../../x y", "beside the scratchpad")
-        with unittest.mock.patch.object(hook, "_SESSION_CWD", base):
-            self.assert_allowed("git diff HEAD~1", "a revision, from the worktree")
-            self.assert_no_opinion("git diff --no-index ../../x y", "beside the scratchpad")
+        scratchpad, under the same setup. The worktree's directory is there, since git is asked
+        from it about the repository it finds."""
+        with tempfile.TemporaryDirectory(prefix="readonly_hook_scratch_") as directory:
+            scratch = Path(os.path.realpath(directory), "session", "scratchpad")
+            base = str(scratch / "base")
+            Path(base).mkdir(parents=True)
+            with with_scratchpad_dir(str(scratch)):
+                for revisions in ("HEAD~1", "HEAD^ HEAD", "HEAD:AGENTS.md", "@{u}", "main...HEAD"):
+                    with self.subTest(revisions=revisions):
+                        self.assert_allowed(f"git -C {base} diff {revisions}", "in a worktree")
+                self.assert_no_opinion(
+                    f"git -C {base} diff --no-index ../../x y", "beside the scratchpad"
+                )
+                with unittest.mock.patch.object(hook, "_SESSION_CWD", base):
+                    self.assert_allowed("git diff HEAD~1", "a revision, from the worktree")
+                    self.assert_no_opinion("git diff --no-index ../../x y", "beside the scratchpad")
 
     def test_a_file_name_joined_to_each_directory(self):
         """`ls-files --exclude-per-directory` joins its value to each directory it reads, from
@@ -12164,6 +12521,21 @@ class PolicyAlreadyDecidedToRefuse(Verdicts, unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_refused(command, "loads the config of the repository at /tmp")
 
+    @needs_git
+    def test_a_nested_repository_brings_its_own_config(self):
+        """Decided: left to the rules where that config names a program (#104). `git -C` into
+        a directory inside the project was approved and recorded as undecided, the last case
+        of `PolicyStillUndecided`: a vendored checkout or an unpacked archive there is a
+        repository of its own, whose config git loads, as `--git-dir` would. The module reads
+        that config now, in `ReadsWhatARepositoryHasGitRun`. `cd` there is the same."""
+        with remotes_configured("") as project:
+            git_directory_at(project / "vendor" / "lib" / ".git", "[core]\n\tbare = false\n")
+            git_directory_at(project / "vendor" / "evil" / ".git", "[core]\n\tpager = /x/run\n")
+            self.assert_allowed("git -C vendor/lib status", "the control: names no program")
+            self.assert_refused("git -C vendor/evil status", "its config names a program")
+            self.assert_refused("cd ./vendor/evil && git status", "the same, by cd")
+            self.assert_refused("git -C vendor/gone status", "no directory to ask git from")
+
     def test_resource_exhaustion(self):
         """A field width is what makes output unbounded. The `find` case was recorded as
         `-printf '%p%p%p'`, which only triples a listing, and is the width form instead."""
@@ -12179,39 +12551,6 @@ class PolicyAlreadyDecidedToRefuse(Verdicts, unittest.TestCase):
             "printf '\\033]52;c;cm9vdA==\\a'", "writes the clipboard through OSC 52"
         )
         self.assert_refused("printf '\\033]0;whatever\\007'", "sets the terminal title")
-
-
-class PolicyStillUndecided(Verdicts, unittest.TestCase):
-    """The half that is still approved, and the premise-check the old class lacked.
-
-    These are read-only by the classifier's definition and still damaging, and whether
-    that is a bug depends on what the hook is for -- the question the module does not
-    answer. Under a poisoned prompt (the threat the harder passes assume) the credential
-    and exfiltration cases are bugs; under an agent that is merely careless they are not.
-
-    The difference from the old `UndecidedPolicy` is that these do not skip. Each asserts
-    the *current* verdict -- approved -- with `assert_allowed`, so the class states the
-    premise out loud and goes red the day the hook's behaviour drifts from it. A red test
-    here is not a regression; it is the signal to come back and decide, by moving the case
-    into `PolicyAlreadyDecidedToRefuse` (if the hook now refuses it and should) or editing
-    the assertion (if the approval is still intended). That is strictly more than the skip
-    did: it could not distinguish "still approved" from "quietly fixed".
-
-    These approvals are deliberate statements of current behaviour, not idioms the hook is
-    built to allow, so they are exempt from the approval budget by sitting in their own
-    class rather than a `@approvals_budgeted` one.
-
-    Reads outside the working directories and the `/proc` pseudo-files were here and have
-    been decided: they are refused, and `RefusesReadsOutsideTheWorkingDirectories` holds them.
-    So was `git -C` outside them, now in `PolicyAlreadyDecidedToRefuse`.
-    """
-
-    def test_a_nested_repository_brings_its_own_config(self):
-        """`git -C` into a directory inside the project is approved, and if that directory
-        is a repository of its own -- a vendored checkout, an unpacked archive -- git loads
-        its config, which can name a program to run, as `--git-dir` would. The module reads
-        the path, not the disk, so it cannot tell. `cd vendor/lib && git status` is the same."""
-        self.assert_allowed("git -C vendor/lib status", "a nested repository; approved today")
 
 
 @unittest.skip("recorded, not asserted: see the class docstring")

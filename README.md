@@ -111,6 +111,24 @@ Claude Code applies them, as for `additionalDirectories` above:
   view
 - An allow rule in your user settings lets Claude Code's file tools read the path, and not Bash
 
+## Repositories that have git run a program
+
+git runs the programs its repository's config names, such as `core.fsmonitor` on `git status`,
+and some of its hooks. So before the hook approves a git command, it asks git which keys the
+repository sets in its own config, and where its hooks are:
+
+- It approves git where the repository sets only keys it knows to name no program: what
+  `git init`, `git clone` and `git push -u` write, `user.name` and `user.email`, and
+  `core.hooksPath`
+- Any other key leaves every git command there to your rules, so git prompts in a repository
+  with initialized submodules, `git lfs install --local`, a partial clone or `core.worktree`
+- `core.sshCommand`, `core.gitProxy` and `remote.<name>.uploadpack` only leave the commands that
+  contact a remote, `git ls-remote` and `git remote show`
+- A `post-index-change` hook, which `git status` runs, leaves every git command there too
+- Your own config is trusted: `~/.gitconfig`, the system's, and what the environment sets
+
+A rule such as `Bash(git status)` in the project's settings still approves its command there.
+
 ## `curl`
 
 The approval hook also approves a `curl` GET of one page on a site the project lists, such as

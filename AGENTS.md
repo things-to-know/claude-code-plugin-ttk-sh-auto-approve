@@ -52,6 +52,29 @@ insists on its own filename, symlink to this file rather than copying it.
     is a package of a larger repository
     - The hook measures each path git takes, but not what a subcommand reads with none:
       `git log -p` and `git diff` read the whole repository
+  - git runs what its repository names: a program in its config, as `core.fsmonitor` on
+    `git status`, or a hook
+    - A repository gets there with no prompt: as an archive that holds its `.git`, or file by
+      file through the `Write` tool, into the scratchpad too (#104)
+    - So before approving a git command the hook asks git, from each directory the command may
+      run in, which keys the repository sets and where its hooks are (`_check_git_repository`)
+      - `git config --list --show-scope` and `git rev-parse --git-path hooks`, which start no
+        program the config names: `test_asking_git_runs_no_program_the_config_names`
+    - A key `GIT_CONFIG_KEYS` lacks is no opinion, for every git command
+      - An allowlist: a key a later git adds prompts
+      - At a cost: git prompts in a repository with initialized submodules, LFS's local filters,
+        a partial clone or `core.worktree`
+    - `core.sshCommand`, `core.gitProxy` and `remote.<name>.uploadpack` are no opinion only for
+      a command that contacts a remote
+    - A hook a read runs, `post-index-change`, is no opinion where the hooks directory holds it
+      (`GIT_READ_HOOKS`)
+    - The system's config, the user's and the environment's are the operator's own, and so is a
+      hooks directory they name
+    - Known gap: a nested repository the index holds as a gitlink, where `git status` and
+      `git diff` run git under its config (#179)
+    - Known gap: a directory `CDPATH` may take a `cd` to, where git isn't asked (#118)
+    - `gh` isn't held to it: the git commands gh 2.104.0 ran to find its repository started
+      neither a `core.fsmonitor` nor a `post-index-change`
   - A reader that follows links while it recurses, such as `grep -R`, reads where they lead
     - Both layers walk its directory operands for links (`LINK_FOLLOWERS`), every entry,
       ignore files or not

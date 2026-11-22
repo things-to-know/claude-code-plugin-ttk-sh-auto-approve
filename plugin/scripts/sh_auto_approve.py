@@ -44,7 +44,9 @@ Tier 1 accepts two writes that the command does not choose, both by a ``git ls-r
 ``git remote show`` that reaches its remote: git hands the credential back to the credential
 helper, which may store it again, and ssh may record a host key it has not seen. See
 ``_check_git_ls_remote``. To learn which URL such a command reaches, the module runs
-``git ls-remote --get-url``, which contacts nothing; see ``_check_git_remote_reach``.
+``git ls-remote --get-url``, which contacts nothing; see ``_check_git_remote_reach``. And
+before it approves any ``git`` command it asks git which config keys the repository sets and
+where its hooks are, since either can name a program a read runs; see ``_check_git_repository``.
 
 Tier 1 is a superset of the host's own built-in read-only set, because a pipeline is only
 useful if ``cut``, ``printf``, ``sort`` and ``tr`` are reachable inside it. It reads the
@@ -931,8 +933,8 @@ GIT_BRANCH_LIST_MODE = frozenset(
 # rest), `-d`, and `-v`, which verifies. Checked against git 2.48.1, `git tag v9 --contains HEAD`
 # included, which creates nothing.
 # Not stopped here: a `--format` with a `%(signature)` atom runs the program `gpg.program` names,
-# as `git branch --format` and `git log --show-signature` do. A repository config that names a
-# program is #104's.
+# as `git branch --format` and `git log --show-signature` do. A repository config that names
+# one is no opinion for every git command: `_check_git_repository`.
 # A set of its own, not `GIT_BRANCH_LIST_MODE`: a flag added there for `git branch` would make
 # every operand of `git tag` a pattern, though git may read that flag otherwise in `git tag`.
 GIT_TAG_LIST_MODE = frozenset(
@@ -981,6 +983,47 @@ GIT_NETWORK_URL = re.compile(
 # The longest the hook waits for git to say where a remote leads: `git ls-remote --get-url`
 # reads config and contacts nothing, so it takes milliseconds unless a file it opens blocks
 GIT_RESOLVE_TIMEOUT = 5.0
+
+# The scopes `git config --list --show-scope` gives a key that the repository didn't set: the
+# machine's config, the user's, and the environment's (`GIT_CONFIG_COUNT`), each the operator's
+# own. Every other scope is the repository's: `local`, `worktree`, and any a later git adds.
+GIT_TRUSTED_CONFIG_SCOPES = frozenset({"system", "global", "command"})
+
+# The keys of a repository's own config that `_check_git_repository` vouches for: under any
+# value, git starts no program for it and reads no other directory, in a command this module
+# approves. An allowlist, so that a key it lacks, one a later git adds included, is no opinion:
+# `core.fsmonitor`, `diff.external`, `gpg.program`, `diff.<driver>.textconv`, `filter.<name>.clean`
+# and `core.pager` each name a program a read runs, and `core.worktree` a directory `git diff`
+# prints files of. As git prints them: section and key in lower case.
+# - What `git init`, `git clone`, `git push -u` and `gh` write, and what the operator's
+#   repositories held (13 read on 2026-11-21): the format and filesystem keys, a remote's URLs
+#   and refspec, a branch's upstream, and the identity
+# - `include.path` and `extensions.worktreeconfig`, since git lists the keys either brings in
+#   as the repository's, where they are checked
+# - `core.hookspath`, since the hooks directory is read wherever it is: `GIT_READ_HOOKS`
+# `GIT_CONFIG_REMOTE_KEYS` are vouched for only in a command that contacts no remote.
+GIT_CONFIG_KEYS = frozenset(
+    {"core.repositoryformatversion", "core.filemode", "core.bare", "core.logallrefupdates"}
+    | {"core.ignorecase", "core.precomposeunicode", "core.symlinks", "core.hookspath"}
+    | {"user.name", "user.email", "include.path", "extensions.worktreeconfig"}
+)
+# By section, the keys below any subsection: `remote.<name>.url`
+GIT_CONFIG_SUBSECTION_KEYS = {
+    "remote": frozenset({"url", "pushurl", "fetch", "gh-resolved"}),
+    "branch": frozenset({"remote", "merge", "rebase", "pushremote", "gh-merge-base"}),
+    # A rewrite of a remote's URL, which `_check_git_remote_reach` reads as rewritten
+    "url": frozenset({"insteadof", "pushinsteadof"}),
+}
+# The keys that name a program git runs to reach a remote, and nowhere else: as
+# `GIT_CONFIG_KEYS` and `GIT_CONFIG_SUBSECTION_KEYS`, for a command `_git_remote_names` gives
+# no remote for. `core.sshcommand` whatever it holds: `ssh -o ProxyCommand=<cmd>` runs `<cmd>`.
+GIT_CONFIG_REMOTE_KEYS = frozenset({"core.sshcommand", "core.gitproxy"})
+GIT_CONFIG_REMOTE_SUBSECTION_KEYS = {"remote": frozenset({"uploadpack"})}
+
+# The hooks git runs under a command this module approves: `post-index-change`, when `git
+# status` or `git describe --dirty` writes the index it refreshed, which it does with no change
+# to record too. git 2.48.1 ran an executable one from `.git/hooks` with no config key set.
+GIT_READ_HOOKS = ("post-index-change",)
 
 
 class NotReadOnly(Exception):  # noqa: N818 - a verdict, not an error
@@ -3382,10 +3425,89 @@ def _git_remote_url(directory: str, name: str | None, scope: _ReadScope) -> str 
     return lines[0] if len(lines) == 1 else None
 
 
+def _check_git_repository(args: list[str], scope: _ReadScope | None) -> None:
+    """Require the repository a ``git`` command runs in to name no program git would run.
+
+    ``args`` run from the subcommand on, and ``scope`` is `_check_git_remote_reach`'s. A
+    repository's config can name a program a read runs, `core.fsmonitor` on ``git status``
+    among them, and so can its hooks directory: see `GIT_CONFIG_KEYS` and `GIT_READ_HOOKS`. The
+    directories a command starts in are judged as any other: a repository gets there as an
+    archive that holds its `.git`, or file by file through the `Write` tool, which no hook reads
+    (#104).
+
+    So git is asked, from every directory the command may run in, ``scope.run_bases``:
+    - ``git config --list --show-scope`` for the keys the repository sets, in its config, a
+      worktree's, or a file either includes. One this module doesn't vouch for is no opinion
+    - ``git rev-parse --git-path hooks`` for the hooks directory, `core.hooksPath` applied.
+      One that holds a hook of `GIT_READ_HOOKS` is no opinion, executable or not, unless the
+      operator's own config names the directory. Where git finds no repository there is none
+
+    Neither starts a program the config names: with `core.fsmonitor` set, git 2.48.1 ran it for
+    ``git status`` and for neither of these. Before git runs anywhere, a directory
+    `_unvouched_directory` finds is no opinion, as in `_check_git_remote_reach`. A directory
+    below `UNREAD_VALUE`, where `CDPATH` may take a `cd`, is not asked from, and stays the gap
+    #118 records.
+
+    Not read: a nested repository the index holds as a gitlink, whose config ``git status`` and
+    ``git diff`` run git under (#179), and what changes between this check and the command.
+
+    Each failure is no opinion, which an operator's rule can still grant: a directory that
+    isn't there among them, where git can't be asked, and which a program before git in the
+    command may yet make, as `tar x` under a rule. With no scope there is no directory to ask
+    from, as for Layer A.
+    """
+    if scope is None:
+        return
+    bases = [cwd for cwd in scope.run_bases if UNREAD_VALUE not in cwd]
+    _check_where_it_runs(_unvouched_directory(bases, _for_git(scope)))
+    contacts_a_remote = _git_remote_names(args) is not None
+    for cwd in bases:
+        listed = _run_git(scope, cwd, "config", "--list", "--show-scope", "--name-only", "-z")
+        fields = listed[1].split("\0") if listed is not None and listed[0] == 0 else [None]
+        # Each row is a scope and a key, each ended by a NUL
+        if fields.pop() != "" or len(fields) % 2:
+            raise NoOpinion(f"git cannot list the config it reads from {cwd}")
+        rows = list(zip(fields[0::2], fields[1::2], strict=True))
+        own = [key for origin, key in rows if origin not in GIT_TRUSTED_CONFIG_SCOPES]
+        for key in own:
+            if not _git_config_key_vouched(key, contacts_a_remote=contacts_a_remote):
+                raise NoOpinion(f"git reads a repository config key not known to be inert: {key}")
+        # The last one set decides, and git lists the repository's after the operator's
+        hooks_set_by = [origin for origin, key in rows if key == "core.hookspath"][-1:]
+        if hooks_set_by and hooks_set_by[0] in GIT_TRUSTED_CONFIG_SCOPES:
+            continue
+        found = _run_git(scope, cwd, "rev-parse", "--git-path", "hooks")
+        if found is not None and found[0] != 0 and not own:
+            continue  # no repository here, so no hooks directory and no config of its own
+        lines = found[1].splitlines() if found is not None and found[0] == 0 else []
+        if len(lines) != 1:
+            raise NoOpinion(f"git cannot tell where its hooks are from {cwd}")
+        for name in GIT_READ_HOOKS:
+            # git prints the directory relative to where it ran
+            if os.path.lexists(os.path.join(cwd, lines[0], name)):
+                raise NoOpinion(f"git may run a hook of the repository: {name}")
+
+
+def _git_config_key_vouched(key: str, *, contacts_a_remote: bool) -> bool:
+    """Whether ``key``, as ``git config --list`` prints it, is one `GIT_CONFIG_KEYS` vouches for.
+
+    A subsection may hold dots, so the key is cut at its first and its last: `branch.a.b.merge`
+    is `merge` of the branch `a.b`.
+    """
+    section, _, rest = key.partition(".")
+    _subsection, dot, name = rest.rpartition(".")
+    if dot:
+        allowed = GIT_CONFIG_SUBSECTION_KEYS.get(section, frozenset())
+        remote_only = GIT_CONFIG_REMOTE_SUBSECTION_KEYS.get(section, frozenset())
+        return name in allowed or (name in remote_only and not contacts_a_remote)
+    return key in GIT_CONFIG_KEYS or (key in GIT_CONFIG_REMOTE_KEYS and not contacts_a_remote)
+
+
 def _run_git(scope: _ReadScope, directory: str, *args: str) -> tuple[int, str] | None:
     """The exit status and output of ``git <args>`` run in ``directory``, once per command.
 
-    Only for subcommands that read config and contact nothing. It is the ``git`` on ``PATH``,
+    Only for subcommands that read config, start no program it names and contact nothing. It
+    is the ``git`` on ``PATH``,
     in this process's environment, which is the one the command gets, short of what the shell's
     startup file changes. git still does whatever that config has it do on every call, such as
     writing a ``trace2`` target. None where git cannot run, does not finish within
@@ -5046,6 +5168,7 @@ def _check_command(
                 _check_read_scope(f"git {args[index]}", found, args, arg_tokens, parts, files_scope)
             _check_git_paths(args, index, arg_tokens, parts, files_scope)
         _check_git_remote_reach(args[index:], files_scope)
+        _check_git_repository(args[index:], files_scope)
 
     # The read scope comes after the validator, so a write the validator found keeps its
     # verdict whatever a rule says: `sort -o out /etc/hostname` writes `out` wherever it reads.
@@ -6953,7 +7076,8 @@ def _unvouched_directory(bases: list[str], scope: _ReadScope) -> str | None:
     whole directory, and `git status` runs the `core.fsmonitor` of the repository it is in. So
     every program after such a `cd` or `pushd` runs somewhere this module didn't read, as after
     `pushd ~`, `pushd ..`, `pushd "$d"` and `pushd -`. The directories a command starts in are
-    the session's, which it doesn't judge.
+    the session's, which it doesn't judge: what the repository there has git run is
+    `_check_git_repository`'s to read.
     """
     session = _session_bases()
     for base in bases:
